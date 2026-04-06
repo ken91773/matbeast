@@ -1,0 +1,249 @@
+// Mat Beast Score — data model (Quintet / EBI-style, submission-only)
+// Run: npx prisma generate && npx prisma db push
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum BeltRank {
+  WHITE
+  BLUE
+  PURPLE
+  BROWN
+  BLACK
+}
+
+/// Blue belt event vs purple & brown combined event
+enum EventKind {
+  BLUE_BELT
+  PURPLE_BROWN
+}
+
+enum BracketRound {
+  QUARTER_FINAL
+  SEMI_FINAL
+  GRAND_FINAL
+}
+
+enum EliminationMode {
+  SINGLE
+  DOUBLE
+}
+
+/// End of a single 4-min regulation bout or an overtime minute (submission-only)
+enum BoutOutcome {
+  SUBMISSION_LEFT
+  SUBMISSION_RIGHT
+  DRAW
+}
+
+/// Regulation 4 min vs OT 1 min periods
+enum TimerPhase {
+  REGULATION
+  OVERTIME
+}
+
+enum FinalResultType {
+  LEFT
+  RIGHT
+  DRAW
+  NO_CONTEST
+}
+
+model Tournament {
+  id                String            @id @default(cuid())
+  name              String
+  eliminationMode   EliminationMode   @default(SINGLE)
+  maxTeams          Int               @default(8)
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  events Event[]
+}
+
+model Event {
+  id           String     @id @default(cuid())
+  tournamentId String
+  tournament   Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  kind         EventKind
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  teams          Team[]
+  bracketMatches BracketMatch[]
+
+  @@unique([tournamentId, kind])
+}
+
+/// Up to 8 teams per event (blue belt vs purple/brown are separate rosters)
+model Team {
+  id       String @id @default(cuid())
+  eventId  String
+  event    Event  @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  name     String
+  seedOrder Int   @default(0)
+
+  players Player[]
+
+  homeBracketMatches BracketMatch[] @relation("HomeTeam")
+  awayBracketMatches BracketMatch[] @relation("AwayTeam")
+  wonBracketMatches  BracketMatch[] @relation("WinnerTeam")
+
+  @@unique([eventId, seedOrder])
+}
+
+/// 5 primary + 2 standby; `lineupOrder` 1–7 is the predetermined Quintet order
+model Player {
+  id        String @id @default(cuid())
+  teamId    String
+  team      Team   @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  firstName String
+  lastName  String
+  nickname  String?
+  academyName String?
+
+  unofficialWeight Float?
+  officialWeight   Float?
+  heightFeet       Int?
+  /// 0–11
+  heightInches   Int?
+  age            Int?
+  beltRank       BeltRank
+
+  /// Paths under /public/uploads/... or external URLs
+  profilePhotoUrl String?
+  headShotUrl     String?
+
+  lineupOrder Int
+
+  /// Coach confirmed seed / lineup order for this slot
+  lineupConfirmed Boolean @default(false)
+
+  /// Coach confirmed weigh-in for this athlete
+  weighedConfirmed Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  activeLeftSessions  QuintetSession[] @relation("ActiveLeftCorner")
+  activeRightSessions QuintetSession[] @relation("ActiveRightCorner")
+
+  boardLeftOf  LiveScoreboardState? @relation("BoardLeftPlayer")
+  boardRightOf LiveScoreboardState? @relation("BoardRightPlayer")
+
+  @@unique([teamId, lineupOrder])
+}
+
+/// Single live row for mat control / overlay (no bracket required yet)
+model LiveScoreboardState {
+  id String @id @default("live")
+
+  leftPlayerId  String? @unique
+  rightPlayerId String? @unique
+  leftPlayer    Player? @relation("BoardLeftPlayer", fields: [leftPlayerId], references: [id], onDelete: SetNull)
+  rightPlayer   Player? @relation("BoardRightPlayer", fields: [rightPlayerId], references: [id], onDelete: SetNull)
+
+  roundLabel String @default("Quarter Finals")
+  currentRosterFileName String @default("UNTITLED")
+  customLeftName  String?
+  customLeftTeamName String?
+  customRightName String?
+  customRightTeamName String?
+
+  finalSaved      Boolean         @default(false)
+  finalResultType FinalResultType?
+  finalWinnerName String?
+  finalResultLogId String?
+  /// JSON snapshot of board state right before FINAL save; used by UNSAVE restore.
+  preFinalStateJson String?
+
+  timerSeconds Int       @default(240)
+  timerRunning Boolean   @default(false)
+  timerEndsAt  DateTime?
+
+  timerPhase        TimerPhase @default(REGULATION)
+  overtimeIndex     Int        @default(0)
+  overtimeWinsLeft  Int        @default(0)
+  overtimeWinsRight Int        @default(0)
+
+  leftEliminatedCount  Int @default(0)
+  rightEliminatedCount Int @default(0)
+
+  updatedAt DateTime @updatedAt
+}
+
+model ResultLog {
+  id String @id @default(cuid())
+  rosterFileName String @default("UNTITLED")
+  roundLabel String
+  leftName String
+  rightName String
+  resultType FinalResultType
+  winnerName String?
+  createdAt DateTime @default(now())
+}
+
+model BracketMatch {
+  id           String        @id @default(cuid())
+  eventId      String
+  event        Event         @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  round        BracketRound
+  bracketIndex Int           @default(0)
+
+  homeTeamId String
+  awayTeamId String
+  homeTeam   Team   @relation("HomeTeam", fields: [homeTeamId], references: [id], onDelete: Cascade)
+  awayTeam   Team   @relation("AwayTeam", fields: [awayTeamId], references: [id], onDelete: Cascade)
+
+  winnerTeamId String?
+  winnerTeam   Team?   @relation("WinnerTeam", fields: [winnerTeamId], references: [id], onDelete: SetNull)
+
+  quintetSessions QuintetSession[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([eventId, round])
+}
+
+model QuintetSession {
+  id             String       @id @default(cuid())
+  bracketMatchId String
+  bracketMatch   BracketMatch @relation(fields: [bracketMatchId], references: [id], onDelete: Cascade)
+
+  leftPlayerId  String?
+  rightPlayerId String?
+  leftPlayer    Player? @relation("ActiveLeftCorner", fields: [leftPlayerId], references: [id], onDelete: SetNull)
+  rightPlayer   Player? @relation("ActiveRightCorner", fields: [rightPlayerId], references: [id], onDelete: SetNull)
+
+  leftEliminatedSlots  String @default("[]")
+  rightEliminatedSlots String @default("[]")
+
+  timerSeconds Int       @default(240)
+  timerRunning Boolean   @default(false)
+  timerPhase   TimerPhase @default(REGULATION)
+  overtimeIndex Int      @default(0)
+  overtimeWinsLeft  Int  @default(0)
+  overtimeWinsRight Int @default(0)
+
+  bouts BoutLog[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model BoutLog {
+  id               String         @id @default(cuid())
+  quintetSessionId String
+  quintetSession   QuintetSession @relation(fields: [quintetSessionId], references: [id], onDelete: Cascade)
+  outcome          BoutOutcome
+  phase            TimerPhase
+  overtimeIndex    Int            @default(0)
+  recordedAt       DateTime       @default(now())
+}

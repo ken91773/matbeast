@@ -1,0 +1,13 @@
+/node_modules
+/.next
+/out
+.env
+.env*.local
+electron-builder.env
+*.db
+*.db-journal
+prisma/dev.db*
+
+# Uploaded roster photos (keep directory in repo)
+/public/uploads/*
+!/public/uploads/.gitkeep

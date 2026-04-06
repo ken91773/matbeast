@@ -1,0 +1,15 @@
+web/node_modules/
+web/.next/
+web/out/
+web/dist/
+web/dist-*/
+web/dist-fixed/
+web/.env
+web/.env*.local
+web/electron-builder.env
+web/*.db
+web/prisma/dev.db*
+web/public/uploads/*
+!web/public/uploads/.gitkeep
+Thumbs.db
+.DS_Store
