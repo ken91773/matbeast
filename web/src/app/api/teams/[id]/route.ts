@@ -1,11 +1,36 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { upsertMasterTeamName } from "@/lib/master-team-names";
+import { ensureMasterTeamNameTable } from "@/lib/master-team-name-table";
+import {
+  forbiddenUserChosenTeamNameMessage,
+  isForbiddenCustomTeamName,
+} from "@/lib/reserved-team-names";
 
 type Params = { params: Promise<{ id: string }> };
 
+function normalizeCssColor(input: unknown): { ok: true; value: string | null } | { ok: false } {
+  if (input === undefined) return { ok: false };
+  if (input === null) return { ok: true, value: null };
+  if (typeof input !== "string") return { ok: false };
+  const raw = input.trim();
+  if (!raw) return { ok: true, value: null };
+  const hex = raw.startsWith("#") ? raw : `#${raw}`;
+  if (!/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(hex)) {
+    return { ok: false };
+  }
+  return { ok: true, value: hex.toLowerCase() };
+}
+
 export async function PATCH(req: Request, { params }: Params) {
   const { id } = await params;
-  const body = (await req.json()) as { name?: string; seedOrder?: number };
+  const body = (await req.json()) as {
+    name?: string;
+    seedOrder?: number;
+    overlayColor?: string | null;
+    /** When clearing a slot (name → TBD), remove this team’s prior name from the global master list instead of keeping it. */
+    removeFromMasterTeamNames?: boolean;
+  };
 
   try {
     const existing = await prisma.team.findUnique({ where: { id } });
@@ -52,10 +77,57 @@ export async function PATCH(req: Request, { params }: Params) {
           : "TBD"
         : undefined;
 
+    const isClearToSentinel =
+      body.name !== undefined && body.name.trim().length === 0;
+    const explicitUserTbd =
+      body.name !== undefined &&
+      body.name.trim().length > 0 &&
+      body.name.trim().toUpperCase() === "TBD";
+
     if (nameUpdate !== undefined) {
+      if (nameUpdate === "TBD") {
+        if (!isClearToSentinel && !explicitUserTbd) {
+          return NextResponse.json({ error: "Invalid team name" }, { status: 400 });
+        }
+      } else if (isForbiddenCustomTeamName(nameUpdate)) {
+        return NextResponse.json(
+          { error: forbiddenUserChosenTeamNameMessage() },
+          { status: 400 },
+        );
+      }
+
+      const prevUpper = existing.name.trim().toUpperCase();
+      if (nameUpdate === "TBD" && prevUpper && prevUpper !== "TBD") {
+        if (body.removeFromMasterTeamNames) {
+          await ensureMasterTeamNameTable();
+          await prisma.masterTeamName.deleteMany({ where: { name: prevUpper } });
+        } else {
+          await upsertMasterTeamName(existing.name);
+        }
+      }
+
       await prisma.team.update({
         where: { id },
         data: { name: nameUpdate },
+      });
+      if (nameUpdate !== "TBD") {
+        await upsertMasterTeamName(nameUpdate);
+      } else if (explicitUserTbd) {
+        await upsertMasterTeamName("TBD", { allowReservedTbd: true });
+      }
+    }
+
+    if (body.overlayColor !== undefined) {
+      const normalized = normalizeCssColor(body.overlayColor);
+      if (!normalized.ok) {
+        return NextResponse.json(
+          { error: "Invalid overlayColor (use #RGB or #RRGGBB)" },
+          { status: 400 },
+        );
+      }
+      await prisma.team.update({
+        where: { id },
+        data: { overlayColor: normalized.value },
       });
     }
 

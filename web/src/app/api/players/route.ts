@@ -1,7 +1,10 @@
-import type { BeltRank } from "@prisma/client";
+import type { BeltRank, Prisma } from "@prisma/client";
 import { NextResponse } from "next/server";
+import { resolveTournamentIdFromRequest } from "@/lib/active-tournament-server";
+import { getPrimaryEventIdOrThrow } from "@/lib/events";
 import { prisma } from "@/lib/prisma";
 import { profileUpper } from "@/lib/profile-text";
+import { normalizeTeamLineup } from "@/lib/team-lineup";
 
 const ALL_BELTS: BeltRank[] = ["WHITE", "BLUE", "PURPLE", "BROWN", "BLACK"];
 
@@ -58,7 +61,7 @@ function parseBody(raw: unknown) {
     headShotUrl:
       typeof b.headShotUrl === "string" ? b.headShotUrl.trim() || null : null,
     lineupOrder:
-      typeof b.lineupOrder === "number" && b.lineupOrder >= 1 && b.lineupOrder <= 7
+      typeof b.lineupOrder === "number" && b.lineupOrder >= 1
         ? b.lineupOrder
         : null,
     lineupConfirmed:
@@ -72,8 +75,23 @@ export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
     const teamId = searchParams.get("teamId");
+    const tournamentParam = searchParams.get("tournamentId")?.trim();
+
+    let where: Prisma.PlayerWhereInput;
+
+    if (teamId) {
+      where = { teamId };
+    } else if (tournamentParam) {
+      const eventId = await getPrimaryEventIdOrThrow(tournamentParam);
+      where = { team: { eventId } };
+    } else {
+      const tid = await resolveTournamentIdFromRequest(req);
+      const eventId = await getPrimaryEventIdOrThrow(tid);
+      where = { team: { eventId } };
+    }
+
     const players = await prisma.player.findMany({
-      where: teamId ? { teamId } : undefined,
+      where,
       orderBy: [{ teamId: "asc" }, { lineupOrder: "asc" }],
       include: { team: { include: { event: true } } },
     });
@@ -104,13 +122,7 @@ export async function POST(req: Request) {
   if (!p.beltRank) {
     return NextResponse.json({ error: "beltRank is required" }, { status: 400 });
   }
-  if (p.lineupOrder == null) {
-    return NextResponse.json(
-      { error: "lineupOrder 1–7 is required" },
-      { status: 400 },
-    );
-  }
-
+  const beltRank = p.beltRank;
   const team = await prisma.team.findUnique({
     where: { id: p.teamId },
   });
@@ -119,26 +131,45 @@ export async function POST(req: Request) {
   }
 
   try {
-    const player = await prisma.player.create({
-      data: {
-        teamId: p.teamId,
-        firstName: p.firstName,
-        lastName: p.lastName,
-        nickname: p.nickname,
-        academyName: p.academyName,
-        unofficialWeight: p.unofficialWeight,
-        officialWeight: p.officialWeight,
-        heightFeet: p.heightFeet,
-        heightInches: p.heightInches,
-        age: p.age,
-        beltRank: p.beltRank,
-        profilePhotoUrl: p.profilePhotoUrl,
-        headShotUrl: p.headShotUrl,
-        lineupOrder: p.lineupOrder,
-        lineupConfirmed: p.lineupConfirmed ?? false,
-        weighedConfirmed: p.weighedConfirmed ?? false,
-      },
-      include: { team: true },
+    const player = await prisma.$transaction(async (tx) => {
+      const existing = await tx.player.findMany({
+        where: { teamId: p.teamId },
+        orderBy: [{ lineupOrder: "asc" }, { createdAt: "asc" }],
+      });
+      const maxLineupOrder = existing.reduce((max, player) => {
+        if (
+          typeof player.lineupOrder === "number" &&
+          Number.isInteger(player.lineupOrder) &&
+          player.lineupOrder >= 1
+        ) {
+          return Math.max(max, player.lineupOrder);
+        }
+        return max;
+      }, 0);
+      const assignedLineupOrder = p.lineupOrder ?? maxLineupOrder + 1;
+      const created = await tx.player.create({
+        data: {
+          teamId: p.teamId,
+          firstName: p.firstName,
+          lastName: p.lastName,
+          nickname: p.nickname,
+          academyName: p.academyName,
+          unofficialWeight: p.unofficialWeight,
+          officialWeight: p.officialWeight,
+          heightFeet: p.heightFeet,
+          heightInches: p.heightInches,
+          age: p.age,
+          beltRank,
+          profilePhotoUrl: p.profilePhotoUrl,
+          headShotUrl: p.headShotUrl,
+          lineupOrder: assignedLineupOrder,
+          lineupConfirmed: p.lineupConfirmed ?? false,
+          weighedConfirmed: p.weighedConfirmed ?? false,
+        },
+        include: { team: true },
+      });
+      await normalizeTeamLineup(tx, p.teamId);
+      return created;
     });
     return NextResponse.json(player);
   } catch (e) {

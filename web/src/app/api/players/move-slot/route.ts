@@ -1,17 +1,19 @@
 import type { EventKind } from "@prisma/client";
 import { NextResponse } from "next/server";
-import { getEventIdOrThrow } from "@/lib/events";
+import { resolveTournamentIdFromRequest } from "@/lib/active-tournament-server";
+import { getEventIdOrThrow, getPrimaryEventIdOrThrow } from "@/lib/events";
 import { prisma } from "@/lib/prisma";
 import { applyTeamSlots, slotsIdsFromPlayers } from "@/lib/team-lineup";
 import { ensureDefaultTournament } from "@/lib/tournament";
 
 /**
- * POST { eventKind, playerId, fromTeamId, fromSlot, toTeamId, toSlot }
- * Slots are 0–6 (maps to lineup 1–7). Supports same-team swap and cross-team moves / swaps.
+ * POST { tournamentId?, eventKind?, playerId, fromTeamId, fromSlot, toTeamId, toSlot }
+ * Slots are 0–6 (maps to lineup 1–7).
  */
 export async function POST(req: Request) {
   const body = (await req.json()) as {
     eventKind?: EventKind;
+    tournamentId?: string;
     playerId?: string;
     fromTeamId?: string;
     fromSlot?: number;
@@ -19,10 +21,6 @@ export async function POST(req: Request) {
     toSlot?: number;
   };
 
-  const kind = body.eventKind;
-  if (kind !== "BLUE_BELT" && kind !== "PURPLE_BROWN") {
-    return NextResponse.json({ error: "eventKind is required" }, { status: 400 });
-  }
   const {
     playerId,
     fromTeamId,
@@ -50,8 +48,17 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Slots must be 0–6" }, { status: 400 });
   }
 
-  const tournament = await ensureDefaultTournament();
-  const eventId = await getEventIdOrThrow(tournament.id, kind);
+  let eventId: string;
+  if (body.eventKind === "BLUE_BELT" || body.eventKind === "PURPLE_BROWN") {
+    const tournament = await ensureDefaultTournament();
+    eventId = await getEventIdOrThrow(tournament.id, body.eventKind);
+  } else {
+    const tid =
+      typeof body.tournamentId === "string" && body.tournamentId.trim()
+        ? body.tournamentId.trim()
+        : await resolveTournamentIdFromRequest(req);
+    eventId = await getPrimaryEventIdOrThrow(tid);
+  }
 
   const [teamFrom, teamTo] = await Promise.all([
     prisma.team.findFirst({

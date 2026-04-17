@@ -1,10 +1,447 @@
 import { NextResponse } from "next/server";
+import { randomUUID } from "node:crypto";
+import { resolveTournamentIdFromRequest } from "@/lib/active-tournament-server";
+
+export const dynamic = "force-dynamic";
 import { prisma } from "@/lib/prisma";
 import {
   ensureLiveScoreboardState,
   getBoardPayload,
-  toBoardPayload,
 } from "@/lib/board";
+import {
+  buildFinalSummaryLine,
+  fighterSummaryFromPlayerOrCustom,
+  formatTime12h,
+} from "@/lib/result-log-summary";
+import { setBracketMatchWinner } from "@/lib/bracket-engine";
+import { FinalResultType, Prisma } from "@prisma/client";
+
+const FINAL_SAVE_TYPES = new Set<string>([
+  "LEFT",
+  "RIGHT",
+  "DRAW",
+  "NO_CONTEST",
+  "SUBMISSION_LEFT",
+  "SUBMISSION_RIGHT",
+  "ESCAPE_LEFT",
+  "ESCAPE_RIGHT",
+  "DQ_LEFT",
+  "DQ_RIGHT",
+]);
+
+function winnerNameForFinal(
+  resultType: FinalResultType,
+  leftName: string,
+  rightName: string,
+): string | null {
+  switch (resultType) {
+    case "LEFT":
+    case "SUBMISSION_LEFT":
+    case "ESCAPE_LEFT":
+      return leftName;
+    case "RIGHT":
+    case "SUBMISSION_RIGHT":
+    case "ESCAPE_RIGHT":
+      return rightName;
+    case "DQ_LEFT":
+      return rightName;
+    case "DQ_RIGHT":
+      return leftName;
+    case "DRAW":
+    case "NO_CONTEST":
+    case "MANUAL":
+      return null;
+    default:
+      return null;
+  }
+}
+
+function isMissingResultLogColumn(error: unknown, part: string) {
+  if (!(error instanceof Prisma.PrismaClientKnownRequestError)) return false;
+  if (error.code !== "P2022") return false;
+  const column =
+    typeof error.meta?.column === "string" ? error.meta.column.toLowerCase() : "";
+  return column.includes(part.toLowerCase());
+}
+
+/** Board state immediately before applying final_save (same PATCH body merge). */
+type PreFinalSnapshot = {
+  leftPlayerId?: string | null;
+  rightPlayerId?: string | null;
+  customLeftName?: string | null;
+  customLeftTeamName?: string | null;
+  customRightName?: string | null;
+  customRightTeamName?: string | null;
+  currentRosterFileName?: string | null;
+  roundLabel?: string | null;
+  leftEliminatedCount?: number;
+  rightEliminatedCount?: number;
+  matchSummaryResultLogId?: string | null;
+  bracketMatchId?: string | null;
+  bracketWinnerTeamIdBefore?: string | null;
+};
+
+function prismaErrorMessage(error: unknown): string {
+  if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    return `${error.code}: ${error.message}`;
+  }
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+function isMissingTournamentIdColumnMessage(message: string): boolean {
+  const m = message.toLowerCase();
+  return m.includes("no column named tournamentid") || m.includes("resultlog.tournamentid");
+}
+
+async function readResultLogColumns(): Promise<Set<string>> {
+  try {
+    const rows = (await prisma.$queryRawUnsafe(
+      `PRAGMA table_info("ResultLog")`,
+    )) as Array<{ name?: unknown }>;
+    const cols = new Set<string>();
+    for (const row of rows) {
+      if (typeof row?.name === "string") cols.add(row.name);
+    }
+    return cols;
+  } catch {
+    return new Set<string>();
+  }
+}
+
+async function insertResultLogByAvailableColumns(params: {
+  id: string;
+  tournamentId: string;
+  rosterFileName: string;
+  roundLabel: string;
+  leftName: string;
+  rightName: string;
+  leftTeamName: string | null;
+  rightTeamName: string | null;
+  resultType: FinalResultType;
+  winnerName: string | null;
+  finalSummaryLine: string | null;
+  createdAt: Date;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const cols = await readResultLogColumns();
+  if (cols.size === 0) return { ok: false, error: "ResultLog schema unavailable" };
+
+  const valuesByColumn = new Map<string, unknown>([
+    ["id", params.id],
+    ["tournamentId", params.tournamentId],
+    ["rosterFileName", params.rosterFileName],
+    ["roundLabel", params.roundLabel],
+    ["leftName", params.leftName],
+    ["rightName", params.rightName],
+    ["leftTeamName", params.leftTeamName],
+    ["rightTeamName", params.rightTeamName],
+    ["resultType", params.resultType],
+    ["winnerName", params.winnerName],
+    ["isManual", 0],
+    ["manualDate", null],
+    ["manualTime", null],
+    ["finalSummaryLine", params.finalSummaryLine],
+    ["createdAt", params.createdAt],
+  ]);
+  const preferredOrder = [
+    "id",
+    "tournamentId",
+    "rosterFileName",
+    "roundLabel",
+    "leftName",
+    "rightName",
+    "leftTeamName",
+    "rightTeamName",
+    "resultType",
+    "winnerName",
+    "isManual",
+    "manualDate",
+    "manualTime",
+    "finalSummaryLine",
+    "createdAt",
+  ] as const;
+  const insertCols = preferredOrder.filter((c) => cols.has(c));
+  const required = ["id", "roundLabel", "leftName", "rightName", "resultType", "createdAt"];
+  if (!required.every((c) => insertCols.includes(c as (typeof preferredOrder)[number]))) {
+    return { ok: false, error: "ResultLog missing required columns for final save" };
+  }
+
+  const placeholders = insertCols.map(() => "?").join(", ");
+  const sql = `INSERT INTO "ResultLog" (${insertCols
+    .map((c) => `"${c}"`)
+    .join(", ")}) VALUES (${placeholders})`;
+  const args = insertCols.map((c) => valuesByColumn.get(c));
+  try {
+    await prisma.$executeRawUnsafe(sql, ...args);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: prismaErrorMessage(error) };
+  }
+}
+
+/**
+ * Persist a finals row; Prisma create first, then raw SQL fallbacks for older SQLite schemas.
+ */
+async function insertResultLogForFinal(params: {
+  tournamentId: string;
+  rosterFileName: string;
+  roundLabel: string;
+  leftName: string;
+  rightName: string;
+  leftTeamName: string | null;
+  rightTeamName: string | null;
+  resultType: FinalResultType;
+  winnerName: string | null;
+  finalSummaryLine: string | null;
+}): Promise<{ id: string } | { error: string }> {
+  const {
+    tournamentId,
+    rosterFileName,
+    roundLabel,
+    leftName,
+    rightName,
+    leftTeamName,
+    rightTeamName,
+    resultType,
+    winnerName,
+    finalSummaryLine,
+  } = params;
+
+  const baseData = {
+    tournamentId,
+    rosterFileName,
+    roundLabel,
+    leftName,
+    rightName,
+    leftTeamName,
+    rightTeamName,
+    resultType,
+    winnerName,
+    isManual: false as const,
+    manualDate: null as null,
+    manualTime: null as null,
+  };
+
+  try {
+    const row = await prisma.resultLog.create({
+      data: {
+        ...baseData,
+        finalSummaryLine: finalSummaryLine ?? null,
+      },
+    });
+    return { id: row.id };
+  } catch (error) {
+    if (isMissingResultLogColumn(error, "finalsummaryline")) {
+      try {
+        const row = await prisma.resultLog.create({ data: baseData });
+        return { id: row.id };
+      } catch (e2) {
+        console.error("[api/board final_save] ResultLog create (no summary col):", e2);
+      }
+    } else {
+      console.error("[api/board final_save] ResultLog create:", error);
+    }
+  }
+
+  const id = randomUUID();
+  const createdAt = new Date();
+  try {
+    await prisma.$executeRaw`
+      INSERT INTO "ResultLog" (
+        "id", "tournamentId", "rosterFileName", "roundLabel",
+        "leftName", "rightName", "leftTeamName", "rightTeamName",
+        "resultType", "winnerName", "isManual", "manualDate", "manualTime",
+        "finalSummaryLine", "createdAt"
+      ) VALUES (
+        ${id}, ${tournamentId}, ${rosterFileName}, ${roundLabel},
+        ${leftName}, ${rightName}, ${leftTeamName}, ${rightTeamName},
+        ${resultType}, ${winnerName}, ${0}, ${null}, ${null},
+        ${finalSummaryLine}, ${createdAt}
+      )
+    `;
+    return { id };
+  } catch (error) {
+    console.warn("[api/board final_save] ResultLog raw insert (full):", error);
+  }
+
+  try {
+    await prisma.$executeRaw`
+      INSERT INTO "ResultLog" (
+        "id", "tournamentId", "rosterFileName", "roundLabel",
+        "leftName", "rightName", "leftTeamName", "rightTeamName",
+        "resultType", "winnerName", "isManual", "manualDate", "manualTime",
+        "createdAt"
+      ) VALUES (
+        ${id}, ${tournamentId}, ${rosterFileName}, ${roundLabel},
+        ${leftName}, ${rightName}, ${leftTeamName}, ${rightTeamName},
+        ${resultType}, ${winnerName}, ${0}, ${null}, ${null},
+        ${createdAt}
+      )
+    `;
+    return { id };
+  } catch (error) {
+    const msg = prismaErrorMessage(error);
+    if (!isMissingTournamentIdColumnMessage(msg)) {
+      console.error("[api/board final_save] ResultLog raw insert (minimal):", error);
+      return { error: msg };
+    }
+  }
+
+  // Legacy SQLite builds may not have ResultLog.tournamentId yet.
+  try {
+    await prisma.$executeRaw`
+      INSERT INTO "ResultLog" (
+        "id", "rosterFileName", "roundLabel",
+        "leftName", "rightName", "leftTeamName", "rightTeamName",
+        "resultType", "winnerName", "isManual", "manualDate", "manualTime",
+        "finalSummaryLine", "createdAt"
+      ) VALUES (
+        ${id}, ${rosterFileName}, ${roundLabel},
+        ${leftName}, ${rightName}, ${leftTeamName}, ${rightTeamName},
+        ${resultType}, ${winnerName}, ${0}, ${null}, ${null},
+        ${finalSummaryLine}, ${createdAt}
+      )
+    `;
+    return { id };
+  } catch (error) {
+    console.warn(
+      "[api/board final_save] ResultLog raw insert (no tournamentId, full):",
+      error,
+    );
+  }
+
+  try {
+    await prisma.$executeRaw`
+      INSERT INTO "ResultLog" (
+        "id", "rosterFileName", "roundLabel",
+        "leftName", "rightName", "leftTeamName", "rightTeamName",
+        "resultType", "winnerName", "isManual", "manualDate", "manualTime",
+        "createdAt"
+      ) VALUES (
+        ${id}, ${rosterFileName}, ${roundLabel},
+        ${leftName}, ${rightName}, ${leftTeamName}, ${rightTeamName},
+        ${resultType}, ${winnerName}, ${0}, ${null}, ${null},
+        ${createdAt}
+      )
+    `;
+    return { id };
+  } catch (error) {
+    const msg = prismaErrorMessage(error);
+    const compat = await insertResultLogByAvailableColumns({
+      id,
+      tournamentId,
+      rosterFileName,
+      roundLabel,
+      leftName,
+      rightName,
+      leftTeamName,
+      rightTeamName,
+      resultType,
+      winnerName,
+      finalSummaryLine,
+      createdAt,
+    });
+    if (compat.ok) return { id };
+    console.error(
+      "[api/board final_save] ResultLog raw insert (no tournamentId, minimal):",
+      error,
+    );
+    return { error: compat.error || msg };
+  }
+}
+
+async function insertResultLogForMatchSummary(params: {
+  tournamentId: string;
+  rosterFileName: string;
+  roundLabel: string;
+  line: string;
+}): Promise<string | null> {
+  const id = randomUUID();
+  const data = {
+    id,
+    tournamentId: params.tournamentId,
+    rosterFileName: params.rosterFileName,
+    roundLabel: params.roundLabel,
+    leftName: params.line,
+    rightName: "",
+    leftTeamName: null as string | null,
+    rightTeamName: null as string | null,
+    resultType: "MANUAL" as FinalResultType,
+    winnerName: null as string | null,
+    isManual: true as const,
+    manualDate: null as string | null,
+    manualTime: null as string | null,
+    finalSummaryLine: null as string | null,
+  };
+  try {
+    await prisma.resultLog.create({ data });
+    return id;
+  } catch (error) {
+    console.warn("[api/board final_save] match summary line insert failed:", error);
+    return null;
+  }
+}
+
+async function deleteResultLogByIdForTournament(
+  resultLogId: string,
+  tournamentId: string,
+): Promise<void> {
+  try {
+    await prisma.resultLog.deleteMany({
+      where: { id: resultLogId, tournamentId },
+    });
+  } catch (error) {
+    const msg = prismaErrorMessage(error);
+    if (!isMissingTournamentIdColumnMessage(msg)) throw error;
+    await prisma.resultLog.deleteMany({ where: { id: resultLogId } });
+  }
+}
+
+function normalizeTeamNameForCompare(name: string | null | undefined) {
+  return (name ?? "").trim().toUpperCase();
+}
+
+/** Losing corner for quintet remaining (not recorded for draw / no contest). */
+function losingSideForFinal(rt: FinalResultType): "left" | "right" | null {
+  switch (rt) {
+    case "LEFT":
+    case "SUBMISSION_LEFT":
+    case "ESCAPE_LEFT":
+    case "DQ_RIGHT":
+      return "right";
+    case "RIGHT":
+    case "SUBMISSION_RIGHT":
+    case "ESCAPE_RIGHT":
+    case "DQ_LEFT":
+      return "left";
+    default:
+      return null;
+  }
+}
+
+/** Board UI line after save: corner, team, fighter. */
+function finalWinnerDisplay(
+  rt: FinalResultType,
+  leftTeam: string,
+  leftName: string,
+  rightTeam: string,
+  rightName: string,
+): string | null {
+  switch (rt) {
+    case "LEFT":
+    case "SUBMISSION_LEFT":
+    case "ESCAPE_LEFT":
+    case "DQ_RIGHT":
+      return `LEFT CORNER — ${leftTeam || "—"} — ${leftName}`;
+    case "RIGHT":
+    case "SUBMISSION_RIGHT":
+    case "ESCAPE_RIGHT":
+    case "DQ_LEFT":
+      return `RIGHT CORNER — ${rightTeam || "—"} — ${rightName}`;
+    default:
+      return null;
+  }
+}
 
 function effectiveSeconds(
   timerRunning: boolean,
@@ -16,9 +453,10 @@ function effectiveSeconds(
   return Math.max(0, Math.ceil(ms / 1000));
 }
 
-export async function GET() {
+export async function GET(req: Request) {
   try {
-    const payload = await getBoardPayload();
+    const tournamentId = await resolveTournamentIdFromRequest(req);
+    const payload = await getBoardPayload(tournamentId);
     return NextResponse.json(payload);
   } catch (e) {
     console.error("[api/board GET]", e);
@@ -42,6 +480,7 @@ type Command =
   | { type: "reset_match" }
   | { type: "reset_timer_regulation" }
   | { type: "reset_timer_overtime" }
+  | { type: "set_timer_seconds"; seconds: number }
   | { type: "adjust_timer_seconds"; deltaSeconds: number }
   | { type: "begin_overtime_period" }
   | { type: "advance_overtime_minute" }
@@ -51,12 +490,32 @@ type Command =
   | { type: "undo_eliminate_right" }
   | { type: "ot_round_win_left" }
   | { type: "ot_round_win_right" }
-  | { type: "final_save"; resultType: "LEFT" | "RIGHT" | "DRAW" | "NO_CONTEST" }
+  | { type: "set_sound_10_enabled"; enabled: boolean }
+  | { type: "set_sound_0_enabled"; enabled: boolean }
+  | { type: "play_sound_10_now" }
+  | { type: "play_sound_0_now" }
+  | { type: "set_timer_rest_period" }
+  | { type: "swap_mat_corners" }
+  | {
+      type: "final_save";
+      resultType: string;
+      selectedBracketMatchId?: string | null;
+    }
   | { type: "final_unsave" }
-  | { type: "clear_fields" };
+  | { type: "clear_fields" }
+  | { type: "result_log_delete"; resultLogId: string }
+  | {
+      type: "result_log_manual_add";
+      manualDate: string;
+      manualTime: string;
+      teamName: string;
+      firstName: string;
+      lastName: string;
+    };
 
 export async function PATCH(req: Request) {
   try {
+    const tournamentId = await resolveTournamentIdFromRequest(req);
     const body = (await req.json()) as {
       leftPlayerId?: string | null;
       rightPlayerId?: string | null;
@@ -69,7 +528,7 @@ export async function PATCH(req: Request) {
       command?: Command;
     };
 
-    const state = await ensureLiveScoreboardState();
+    const state = await ensureLiveScoreboardState(tournamentId);
 
     const next = { ...state };
 
@@ -145,6 +604,12 @@ export async function PATCH(req: Request) {
         next.overtimeWinsRight = 0;
         next.leftEliminatedCount = 0;
         next.rightEliminatedCount = 0;
+        next.leftPlayerId = null;
+        next.rightPlayerId = null;
+        next.customLeftName = null;
+        next.customLeftTeamName = null;
+        next.customRightName = null;
+        next.customRightTeamName = null;
         break;
       }
       case "reset_timer_regulation": {
@@ -159,6 +624,28 @@ export async function PATCH(req: Request) {
         next.timerSeconds = 60;
         next.timerRunning = false;
         next.timerEndsAt = null;
+        next.overtimeIndex = 0;
+        break;
+      }
+      case "set_timer_seconds": {
+        if (!Number.isFinite(cmd.seconds)) break;
+        const clamped = Math.max(
+          0,
+          Math.min(24 * 3600, Math.trunc(cmd.seconds)),
+        );
+        next.timerSeconds = clamped;
+        next.timerRunning = false;
+        next.timerEndsAt = null;
+        next.timerPhase = "REGULATION";
+        next.overtimeIndex = 0;
+        break;
+      }
+      case "set_timer_rest_period": {
+        next.timerSeconds = 60;
+        next.timerRunning = false;
+        next.timerEndsAt = null;
+        next.timerPhase = "REGULATION";
+        next.overtimeIndex = -1;
         break;
       }
       case "adjust_timer_seconds": {
@@ -175,7 +662,7 @@ export async function PATCH(req: Request) {
       }
       case "begin_overtime_period": {
         next.timerPhase = "OVERTIME";
-        next.overtimeIndex = next.overtimeIndex === 0 ? 1 : next.overtimeIndex;
+        next.overtimeIndex = next.overtimeIndex <= 0 ? 1 : next.overtimeIndex;
         next.timerSeconds = 60;
         next.timerRunning = false;
         next.timerEndsAt = null;
@@ -216,6 +703,49 @@ export async function PATCH(req: Request) {
           next.overtimeWinsRight = next.overtimeWinsRight + 1;
         break;
       }
+      case "set_sound_10_enabled": {
+        next.sound10Enabled = Boolean(cmd.enabled);
+        break;
+      }
+      case "set_sound_0_enabled": {
+        next.sound0Enabled = Boolean(cmd.enabled);
+        break;
+      }
+      case "play_sound_10_now": {
+        next.sound10PlayNonce = (next.sound10PlayNonce ?? 0) + 1;
+        break;
+      }
+      case "play_sound_0_now": {
+        next.sound0PlayNonce = (next.sound0PlayNonce ?? 0) + 1;
+        break;
+      }
+      case "swap_mat_corners": {
+        if (next.finalSaved) {
+          return NextResponse.json(
+            {
+              error:
+                "Unsave the recorded final before swapping corners, or clear the board.",
+            },
+            { status: 400 },
+          );
+        }
+        const lp = next.leftPlayerId;
+        next.leftPlayerId = next.rightPlayerId;
+        next.rightPlayerId = lp;
+        const cln = next.customLeftName;
+        next.customLeftName = next.customRightName;
+        next.customRightName = cln;
+        const clt = next.customLeftTeamName;
+        next.customLeftTeamName = next.customRightTeamName;
+        next.customRightTeamName = clt;
+        const le = next.leftEliminatedCount;
+        next.leftEliminatedCount = next.rightEliminatedCount;
+        next.rightEliminatedCount = le;
+        const owl = next.overtimeWinsLeft;
+        next.overtimeWinsLeft = next.overtimeWinsRight;
+        next.overtimeWinsRight = owl;
+        break;
+      }
       case "clear_fields": {
         next.leftPlayerId = null;
         next.rightPlayerId = null;
@@ -232,6 +762,13 @@ export async function PATCH(req: Request) {
         break;
       }
       case "final_save": {
+        if (!FINAL_SAVE_TYPES.has(cmd.resultType)) {
+          return NextResponse.json(
+            { error: "Invalid final result type" },
+            { status: 400 },
+          );
+        }
+        const rt = cmd.resultType as FinalResultType;
         const leftP = next.leftPlayerId
           ? await prisma.player.findUnique({
               where: { id: next.leftPlayerId },
@@ -257,49 +794,236 @@ export async function PATCH(req: Request) {
           );
         }
 
-        let winnerName: string | null = null;
-        if (cmd.resultType === "LEFT") winnerName = leftName;
-        if (cmd.resultType === "RIGHT") winnerName = rightName;
+        const leftTeamName =
+          next.customLeftTeamName?.trim() || leftP?.team.name || "";
+        const rightTeamName =
+          next.customRightTeamName?.trim() || rightP?.team.name || "";
+        const winnerName = winnerNameForFinal(rt, leftName, rightName);
 
-        const snapshot = JSON.stringify({
-          leftPlayerId: state.leftPlayerId,
-          rightPlayerId: state.rightPlayerId,
-          customLeftName: state.customLeftName,
-          customLeftTeamName: state.customLeftTeamName,
-          customRightName: state.customRightName,
-          customRightTeamName: state.customRightTeamName,
-          currentRosterFileName: state.currentRosterFileName,
-          roundLabel: state.roundLabel,
-          finalSaved: state.finalSaved,
-          finalResultType: state.finalResultType,
-          finalWinnerName: state.finalWinnerName,
-          finalResultLogId: state.finalResultLogId,
+        const savedAt = new Date();
+        const leftFighter = fighterSummaryFromPlayerOrCustom(
+          next.customLeftName,
+          next.customLeftTeamName,
+          leftP,
+        );
+        const rightFighter = fighterSummaryFromPlayerOrCustom(
+          next.customRightName,
+          next.customRightTeamName,
+          rightP,
+        );
+        const finalSummaryLine = buildFinalSummaryLine(
+          savedAt,
+          rt,
+          leftFighter,
+          rightFighter,
+          next.roundLabel,
+        );
+
+        // Capture merged board state *before* final bump (same request body as fighters).
+        const snapshot: PreFinalSnapshot = {
+          leftPlayerId: next.leftPlayerId,
+          rightPlayerId: next.rightPlayerId,
+          customLeftName: next.customLeftName,
+          customLeftTeamName: next.customLeftTeamName,
+          customRightName: next.customRightName,
+          customRightTeamName: next.customRightTeamName,
+          currentRosterFileName: next.currentRosterFileName,
+          roundLabel: next.roundLabel,
+          leftEliminatedCount: next.leftEliminatedCount,
+          rightEliminatedCount: next.rightEliminatedCount,
+          matchSummaryResultLogId: null,
+          bracketMatchId: null,
+          bracketWinnerTeamIdBefore: null,
+        };
+
+        const lose = losingSideForFinal(rt);
+        let newLeftElim = next.leftEliminatedCount;
+        let newRightElim = next.rightEliminatedCount;
+        if (lose === "left") {
+          newLeftElim = Math.min(5, newLeftElim + 1);
+        } else if (lose === "right") {
+          newRightElim = Math.min(5, newRightElim + 1);
+        }
+
+        const insertResult = await insertResultLogForFinal({
+          tournamentId,
+          rosterFileName: next.currentRosterFileName,
+          roundLabel: next.roundLabel,
+          leftName,
+          rightName,
+          leftTeamName: leftTeamName || null,
+          rightTeamName: rightTeamName || null,
+          resultType: rt,
+          winnerName,
+          finalSummaryLine,
         });
 
-        const created = await prisma.resultLog.create({
-          data: {
+        if ("error" in insertResult) {
+          return NextResponse.json(
+            {
+              error:
+                "Could not save the result to the event log (database write failed).",
+              detail: insertResult.error,
+            },
+            { status: 500 },
+          );
+        }
+
+        const created = insertResult;
+        const isMatchComplete = newLeftElim >= 5 || newRightElim >= 5;
+        const matchWinnerSide = newLeftElim >= 5 ? "right" : newRightElim >= 5 ? "left" : null;
+        const matchWinnerTeam =
+          matchWinnerSide === "left"
+            ? leftTeamName.trim()
+            : matchWinnerSide === "right"
+              ? rightTeamName.trim()
+              : "";
+        const matchLoserTeam =
+          matchWinnerSide === "left"
+            ? rightTeamName.trim()
+            : matchWinnerSide === "right"
+              ? leftTeamName.trim()
+              : "";
+
+        if (isMatchComplete && matchWinnerTeam && matchLoserTeam) {
+          const round = (next.roundLabel ?? "").trim().toUpperCase();
+          const roundSuffix = round ? ` — ${round}` : "";
+          const summaryLine = `${formatTime12h(savedAt)} ${matchWinnerTeam.toUpperCase()} def. ${matchLoserTeam.toUpperCase()}${roundSuffix}`;
+          const matchSummaryId = await insertResultLogForMatchSummary({
+            tournamentId,
             rosterFileName: next.currentRosterFileName,
             roundLabel: next.roundLabel,
-            leftName,
-            rightName,
-            resultType: cmd.resultType,
-            winnerName,
-          },
-        });
+            line: summaryLine,
+          });
+          snapshot.matchSummaryResultLogId = matchSummaryId;
+        }
 
+        const selectedBracketMatchId =
+          typeof cmd.selectedBracketMatchId === "string"
+            ? cmd.selectedBracketMatchId.trim()
+            : "";
+        if (isMatchComplete && selectedBracketMatchId && matchWinnerTeam) {
+          try {
+            const m = await prisma.bracketMatch.findUnique({
+              where: { id: selectedBracketMatchId },
+              include: {
+                event: { select: { tournamentId: true } },
+                homeTeam: { select: { id: true, name: true } },
+                awayTeam: { select: { id: true, name: true } },
+              },
+            });
+            if (m && m.event.tournamentId === tournamentId) {
+              snapshot.bracketMatchId = m.id;
+              snapshot.bracketWinnerTeamIdBefore = m.winnerTeamId ?? null;
+              const target = normalizeTeamNameForCompare(matchWinnerTeam);
+              const homeNorm = normalizeTeamNameForCompare(m.homeTeam.name);
+              const awayNorm = normalizeTeamNameForCompare(m.awayTeam.name);
+              const winnerTeamId =
+                homeNorm === target ? m.homeTeam.id : awayNorm === target ? m.awayTeam.id : null;
+              if (winnerTeamId) {
+                await setBracketMatchWinner(selectedBracketMatchId, winnerTeamId);
+              }
+            }
+          } catch (error) {
+            console.warn("[api/board final_save] bracket winner sync failed:", error);
+          }
+        }
+
+        next.leftEliminatedCount = newLeftElim;
+        next.rightEliminatedCount = newRightElim;
         next.finalSaved = true;
-        next.finalResultType = cmd.resultType;
-        next.finalWinnerName = winnerName;
+        next.finalResultType = rt;
+        next.finalWinnerName =
+          finalWinnerDisplay(
+            rt,
+            leftTeamName,
+            leftName,
+            rightTeamName,
+            rightName,
+          ) ?? winnerName;
         next.finalResultLogId = created.id;
-        next.preFinalStateJson = snapshot;
+        const snapshotJson = JSON.stringify(snapshot);
+        next.preFinalStateJson = snapshotJson;
         break;
       }
       case "final_unsave": {
         if (!state.finalSaved) break;
         if (state.finalResultLogId) {
-          await prisma.resultLog.deleteMany({ where: { id: state.finalResultLogId } });
+          await deleteResultLogByIdForTournament(state.finalResultLogId, tournamentId);
         }
-        // UNSAVE should only clear the final-result record/state, not fighter fields.
+        try {
+          const snap = state.preFinalStateJson
+            ? (JSON.parse(state.preFinalStateJson) as PreFinalSnapshot)
+            : null;
+          if (snap) {
+            if (snap.matchSummaryResultLogId) {
+              await deleteResultLogByIdForTournament(
+                snap.matchSummaryResultLogId,
+                tournamentId,
+              );
+            }
+            if (snap.bracketMatchId) {
+              try {
+                await setBracketMatchWinner(
+                  snap.bracketMatchId,
+                  snap.bracketWinnerTeamIdBefore ?? null,
+                );
+              } catch (error) {
+                console.warn(
+                  "[api/board final_unsave] bracket winner restore failed:",
+                  error,
+                );
+              }
+            }
+            if (snap.leftPlayerId !== undefined) {
+              next.leftPlayerId = snap.leftPlayerId;
+            }
+            if (snap.rightPlayerId !== undefined) {
+              next.rightPlayerId = snap.rightPlayerId;
+            }
+            if (snap.customLeftName !== undefined) {
+              next.customLeftName = snap.customLeftName;
+            }
+            if (snap.customLeftTeamName !== undefined) {
+              next.customLeftTeamName = snap.customLeftTeamName;
+            }
+            if (snap.customRightName !== undefined) {
+              next.customRightName = snap.customRightName;
+            }
+            if (snap.customRightTeamName !== undefined) {
+              next.customRightTeamName = snap.customRightTeamName;
+            }
+            if (
+              typeof snap.currentRosterFileName === "string" &&
+              snap.currentRosterFileName.trim()
+            ) {
+              next.currentRosterFileName = snap.currentRosterFileName.trim();
+            }
+            if (typeof snap.roundLabel === "string" && snap.roundLabel.trim()) {
+              next.roundLabel = snap.roundLabel.trim();
+            }
+            if (
+              typeof snap.leftEliminatedCount === "number" &&
+              Number.isFinite(snap.leftEliminatedCount)
+            ) {
+              next.leftEliminatedCount = Math.max(
+                0,
+                Math.min(5, Math.trunc(snap.leftEliminatedCount)),
+              );
+            }
+            if (
+              typeof snap.rightEliminatedCount === "number" &&
+              Number.isFinite(snap.rightEliminatedCount)
+            ) {
+              next.rightEliminatedCount = Math.max(
+                0,
+                Math.min(5, Math.trunc(snap.rightEliminatedCount)),
+              );
+            }
+          }
+        } catch (e) {
+          console.warn("[api/board final_unsave] bad preFinalStateJson:", e);
+        }
         next.finalSaved = false;
         next.finalResultType = null;
         next.finalWinnerName = null;
@@ -307,13 +1031,66 @@ export async function PATCH(req: Request) {
         next.preFinalStateJson = null;
         break;
       }
+      case "result_log_delete": {
+        const id =
+          typeof cmd.resultLogId === "string" ? cmd.resultLogId.trim() : "";
+        if (!id) break;
+        try {
+          await prisma.resultLog.deleteMany({
+            where: { id, tournamentId },
+          });
+        } catch (err) {
+          const msg = prismaErrorMessage(err);
+          if (!isMissingTournamentIdColumnMessage(msg)) {
+            console.error("[api/board result_log_delete]", err);
+            break;
+          }
+          await prisma.resultLog.deleteMany({ where: { id } });
+        }
+        break;
+      }
+      case "result_log_manual_add": {
+        const team = cmd.teamName.trim().toUpperCase();
+        const first = cmd.firstName.trim().toUpperCase();
+        const last = cmd.lastName.trim().toUpperCase();
+        const d = cmd.manualDate.trim();
+        const t = cmd.manualTime.trim();
+        if (!team || !first || !last) {
+          return NextResponse.json(
+            { error: "Team, first name, and last name are required" },
+            { status: 400 },
+          );
+        }
+        const fighter = `${first} ${last}`.trim();
+        try {
+          await prisma.resultLog.create({
+            data: {
+              tournamentId,
+              rosterFileName: next.currentRosterFileName,
+              roundLabel: "MANUAL",
+              leftName: fighter,
+              rightName: team,
+              leftTeamName: null,
+              rightTeamName: null,
+              resultType: "MANUAL",
+              winnerName: null,
+              isManual: true,
+              manualDate: d || null,
+              manualTime: t || null,
+            },
+          });
+        } catch (error) {
+          console.error("[api/board result_log_manual_add] ResultLog create:", error);
+        }
+        break;
+      }
       default:
         break;
     }
   }
 
-  const saved = await prisma.liveScoreboardState.update({
-    where: { id: state.id },
+  await prisma.liveScoreboardState.update({
+    where: { tournamentId },
     data: {
       leftPlayerId: next.leftPlayerId,
       rightPlayerId: next.rightPlayerId,
@@ -337,29 +1114,15 @@ export async function PATCH(req: Request) {
       overtimeWinsRight: next.overtimeWinsRight,
       leftEliminatedCount: next.leftEliminatedCount,
       rightEliminatedCount: next.rightEliminatedCount,
+      sound10Enabled: next.sound10Enabled,
+      sound0Enabled: next.sound0Enabled,
+      sound10PlayNonce: next.sound10PlayNonce,
+      sound0PlayNonce: next.sound0PlayNonce,
     },
   });
 
-  const [leftP, rightP] = await Promise.all([
-    saved.leftPlayerId
-      ? prisma.player.findUnique({
-          where: { id: saved.leftPlayerId },
-          include: { team: true },
-        })
-      : null,
-    saved.rightPlayerId
-      ? prisma.player.findUnique({
-          where: { id: saved.rightPlayerId },
-          include: { team: true },
-        })
-      : null,
-  ]);
-  const logs = await prisma.resultLog.findMany({
-    orderBy: { createdAt: "desc" },
-    take: 25,
-  });
-
-    return NextResponse.json(toBoardPayload(saved, leftP, rightP, logs));
+  const payload = await getBoardPayload(tournamentId);
+  return NextResponse.json(payload);
   } catch (e) {
     console.error("[api/board PATCH]", e);
     const message = e instanceof Error ? e.message : "Unknown error";

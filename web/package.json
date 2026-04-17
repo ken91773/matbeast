@@ -1,8 +1,8 @@
 {
   "name": "matbeastscore",
-  "version": "0.1.3",
+  "version": "0.6.0",
   "private": true,
-  "description": "Mat Beast Scoreboard — quintet roster, mat control, and broadcast overlay (Windows desktop)",
+  "description": "Mat Beast Scoreboard - quintet roster, mat control, and broadcast overlay (Windows desktop)",
   "author": "Mat Beast",
   "repository": {
     "type": "git",
@@ -19,20 +19,25 @@
     "desktop:icon": "node ./scripts/generate-icon.mjs",
     "desktop:runtime": "node ./scripts/prepare-node-runtime.mjs",
     "desktop:prepare-db": "node ./scripts/prepare-desktop-db.mjs",
-    "desktop:build": "npm run desktop:icon && npm run desktop:runtime && npm run db:generate && npm run desktop:prepare-db && npm run build && node ./scripts/strip-standalone-dotenv.mjs && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win --x64",
+    "desktop:build": "npm run desktop:icon && npm run desktop:runtime && npm run db:generate && npm run desktop:prepare-db && npm run build && node ./scripts/strip-standalone-dotenv.mjs && node ./scripts/run-electron-builder.mjs --win --x64",
     "desktop:publish": "node ./scripts/desktop-publish.mjs",
-    "desktop:publish:run": "npm run desktop:icon && npm run desktop:runtime && npm run db:generate && npm run desktop:prepare-db && npm run build && node ./scripts/strip-standalone-dotenv.mjs && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win --x64 --publish always",
+    "desktop:publish:run": "npm run desktop:icon && npm run desktop:runtime && npm run db:generate && npm run desktop:prepare-db && npm run build && node ./scripts/strip-standalone-dotenv.mjs && node ./scripts/run-electron-builder.mjs --win --x64 --publish always",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:studio": "prisma studio"
   },
   "dependencies": {
     "@fontsource/bebas-neue": "^5.2.7",
+    "@fontsource/oswald": "^5.2.8",
     "@prisma/client": "^6.5.0",
+    "@tanstack/react-query": "^5.96.2",
     "electron-updater": "^6.6.2",
     "next": "^15.2.4",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "react-grid-layout": "^2.2.3",
+    "react-resizable-panels": "^4.9.0",
+    "sql.js": "^1.11.0"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
@@ -40,14 +45,16 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@types/react-grid-layout": "^1.3.6",
     "concurrently": "^9.2.1",
     "cross-env": "^10.1.0",
     "electron": "^37.2.6",
     "electron-builder": "^26.0.12",
     "eslint": "^9",
     "eslint-config-next": "^15.2.4",
-    "prisma": "^6.5.0",
     "png-to-ico": "^3.0.1",
+    "prisma": "^6.5.0",
+    "rcedit": "^5.0.2",
     "sharp": "^0.34.4",
     "tailwindcss": "^4",
     "typescript": "^5",
@@ -56,18 +63,23 @@
   "build": {
     "appId": "com.matbeastscore.scoreboard",
     "productName": "Mat Beast Scoreboard",
+    "afterPack": "./scripts/after-pack-embed-icon.js",
     "directories": {
       "output": "dist"
     },
     "files": [
-      ".next/**/*",
-      "public/**/*",
-      "prisma/**/*",
       "electron/**/*",
-      "build/**/*",
+      "package.json",
       "node_modules/**/*",
-      "next.config.ts",
-      "package.json"
+      "!node_modules/@prisma/**/*",
+      "!node_modules/prisma/**/*",
+      "!node_modules/next/**/*",
+      "!node_modules/react/**/*",
+      "!node_modules/react-dom/**/*",
+      "!node_modules/@next/**/*",
+      "!node_modules/sharp/**/*",
+      "!node_modules/tailwindcss/**/*",
+      "!node_modules/@tailwindcss/**/*"
     ],
     "extraResources": [
       {
@@ -97,6 +109,16 @@
       {
         "from": "build/default-data/matbeast-template.db",
         "to": "default-data/matbeast-template.db"
+      }
+    ],
+    "fileAssociations": [
+      {
+        "ext": "matb",
+        "name": "com.matbeastscore.event",
+        "description": "Mat Beast Scoreboard event file",
+        "mimeType": "application/json",
+        "role": "Editor",
+        "icon": "build/icon.ico"
       }
     ],
     "win": {

@@ -1,7 +1,13 @@
 import type { EventKind } from "@prisma/client";
 import { NextResponse } from "next/server";
-import { getEventIdOrThrow } from "@/lib/events";
+import { resolveTournamentIdFromRequest } from "@/lib/active-tournament-server";
+import { getEventIdOrThrow, getPrimaryEventIdOrThrow } from "@/lib/events";
 import { prisma } from "@/lib/prisma";
+import { upsertMasterTeamName } from "@/lib/master-team-names";
+import {
+  forbiddenUserChosenTeamNameMessage,
+  isForbiddenUserChosenTeamName,
+} from "@/lib/reserved-team-names";
 import { ensureEightTeamSlots } from "@/lib/teams-bootstrap";
 import { ensureDefaultTournament } from "@/lib/tournament";
 
@@ -10,20 +16,37 @@ function parseEventKind(v: string | null): EventKind | null {
   return null;
 }
 
-/** GET ?eventKind=BLUE_BELT|PURPLE_BROWN (required) */
+async function resolveTournamentId(req: Request): Promise<string> {
+  const url = new URL(req.url);
+  const qp = url.searchParams.get("tournamentId")?.trim();
+  if (qp) return qp;
+  return resolveTournamentIdFromRequest(req);
+}
+
+/** GET — primary event roster for tournament (header or ?tournamentId=). Legacy: ?eventKind= for default tournament only */
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
-    const kind = parseEventKind(searchParams.get("eventKind"));
-    if (!kind) {
-      return NextResponse.json(
-        { error: "Query eventKind=BLUE_BELT or PURPLE_BROWN is required" },
-        { status: 400 },
-      );
+    const legacyKind = parseEventKind(searchParams.get("eventKind"));
+    let tournamentId: string;
+    let eventId: string;
+    let eventKind: EventKind;
+
+    if (legacyKind) {
+      const tournament = await ensureDefaultTournament();
+      tournamentId = tournament.id;
+      eventId = await getEventIdOrThrow(tournamentId, legacyKind);
+      eventKind = legacyKind;
+    } else {
+      tournamentId = await resolveTournamentId(req);
+      eventId = await getPrimaryEventIdOrThrow(tournamentId);
+      const eventRow = await prisma.event.findUnique({
+        where: { id: eventId },
+        select: { kind: true },
+      });
+      eventKind = eventRow?.kind ?? "BLUE_BELT";
     }
 
-    const tournament = await ensureDefaultTournament();
-    const eventId = await getEventIdOrThrow(tournament.id, kind);
     await ensureEightTeamSlots(eventId);
 
     const teams = await prisma.team.findMany({
@@ -34,9 +57,9 @@ export async function GET(req: Request) {
       },
     });
     return NextResponse.json({
-      tournamentId: tournament.id,
+      tournamentId,
       eventId,
-      eventKind: kind,
+      eventKind,
       teams,
     });
   } catch (e) {
@@ -54,24 +77,38 @@ export async function GET(req: Request) {
 
 export async function POST(req: Request) {
   try {
-    const tournament = await ensureDefaultTournament();
     const body = (await req.json()) as {
       name?: string;
       seedOrder?: number;
       eventKind?: EventKind;
+      tournamentId?: string;
     };
     const name = body.name?.trim();
     if (!name) {
       return NextResponse.json({ error: "name is required" }, { status: 400 });
     }
-    const kind = body.eventKind;
-    if (kind !== "BLUE_BELT" && kind !== "PURPLE_BROWN") {
+    if (isForbiddenUserChosenTeamName(name)) {
       return NextResponse.json(
-        { error: "eventKind BLUE_BELT or PURPLE_BROWN is required" },
+        { error: forbiddenUserChosenTeamNameMessage() },
         { status: 400 },
       );
     }
-    const eventId = await getEventIdOrThrow(tournament.id, kind);
+
+    let tournamentId: string;
+    let eventId: string;
+
+    if (body.eventKind === "BLUE_BELT" || body.eventKind === "PURPLE_BROWN") {
+      const tournament = await ensureDefaultTournament();
+      tournamentId = tournament.id;
+      eventId = await getEventIdOrThrow(tournamentId, body.eventKind);
+    } else if (typeof body.tournamentId === "string" && body.tournamentId.trim()) {
+      tournamentId = body.tournamentId.trim();
+      eventId = await getPrimaryEventIdOrThrow(tournamentId);
+    } else {
+      tournamentId = await resolveTournamentIdFromRequest(req);
+      eventId = await getPrimaryEventIdOrThrow(tournamentId);
+    }
+
     const count = await prisma.team.count({ where: { eventId } });
     if (count >= 8) {
       return NextResponse.json(
@@ -86,6 +123,7 @@ export async function POST(req: Request) {
         seedOrder: body.seedOrder ?? count + 1,
       },
     });
+    await upsertMasterTeamName(name);
     return NextResponse.json(team);
   } catch (e) {
     console.error("[POST /api/teams]", e);

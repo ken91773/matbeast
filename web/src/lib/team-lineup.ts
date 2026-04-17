@@ -16,7 +16,10 @@ export async function applyTeamSlots(
     throw new Error("slots must be an array of length 7");
   }
 
-  const teamPlayers = await db.player.findMany({ where: { teamId } });
+  const teamPlayers = await db.player.findMany({
+    where: { teamId },
+    orderBy: [{ lineupOrder: "asc" }, { createdAt: "asc" }],
+  });
   const idSet = new Set(teamPlayers.map((p) => p.id));
   const seen = new Set<string>();
   for (const s of slots) {
@@ -30,12 +33,6 @@ export async function applyTeamSlots(
       seen.add(s);
     }
   }
-  for (const p of teamPlayers) {
-    if (!seen.has(p.id)) {
-      throw new Error("Every roster player must appear in slots");
-    }
-  }
-
   for (let i = 0; i < teamPlayers.length; i++) {
     await db.player.update({
       where: { id: teamPlayers[i].id },
@@ -51,16 +48,98 @@ export async function applyTeamSlots(
       });
     }
   }
+  let overflowLineupOrder = 8;
+  for (const p of teamPlayers) {
+    if (!seen.has(p.id)) {
+      await db.player.update({
+        where: { id: p.id },
+        data: { lineupOrder: overflowLineupOrder++ },
+      });
+    }
+  }
 }
 
 export function slotsIdsFromPlayers(
-  players: { id: string; lineupOrder: number }[],
+  players: { id: string; lineupOrder: number | null }[],
 ): (string | null)[] {
   const row: (string | null)[] = Array(7).fill(null);
   for (const p of players) {
-    if (p.lineupOrder >= 1 && p.lineupOrder <= 7) {
+    if (typeof p.lineupOrder === "number" && p.lineupOrder >= 1 && p.lineupOrder <= 7) {
       row[p.lineupOrder - 1] = p.id;
     }
   }
   return row;
+}
+
+/**
+ * Ensure team lineup order is contiguous and always numbered: 1..N.
+ */
+export async function normalizeTeamLineup(db: TeamLineupDb, teamId: string): Promise<void> {
+  const players = await db.player.findMany({
+    where: { teamId },
+    orderBy: [{ lineupOrder: "asc" }, { createdAt: "asc" }],
+  });
+  for (let i = 0; i < players.length; i++) {
+    await db.player.update({
+      where: { id: players[i].id },
+      data: { lineupOrder: 100 + i },
+    });
+  }
+  for (let i = 0; i < players.length; i++) {
+    await db.player.update({
+      where: { id: players[i].id },
+      data: { lineupOrder: i + 1 },
+    });
+  }
+}
+
+/**
+ * Insert/move one player into a numbered lineup slot (1..7), pushing subsequent
+ * players down while preserving sequential lineupOrder for all team players.
+ */
+export async function insertPlayerIntoTeamLineup(
+  db: TeamLineupDb,
+  teamId: string,
+  playerId: string,
+  toLineupOrder: number,
+): Promise<void> {
+  if (!Number.isInteger(toLineupOrder) || toLineupOrder < 1) {
+    throw new Error("lineup slot must be >= 1");
+  }
+  const players = await db.player.findMany({
+    where: { teamId },
+    orderBy: [{ lineupOrder: "asc" }, { createdAt: "asc" }],
+  });
+  const existing = players.find((p) => p.id === playerId);
+  if (!existing) throw new Error("Player not found on team");
+
+  const ordered = players
+    .slice()
+    .sort((a, b) => {
+      const aRank =
+        typeof a.lineupOrder === "number" && a.lineupOrder >= 1
+          ? a.lineupOrder
+          : 1000;
+      const bRank =
+        typeof b.lineupOrder === "number" && b.lineupOrder >= 1
+          ? b.lineupOrder
+          : 1000;
+      return aRank - bRank || a.createdAt.getTime() - b.createdAt.getTime();
+    })
+    .filter((p) => p.id !== playerId);
+  const boundedInsertIndex = Math.max(0, Math.min(toLineupOrder - 1, ordered.length));
+  ordered.splice(boundedInsertIndex, 0, existing);
+
+  for (let i = 0; i < ordered.length; i++) {
+    await db.player.update({
+      where: { id: ordered[i].id },
+      data: { lineupOrder: 200 + i },
+    });
+  }
+  for (let i = 0; i < ordered.length; i++) {
+    await db.player.update({
+      where: { id: ordered[i].id },
+      data: { lineupOrder: i + 1 },
+    });
+  }
 }

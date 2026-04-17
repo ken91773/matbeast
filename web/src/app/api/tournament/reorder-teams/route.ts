@@ -1,15 +1,16 @@
 import type { EventKind } from "@prisma/client";
 import { NextResponse } from "next/server";
-import { getEventIdOrThrow } from "@/lib/events";
+import { resolveTournamentIdFromRequest } from "@/lib/active-tournament-server";
+import { getEventIdOrThrow, getPrimaryEventIdOrThrow } from "@/lib/events";
 import { prisma } from "@/lib/prisma";
 import { ensureDefaultTournament } from "@/lib/tournament";
 
-/** POST { teamIds: string[], eventKind: BLUE_BELT | PURPLE_BROWN } */
+/** POST { teamIds: string[], tournamentId?: string, eventKind?: legacy } */
 export async function POST(req: Request) {
-  const tournament = await ensureDefaultTournament();
   const body = (await req.json()) as {
     teamIds?: string[];
     eventKind?: EventKind;
+    tournamentId?: string;
   };
   if (!Array.isArray(body.teamIds) || body.teamIds.length !== 8) {
     return NextResponse.json(
@@ -17,14 +18,18 @@ export async function POST(req: Request) {
       { status: 400 },
     );
   }
-  if (body.eventKind !== "BLUE_BELT" && body.eventKind !== "PURPLE_BROWN") {
-    return NextResponse.json(
-      { error: "eventKind is required" },
-      { status: 400 },
-    );
-  }
 
-  const eventId = await getEventIdOrThrow(tournament.id, body.eventKind);
+  let eventId: string;
+  if (body.eventKind === "BLUE_BELT" || body.eventKind === "PURPLE_BROWN") {
+    const tournament = await ensureDefaultTournament();
+    eventId = await getEventIdOrThrow(tournament.id, body.eventKind);
+  } else {
+    const tid =
+      typeof body.tournamentId === "string" && body.tournamentId.trim()
+        ? body.tournamentId.trim()
+        : await resolveTournamentIdFromRequest(req);
+    eventId = await getPrimaryEventIdOrThrow(tid);
+  }
 
   const teams = await prisma.team.findMany({
     where: { eventId },

@@ -3,49 +3,14 @@
  * Order: existing env → web/.env → web/electron-builder.env → `gh auth token` (GitHub CLI).
  */
 import { execSync, spawnSync } from "node:child_process";
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { applyStandardElectronBuilderEnv } from "./electron-builder-env.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, "..");
 
-function parseEnvFile(filePath) {
-  const out = {};
-  if (!fs.existsSync(filePath)) return out;
-  let text = fs.readFileSync(filePath, "utf8");
-  if (text.charCodeAt(0) === 0xfeff) {
-    text = text.slice(1);
-  }
-  for (const line of text.split(/\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eq = trimmed.indexOf("=");
-    if (eq <= 0) continue;
-    const key = trimmed.slice(0, eq).trim();
-    let val = trimmed.slice(eq + 1).trim();
-    if (
-      (val.startsWith('"') && val.endsWith('"')) ||
-      (val.startsWith("'") && val.endsWith("'"))
-    ) {
-      val = val.slice(1, -1);
-    }
-    out[key] = val;
-  }
-  return out;
-}
-
-/** Later files override earlier; do not overwrite non-empty vars already in process.env (shell). */
-const mergedFileEnv = {
-  ...parseEnvFile(path.join(root, ".env")),
-  ...parseEnvFile(path.join(root, "electron-builder.env")),
-};
-for (const [key, val] of Object.entries(mergedFileEnv)) {
-  if (val === "") continue;
-  const existing = process.env[key];
-  if (existing !== undefined && existing !== "") continue;
-  process.env[key] = val;
-}
+applyStandardElectronBuilderEnv(root);
 
 if (!process.env.GH_TOKEN && !process.env.GITHUB_TOKEN) {
   try {

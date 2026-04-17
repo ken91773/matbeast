@@ -53,6 +53,13 @@ enum FinalResultType {
   RIGHT
   DRAW
   NO_CONTEST
+  SUBMISSION_LEFT
+  SUBMISSION_RIGHT
+  ESCAPE_LEFT
+  ESCAPE_RIGHT
+  DQ_LEFT
+  DQ_RIGHT
+  MANUAL
 }
 
 model Tournament {
@@ -63,7 +70,9 @@ model Tournament {
   createdAt         DateTime          @default(now())
   updatedAt         DateTime          @updatedAt
 
-  events Event[]
+  events     Event[]
+  scoreboard LiveScoreboardState?
+  resultLogs ResultLog[]
 }
 
 model Event {
@@ -80,13 +89,15 @@ model Event {
   @@unique([tournamentId, kind])
 }
 
-/// Up to 8 teams per event (blue belt vs purple/brown are separate rosters)
+/// Up to 8 teams per event (each saved “event file” uses one primary Event row)
 model Team {
   id       String @id @default(cuid())
   eventId  String
   event    Event  @relation(fields: [eventId], references: [id], onDelete: Cascade)
   name     String
   seedOrder Int   @default(0)
+  /** Optional CSS color (e.g. `#ff00aa`) for bracket overlay slot backgrounds */
+  overlayColor String?
 
   players Player[]
 
@@ -120,7 +131,8 @@ model Player {
   profilePhotoUrl String?
   headShotUrl     String?
 
-  lineupOrder Int
+  /// 1..7 for seeded lineup positions; null for overflow athletes beyond top 7.
+  lineupOrder Int?
 
   /// Coach confirmed seed / lineup order for this slot
   lineupConfirmed Boolean @default(false)
@@ -140,9 +152,42 @@ model Player {
   @@unique([teamId, lineupOrder])
 }
 
-/// Single live row for mat control / overlay (no bracket required yet)
+/// Global athlete profiles (all events / history). Names normalized uppercase for dedup.
+model MasterPlayerProfile {
+  id        String @id @default(cuid())
+  firstName String
+  lastName  String
+  nickname  String?
+  academyName String?
+
+  unofficialWeight Float?
+  heightFeet       Int?
+  heightInches     Int?
+  age              Int?
+  beltRank         BeltRank
+
+  profilePhotoUrl String?
+  headShotUrl     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([firstName, lastName])
+}
+
+/// Global team name list (all events / dashboards). Names normalized uppercase for dedup.
+model MasterTeamName {
+  id   String @id @default(cuid())
+  name String @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// Live mat state per tournament (event file)
 model LiveScoreboardState {
-  id String @id @default("live")
+  tournamentId String      @id
+  tournament   Tournament  @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
 
   leftPlayerId  String? @unique
   rightPlayerId String? @unique
@@ -174,19 +219,34 @@ model LiveScoreboardState {
 
   leftEliminatedCount  Int @default(0)
   rightEliminatedCount Int @default(0)
+  sound10Enabled       Boolean @default(true)
+  sound0Enabled        Boolean @default(true)
+  sound10PlayNonce     Int @default(0)
+  sound0PlayNonce      Int @default(0)
 
   updatedAt DateTime @updatedAt
 }
 
 model ResultLog {
   id String @id @default(cuid())
+  tournamentId String?
+  tournament   Tournament? @relation(fields: [tournamentId], references: [id], onDelete: SetNull)
   rosterFileName String @default("UNTITLED")
   roundLabel String
   leftName String
   rightName String
+  leftTeamName String?
+  rightTeamName String?
   resultType FinalResultType
   winnerName String?
+  isManual Boolean @default(false)
+  manualDate String?
+  manualTime String?
+  /// One-line finals text: "M/D/YYYY HH:mm WINNER def. LOSER"
+  finalSummaryLine String?
   createdAt DateTime @default(now())
+
+  @@index([tournamentId, createdAt])
 }
 
 model BracketMatch {

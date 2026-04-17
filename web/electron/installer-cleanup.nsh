@@ -12,17 +12,7 @@ ShowUninstDetails show
 found_old_uninstaller:
   StrCmp $R0 "" done_init
 
-  MessageBox MB_ICONQUESTION|MB_YESNO "A previous Mat Beast Scoreboard installation was detected.$\r$\n$\r$\nOpen the uninstaller now?$\r$\n$\r$\nThis setup will close. After uninstall finishes, run this installer again." IDYES do_uninstall IDNO done_init
-
-do_uninstall:
-  DetailPrint "Launching previous uninstaller; this setup will exit (re-run this installer after uninstall)."
-  ; Full uninstall command line from registry (interactive — do not add /S).
-  ; ExecWait can return while files are still locked; continuing the install in parallel causes conflicts.
-  Exec '$R0'
-  IfErrors uninstall_launch_failed
-  Quit
-uninstall_launch_failed:
-  MessageBox MB_ICONEXCLAMATION|MB_OK "Could not start the uninstaller. Remove the old version from Windows Settings → Apps, then run this setup again, or choose a different install folder."
+  DetailPrint "Previous installation detected; proceeding with installer-managed upgrade."
   Goto done_init
 
 done_init:
