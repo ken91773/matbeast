@@ -67,6 +67,8 @@ model Tournament {
   name              String
   eliminationMode   EliminationMode   @default(SINGLE)
   maxTeams          Int               @default(8)
+  /// When true, this event file uses TrainingMaster* lists (read/write). Immutable after create.
+  trainingMode      Boolean           @default(false)
   createdAt         DateTime          @default(now())
   updatedAt         DateTime          @updatedAt
 
@@ -179,6 +181,29 @@ model MasterPlayerProfile {
   @@unique([firstName, lastName])
 }
 
+/// Training-only athlete profiles (separate from live masters). Used when Tournament.trainingMode is true.
+model TrainingMasterPlayerProfile {
+  id        String @id @default(cuid())
+  firstName String
+  lastName  String
+  nickname  String?
+  academyName String?
+
+  unofficialWeight Float?
+  heightFeet       Int?
+  heightInches     Int?
+  age              Int?
+  beltRank         BeltRank
+
+  profilePhotoUrl String?
+  headShotUrl     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([firstName, lastName])
+}
+
 /// Global team name list (all events / dashboards). Names normalized uppercase for dedup.
 model MasterTeamName {
   id   String @id @default(cuid())
@@ -190,6 +215,21 @@ model MasterTeamName {
   /// Mat Beast Masters cloud row id. Set after first push or pull. Null
   /// = local-only (never synced to cloud yet).
   cloudId String?
+}
+
+/// Training-only team name list. Used when Tournament.trainingMode is true.
+model TrainingMasterTeamName {
+  id   String @id @default(cuid())
+  name String @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// Idempotent one-time migrations applied to the local SQLite file.
+model AppSchemaMigration {
+  id        String   @id
+  appliedAt DateTime @default(now())
 }
 
 /// Single-row config for cloud sync against the Mat Beast Masters service.
@@ -212,6 +252,9 @@ model CloudConfig {
   lastTeamNamesPullAt DateTime?
   /// Last sync error message (cleared automatically on next success).
   lastSyncError       String?
+  /// When false, skip pulling live Master* rows from Mat Beast Masters (used after
+  /// one-time migration moves sample data to Training* so cloud does not refill live lists).
+  liveMastersPullFromCloud Boolean @default(true)
 
   updatedAt DateTime @updatedAt
 }

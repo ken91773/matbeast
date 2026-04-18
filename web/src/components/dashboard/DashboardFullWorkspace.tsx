@@ -17,7 +17,6 @@ import {
 } from "@/lib/matbeast-fetch";
 import { matbeastKeys } from "@/lib/matbeast-query-keys";
 import { matbeastJson } from "@/lib/matbeast-query";
-import { openScoreboardOverlayWindow } from "@/lib/open-scoreboard-overlay";
 import { postScoreboardMode } from "@/lib/overlay-output-broadcast";
 import type { BoardPayload } from "@/types/board";
 import { ResultsLogPanel } from "@/components/ResultsLogPanel";
@@ -528,16 +527,8 @@ function OverlayStrip() {
    * is the right target for that scene.
    */
   const previewFocusY = previewScene === "scoreboard" ? 420 : 540;
-  const { overlayOutputLive, toggleOverlayOutputLive, activateOverlay } =
+  const { overlayOutputLive, toggleOverlayOutputLive } =
     useOverlayOutputLiveControl();
-
-  useEffect(() => {
-    if (!tournamentId) return;
-    if (typeof window === "undefined") return;
-    if (!window.matBeastDesktop) return;
-    void openScoreboardOverlayWindow();
-    activateOverlay();
-  }, [tournamentId, activateOverlay]);
 
   /**
    * Push the current preview scene (scoreboard ↔ bracket) into the iframe.
@@ -743,6 +734,7 @@ function OverlayStrip() {
               ref={previewIframeRef}
               src={`/overlay?preview=1&tournamentId=${encodeURIComponent(tournamentId)}`}
               title="Overlay preview"
+              tabIndex={-1}
               width={previewFrameW}
               height={previewFrameH}
               onLoad={() => {

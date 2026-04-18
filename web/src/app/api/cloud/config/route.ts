@@ -26,6 +26,7 @@ export async function GET() {
   return NextResponse.json({
     cloudBaseUrl: cfg.cloudBaseUrl,
     syncEnabled: cfg.syncEnabled,
+    liveMastersPullFromCloud: cfg.liveMastersPullFromCloud,
     tokenSet: tok.length > 0,
     tokenPreview: tok.length >= 4 ? tok.slice(-4) : "",
     configured: isCloudConfigured(cfg),
@@ -85,6 +86,16 @@ export async function PATCH(req: Request) {
     update.syncEnabled = b.syncEnabled;
   }
 
+  if (b.liveMastersPullFromCloud !== undefined) {
+    if (typeof b.liveMastersPullFromCloud !== "boolean") {
+      return NextResponse.json(
+        { error: "liveMastersPullFromCloud must be boolean" },
+        { status: 400 },
+      );
+    }
+    update.liveMastersPullFromCloud = b.liveMastersPullFromCloud;
+  }
+
   const cfg = await updateCloudConfig(update);
   const tok = cfg.desktopToken.trim();
   return NextResponse.json({
@@ -93,6 +104,7 @@ export async function PATCH(req: Request) {
     tokenPreview: tok.length >= 4 ? tok.slice(-4) : "",
     cloudBaseUrl: cfg.cloudBaseUrl,
     syncEnabled: cfg.syncEnabled,
+    liveMastersPullFromCloud: cfg.liveMastersPullFromCloud,
     configured: isCloudConfigured(cfg),
   });
 }

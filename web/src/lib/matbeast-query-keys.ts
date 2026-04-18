@@ -10,6 +10,9 @@ export const matbeastKeys = {
     [...matbeastKeys.all, "bracket", tournamentId ?? "none"] as const,
   teams: (tournamentId: string | null) =>
     [...matbeastKeys.all, "teams", tournamentId ?? "none"] as const,
-  playerProfiles: () => [...matbeastKeys.all, "player-profiles"] as const,
-  masterTeamNames: () => [...matbeastKeys.all, "master-team-names"] as const,
+  /** Scoped by active tournament so live vs training caches never mix. */
+  playerProfiles: (tournamentId: string | null) =>
+    [...matbeastKeys.all, "player-profiles", tournamentId ?? "none"] as const,
+  masterTeamNames: (tournamentId: string | null) =>
+    [...matbeastKeys.all, "master-team-names", tournamentId ?? "none"] as const,
 };

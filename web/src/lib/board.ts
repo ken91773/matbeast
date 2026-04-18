@@ -365,5 +365,10 @@ export async function getBoardPayload(tournamentId: string): Promise<BoardPayloa
   logs = logs
     .filter((r) => resultLogMatchesRosterKey(r, rosterKey))
     .slice(0, 80);
-  return toBoardPayload(state, leftP, rightP, logs);
+  const payload = toBoardPayload(state, leftP, rightP, logs);
+  const t = await prisma.tournament.findUnique({
+    where: { id: tournamentId },
+    select: { trainingMode: true },
+  });
+  return { ...payload, trainingMode: Boolean(t?.trainingMode) };
 }

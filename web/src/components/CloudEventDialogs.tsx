@@ -54,6 +54,7 @@ export default function CloudEventDialogs() {
     tournamentId,
     openTabs,
     selectTab,
+    setShowHome,
   } = useEventWorkspace();
 
   const openTabsRef = useRef(openTabs);
@@ -123,6 +124,9 @@ export default function CloudEventDialogs() {
         queryClient,
         openEventInTab,
         refreshTournaments,
+        openTabs,
+        selectTab,
+        setShowHome,
       });
 
       // matbeastImportOpenedEventFile creates a tournament + opens a tab.
@@ -153,7 +157,7 @@ export default function CloudEventDialogs() {
       void queryClient.invalidateQueries({ queryKey: matbeastKeys.all });
       close();
     },
-    [queryClient, openEventInTab, refreshTournaments, close],
+    [queryClient, openEventInTab, refreshTournaments, close, openTabs, selectTab, setShowHome],
   );
 
   return (

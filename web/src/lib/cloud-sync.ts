@@ -140,6 +140,7 @@ export async function queueOutboxOp(
 export async function pullTeamNames(): Promise<{ pulled: number }> {
   const cfg = await getCloudConfig();
   if (!isCloudConfigured(cfg)) return { pulled: 0 };
+  if (!cfg.liveMastersPullFromCloud) return { pulled: 0 };
   await ensureMasterTeamNameTable();
 
   const res = await cloudFetch(cfg, "/api/master-team-names", { method: "GET" });
@@ -168,6 +169,7 @@ export async function pullTeamNames(): Promise<{ pulled: number }> {
 export async function pullProfiles(): Promise<{ pulled: number }> {
   const cfg = await getCloudConfig();
   if (!isCloudConfigured(cfg)) return { pulled: 0 };
+  if (!cfg.liveMastersPullFromCloud) return { pulled: 0 };
   await ensureMasterPlayerProfileTable();
 
   const res = await cloudFetch(cfg, "/api/master-player-profiles", {

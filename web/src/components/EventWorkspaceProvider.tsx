@@ -5,6 +5,7 @@ import {
   setMatBeastTournamentId,
 } from "@/lib/matbeast-fetch";
 import { matbeastDebugLog } from "@/lib/matbeast-debug-log";
+import { unregisterOpenEventFilePath } from "@/lib/matbeast-open-file-registry";
 import { matbeastKeys } from "@/lib/matbeast-query-keys";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -21,22 +22,25 @@ const TABS_STORAGE_KEY = "matbeast-open-tabs-v1";
 /** Must match `STORAGE_KEY` in `@/lib/matbeast-fetch` (localStorage sync across windows). */
 const ACTIVE_TOURNAMENT_STORAGE_KEY = "matbeast-active-tournament-id";
 
-export type EventTab = { id: string; name: string };
+export type EventTab = { id: string; name: string; trainingMode?: boolean };
 
 type TournamentSummary = {
   id: string;
   name: string;
   updatedAt: string;
+  trainingMode?: boolean;
 };
 
 type Ctx = {
   tournamentId: string | null;
   tournamentName: string;
+  /** True when the active tab's event was created as a training file. */
+  tournamentTrainingMode: boolean;
   openTabs: EventTab[];
   ready: boolean;
   tournaments: TournamentSummary[];
   refreshTournaments: () => Promise<void>;
-  openEventInTab: (id: string, name: string) => void;
+  openEventInTab: (id: string, name: string, trainingMode?: boolean) => void;
   selectTab: (id: string) => void;
   closeTab: (id: string) => void;
   renameActiveTab: (name: string) => void;
@@ -90,8 +94,19 @@ async function fetchTournaments(): Promise<TournamentSummary[]> {
   if (!res.ok) {
     throw new Error(`GET /api/tournaments ${res.status}`);
   }
-  const j = (await res.json()) as { tournaments?: TournamentSummary[] };
-  return j.tournaments ?? [];
+  const j = (await res.json()) as {
+    tournaments?: Array<{
+      id: string;
+      name: string;
+      updatedAt: string;
+      trainingMode?: boolean;
+    }>;
+  };
+  const list = j.tournaments ?? [];
+  return list.map((t) => ({
+    ...t,
+    trainingMode: Boolean(t.trainingMode),
+  }));
 }
 
 export function EventWorkspaceProvider({
@@ -158,8 +173,9 @@ export function EventWorkspaceProvider({
   }, [queryClient]);
 
   const tournamentId = activeTabId;
-  const tournamentName =
-    openTabs.find((t) => t.id === activeTabId)?.name ?? "Untitled event";
+  const activeTab = openTabs.find((t) => t.id === activeTabId);
+  const tournamentName = activeTab?.name ?? "Untitled event";
+  const tournamentTrainingMode = Boolean(activeTab?.trainingMode);
 
   useEffect(() => {
     if (typeof window !== "undefined" && !window.location.pathname.startsWith("/overlay")) {
@@ -243,14 +259,24 @@ export function EventWorkspaceProvider({
         tabs = readStoredTabs().filter((t) => validIds.has(t.id));
         tabs = tabs.map((t) => {
           const s = serverList.find((x) => x.id === t.id);
-          return { id: t.id, name: s?.name ?? t.name };
+          return {
+            id: t.id,
+            name: s?.name ?? t.name,
+            trainingMode: Boolean(s?.trainingMode ?? t.trainingMode),
+          };
         });
 
         if (tabs.length === 0) {
           const storedSingle = getMatBeastTournamentId();
           if (storedSingle && validIds.has(storedSingle)) {
             const s = serverList.find((x) => x.id === storedSingle);
-            tabs = [{ id: storedSingle, name: s?.name ?? "Untitled event" }];
+            tabs = [
+              {
+                id: storedSingle,
+                name: s?.name ?? "Untitled event",
+                trainingMode: Boolean(s?.trainingMode),
+              },
+            ];
           }
         }
 
@@ -291,9 +317,11 @@ export function EventWorkspaceProvider({
       let changed = false;
       const next = prev.map((tab) => {
         const s = tournaments.find((t) => t.id === tab.id);
-        if (s && s.name !== tab.name) {
+        if (!s) return tab;
+        const tm = Boolean(s.trainingMode);
+        if (s.name !== tab.name || tm !== Boolean(tab.trainingMode)) {
           changed = true;
-          return { ...tab, name: s.name };
+          return { ...tab, name: s.name, trainingMode: tm };
         }
         return tab;
       });
@@ -387,11 +415,18 @@ export function EventWorkspaceProvider({
   );
 
   const openEventInTab = useCallback(
-    (id: string, name: string) => {
+    (id: string, name: string, trainingMode?: boolean) => {
       const prev = openTabsRef.current;
+      const existing = prev.find((t) => t.id === id);
+      const tm =
+        trainingMode !== undefined
+          ? Boolean(trainingMode)
+          : existing
+            ? Boolean(existing.trainingMode)
+            : false;
       const next = prev.some((t) => t.id === id)
-        ? prev
-        : [...prev, { id, name }];
+        ? prev.map((t) => (t.id === id ? { ...t, name, trainingMode: tm } : t))
+        : [...prev, { id, name, trainingMode: tm }];
       matbeastDebugLog("tabs:open", id, name, {
         wasNew: !prev.some((t) => t.id === id),
         nextCount: next.length,
@@ -411,6 +446,7 @@ export function EventWorkspaceProvider({
 
   const closeTab = useCallback(
     (id: string) => {
+      unregisterOpenEventFilePath(id);
       const prev = openTabsRef.current;
       const idx = prev.findIndex((t) => t.id === id);
       if (idx < 0) return;
@@ -460,6 +496,7 @@ export function EventWorkspaceProvider({
     () => ({
       tournamentId,
       tournamentName,
+      tournamentTrainingMode,
       openTabs,
       ready,
       tournaments,
@@ -477,6 +514,7 @@ export function EventWorkspaceProvider({
     [
       tournamentId,
       tournamentName,
+      tournamentTrainingMode,
       openTabs,
       ready,
       tournaments,

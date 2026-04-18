@@ -12,6 +12,8 @@ export type CloudConfig = {
   lastProfilesPullAt: Date | null;
   lastTeamNamesPullAt: Date | null;
   lastSyncError: string | null;
+  /** When false, pullProfiles/pullTeamNames skip downloading live masters from cloud. */
+  liveMastersPullFromCloud: boolean;
   updatedAt: Date;
 };
 
@@ -29,6 +31,7 @@ export async function getCloudConfig(): Promise<CloudConfig> {
         desktopToken: "",
         cloudBaseUrl: DEFAULT_CLOUD_BASE_URL,
         syncEnabled: true,
+        liveMastersPullFromCloud: true,
       },
     });
   }
@@ -42,6 +45,7 @@ export type UpdateCloudConfigInput = {
   lastProfilesPullAt?: Date | null;
   lastTeamNamesPullAt?: Date | null;
   lastSyncError?: string | null;
+  liveMastersPullFromCloud?: boolean;
 };
 
 export async function updateCloudConfig(
@@ -58,6 +62,7 @@ export async function updateCloudConfig(
       lastProfilesPullAt: input.lastProfilesPullAt ?? null,
       lastTeamNamesPullAt: input.lastTeamNamesPullAt ?? null,
       lastSyncError: input.lastSyncError ?? null,
+      liveMastersPullFromCloud: input.liveMastersPullFromCloud ?? true,
     },
     update: {
       ...(input.desktopToken !== undefined && { desktopToken: input.desktopToken }),
@@ -71,6 +76,9 @@ export async function updateCloudConfig(
       }),
       ...(input.lastSyncError !== undefined && {
         lastSyncError: input.lastSyncError,
+      }),
+      ...(input.liveMastersPullFromCloud !== undefined && {
+        liveMastersPullFromCloud: input.liveMastersPullFromCloud,
       }),
     },
   });

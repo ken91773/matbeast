@@ -19,9 +19,11 @@ export async function GET() {
 
 export async function POST(req: Request) {
   try {
-    const body = (await req.json()) as { name?: string };
+    const body = (await req.json()) as { name?: string; trainingMode?: boolean };
     const name = typeof body.name === "string" ? body.name : "Untitled event";
-    const t = await createTournamentWithName(name);
+    const t = await createTournamentWithName(name, {
+      trainingMode: Boolean(body.trainingMode),
+    });
     return NextResponse.json(t);
   } catch (e) {
     console.error("[POST /api/tournaments]", e);

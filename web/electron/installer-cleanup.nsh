@@ -21,18 +21,34 @@ done_init:
 
 !macro customInstall
   DetailPrint "Starting legacy cleanup..."
-  ; Remove common legacy desktop/start-menu shortcuts from prior variants.
+
+  ; Always remove very old shortcut names (no longer used by any current build).
   Delete "$DESKTOP\Mat Beast Score.lnk"
-  Delete "$DESKTOP\Mat Beast Scoreboard.lnk"
-  Delete "$SMPROGRAMS\Mat Beast Scoreboard.lnk"
   Delete "$SMPROGRAMS\Mat Beast Score.lnk"
 
-  ; Remove old per-user install roots that were used in earlier builds.
-  RMDir /r "$LOCALAPPDATA\Programs\matbeastscore"
-  RMDir /r "$LOCALAPPDATA\Programs\Mat Beast Score"
-  RMDir /r "$LOCALAPPDATA\Programs\Mat Beast Scoreboard"
+  !if "${APP_ID}" == "com.matbeastscore.scoreboard.demo"
+    ; ------------------------------------------------------------------
+    ; Demo installer — must NOT delete or recreate "Mat Beast Scoreboard.lnk"
+    ; (that name belongs to the production app). Only refresh *this* product's
+    ; shortcut using electron-builder defines (PRODUCT_FILENAME / exe name).
+    ; ------------------------------------------------------------------
+    Delete "$DESKTOP\${PRODUCT_FILENAME}.lnk"
+    Delete "$SMPROGRAMS\${PRODUCT_FILENAME}.lnk"
+    RMDir /r "$LOCALAPPDATA\Programs\matbeastscore"
+    RMDir /r "$LOCALAPPDATA\Programs\Mat Beast Score"
+    ; Fallback: desktop shortcut if assisted-install UI skipped it.
+    CreateShortCut "$DESKTOP\${PRODUCT_FILENAME}.lnk" "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
+  !else
+    ; ------------------------------------------------------------------
+    ; Production installer — legacy migration from older folder/shortcut names.
+    ; ------------------------------------------------------------------
+    Delete "$DESKTOP\Mat Beast Scoreboard.lnk"
+    Delete "$SMPROGRAMS\Mat Beast Scoreboard.lnk"
+    RMDir /r "$LOCALAPPDATA\Programs\matbeastscore"
+    RMDir /r "$LOCALAPPDATA\Programs\Mat Beast Score"
+    RMDir /r "$LOCALAPPDATA\Programs\Mat Beast Scoreboard"
+    CreateShortCut "$DESKTOP\${PRODUCT_FILENAME}.lnk" "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
+  !endif
 
-  ; Fallback: explicitly create the desktop shortcut in case task UI is skipped.
-  CreateShortCut "$DESKTOP\Mat Beast Scoreboard.lnk" "$INSTDIR\Mat Beast Scoreboard.exe"
   DetailPrint "Legacy cleanup complete."
 !macroend

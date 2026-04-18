@@ -173,11 +173,16 @@ export default function OverlayClient() {
   );
   const overlayTournamentId = runtimeTournamentId;
 
-  /** Keep `matbeastFetch` header aligned with resolved overlay tournament source. */
+  /**
+   * Keep `matbeastFetch` header aligned with resolved overlay tournament source.
+   * Preview iframe: do not write the shared tournament id — avoids touching
+   * localStorage from a nested document (and focus fights with the dashboard).
+   */
   useEffect(() => {
     if (!overlayTournamentId) return;
+    if (isPreview) return;
     setMatBeastTournamentId(overlayTournamentId);
-  }, [overlayTournamentId]);
+  }, [overlayTournamentId, isPreview]);
 
   useEffect(() => {
     const onTournamentId = (

@@ -2,6 +2,8 @@ import { Prisma, type BeltRank } from "@prisma/client";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { ensureMasterPlayerProfileTable } from "@/lib/master-player-profile-table";
+import { migrateMastersSplitIfNeeded } from "@/lib/migrate-masters-split";
+import { resolveUseTrainingMasters } from "@/lib/masters-training-mode";
 import { drainOutbox, queueOutboxOp, syncProfiles } from "@/lib/cloud-sync";
 
 const BELTS: readonly BeltRank[] = [
@@ -23,7 +25,7 @@ function isMissingMasterProfileTable(error: unknown): boolean {
   if (error.code !== "P2021") return false;
   const table =
     typeof error.meta?.table === "string" ? error.meta.table.toLowerCase() : "";
-  return table.includes("masterplayerprofile");
+  return table.includes("masterplayerprofile") || table.includes("trainingmasterplayerprofile");
 }
 
 /** Push a fully-shaped profile.upsert op to the cloud outbox + drain. */
@@ -57,11 +59,18 @@ async function queueProfileUpsertOp(row: {
 }
 
 /** Global master list (not scoped by tournament). */
-export async function GET() {
+export async function GET(req: Request) {
   try {
+    await migrateMastersSplitIfNeeded();
+    const training = await resolveUseTrainingMasters(req);
+    if (training) {
+      const profiles = await prisma.trainingMasterPlayerProfile.findMany({
+        orderBy: [{ lastName: "asc" }, { firstName: "asc" }],
+      });
+      return NextResponse.json({ profiles });
+    }
+
     await ensureMasterPlayerProfileTable();
-    // On-demand cloud sync: pull cloud rows + drain pending pushes.
-    // Failures are swallowed so we always serve cached local data.
     await syncProfiles().catch(() => {
       /* offline / cloud error - fall back to local cache */
     });
@@ -84,7 +93,8 @@ export async function GET() {
 /** Upsert by uppercase first + last name (historical master DB). */
 export async function POST(req: Request) {
   try {
-    await ensureMasterPlayerProfileTable();
+    await migrateMastersSplitIfNeeded();
+    const training = await resolveUseTrainingMasters(req);
     const body = (await req.json()) as {
       firstName?: string;
       lastName?: string;
@@ -107,6 +117,74 @@ export async function POST(req: Request) {
       );
     }
 
+    if (training) {
+      const existing = await prisma.trainingMasterPlayerProfile.findUnique({
+        where: { firstName_lastName: { firstName, lastName } },
+      });
+
+      if (existing) {
+        const merged = {
+          nickname:
+            "nickname" in body
+              ? typeof body.nickname === "string"
+                ? body.nickname.trim() || null
+                : (body.nickname ?? null)
+              : existing.nickname,
+          academyName:
+            "academyName" in body
+              ? typeof body.academyName === "string"
+                ? body.academyName.trim() || null
+                : (body.academyName ?? null)
+              : existing.academyName,
+          unofficialWeight:
+            "unofficialWeight" in body
+              ? body.unofficialWeight ?? null
+              : existing.unofficialWeight,
+          heightFeet:
+            "heightFeet" in body ? body.heightFeet ?? null : existing.heightFeet,
+          heightInches:
+            "heightInches" in body ? body.heightInches ?? null : existing.heightInches,
+          age: "age" in body ? body.age ?? null : existing.age,
+          beltRank: "beltRank" in body ? parseBelt(body.beltRank) : existing.beltRank,
+          profilePhotoUrl:
+            "profilePhotoUrl" in body
+              ? typeof body.profilePhotoUrl === "string"
+                ? body.profilePhotoUrl.trim() || null
+                : (body.profilePhotoUrl ?? null)
+              : existing.profilePhotoUrl,
+          headShotUrl:
+            "headShotUrl" in body
+              ? typeof body.headShotUrl === "string"
+                ? body.headShotUrl.trim() || null
+                : (body.headShotUrl ?? null)
+              : existing.headShotUrl,
+        };
+        const row = await prisma.trainingMasterPlayerProfile.update({
+          where: { id: existing.id },
+          data: merged,
+        });
+        return NextResponse.json(row);
+      }
+
+      const row = await prisma.trainingMasterPlayerProfile.create({
+        data: {
+          firstName,
+          lastName,
+          nickname: body.nickname?.trim() || null,
+          academyName: body.academyName?.trim() || null,
+          unofficialWeight: body.unofficialWeight ?? null,
+          heightFeet: body.heightFeet ?? null,
+          heightInches: body.heightInches ?? null,
+          age: body.age ?? null,
+          beltRank: parseBelt(body.beltRank),
+          profilePhotoUrl: body.profilePhotoUrl?.trim() || null,
+          headShotUrl: body.headShotUrl?.trim() || null,
+        },
+      });
+      return NextResponse.json(row);
+    }
+
+    await ensureMasterPlayerProfileTable();
     const existing = await prisma.masterPlayerProfile.findUnique({
       where: { firstName_lastName: { firstName, lastName } },
     });

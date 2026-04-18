@@ -136,6 +136,7 @@ export function parseMatBeastEventFileJson(
     }>;
   };
   audioVolumePercent?: number;
+  trainingMode?: boolean;
 } {
   const obj = raw as Partial<MatBeastEventEnvelope> & Record<string, unknown>;
   if (obj && obj.kind === "matbeast-event" && obj.version === 1 && obj.roster) {
@@ -189,6 +190,7 @@ export function parseMatBeastEventFileJson(
       document: parseRosterDocument(obj.roster),
       bracket,
       audioVolumePercent,
+      trainingMode: obj.trainingMode === true,
     };
   }
   return {

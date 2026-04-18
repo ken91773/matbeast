@@ -46,6 +46,7 @@ export async function POST(req: NextRequest, ctx: Ctx) {
       id: true,
       name: true,
       eventName: true,
+      trainingMode: true,
       currentVersion: true,
       currentBlobSha: true,
       sizeBytes: true,
@@ -112,6 +113,7 @@ export async function POST(req: NextRequest, ctx: Ctx) {
       data: {
         name: effectiveName.slice(0, 200),
         eventName: effectiveEventName.slice(0, 200),
+        trainingMode: src.trainingMode,
         ownerUserId: a.userId,
         currentVersion: 1,
         currentBlobSha: latestBlob.sha256,
@@ -141,6 +143,7 @@ export async function POST(req: NextRequest, ctx: Ctx) {
         id: created.id,
         name: created.name,
         eventName: created.eventName,
+        trainingMode: created.trainingMode,
         currentVersion: created.currentVersion,
         currentBlobSha: created.currentBlobSha,
         sizeBytes: created.sizeBytes,

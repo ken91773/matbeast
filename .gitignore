@@ -4,6 +4,7 @@ web/out/
 web/dist/
 web/dist-*/
 web/dist-fixed/
+web/build/variant.json
 web/tsconfig.tsbuildinfo
 web/.env
 web/.env*.local

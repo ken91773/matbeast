@@ -8,6 +8,7 @@
  */
 import { useEventWorkspace } from "@/components/EventWorkspaceProvider";
 import {
+  matbeastBackupTabByIdToDisk,
   matbeastImportOpenedEventFile,
   matbeastOpenEventOrShowPicker,
   matbeastRestoreFromDiskToCloud,
@@ -15,6 +16,7 @@ import {
   matbeastSaveActiveTabAs,
 } from "@/lib/matbeast-dashboard-file-actions";
 import { matbeastDebugLog } from "@/lib/matbeast-debug-log";
+import { getMatBeastTournamentId } from "@/lib/matbeast-fetch";
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
 
@@ -65,6 +67,9 @@ export function NativeFileMenuBridge() {
           queryClient,
           openEventInTab,
           refreshTournaments,
+          openTabs,
+          selectTab,
+          setShowHome,
         });
       } catch (e) {
         window.alert(e instanceof Error ? e.message : "Could not open event");
@@ -91,6 +96,9 @@ export function NativeFileMenuBridge() {
         queryClient,
         openEventInTab,
         refreshTournaments,
+        openTabs,
+        selectTab,
+        setShowHome,
       });
     },
     runSave: async () => {
@@ -127,8 +135,29 @@ export function NativeFileMenuBridge() {
         void h.runOpenRecent(d.filePath);
       }
       else if (d.action === "save") void h.runSave();
-      else if (d.action === "saveAs" || d.action === "backupToDisk") {
+      else if (d.action === "saveAs") {
         void h.runSaveAs();
+      } else if (d.action === "backupToDisk") {
+        void (async () => {
+          if (!readyRef.current) {
+            window.alert("Workspace is still loading. Try again in a moment.");
+            return;
+          }
+          const tid = getMatBeastTournamentId();
+          if (!tid) {
+            window.alert("Open or create an event before backing up.");
+            return;
+          }
+          const wrote = await matbeastBackupTabByIdToDisk({
+            queryClient,
+            selectTab,
+            getOpenTabs: () => openTabsRef.current,
+            tabId: tid,
+          });
+          if (wrote) {
+            matbeastDebugLog("native-file-menu", "backupToDisk", "ok", tid);
+          }
+        })();
       } else if (d.action === "openCloud") {
         window.dispatchEvent(new CustomEvent("matbeast-cloud-open-dialog"));
       } else if (d.action === "uploadCloud") {

@@ -35,10 +35,17 @@ export async function ensureDefaultTournament() {
   return t;
 }
 
-export async function createTournamentWithName(name: string) {
+export async function createTournamentWithName(
+  name: string,
+  opts?: { trainingMode?: boolean },
+) {
   const trimmed = name.trim() || DEFAULT_NAME;
   const t = await prisma.tournament.create({
-    data: { name: trimmed, maxTeams: 8 },
+    data: {
+      name: trimmed,
+      maxTeams: 8,
+      trainingMode: Boolean(opts?.trainingMode),
+    },
   });
   await ensurePrimaryEventForTournament(t.id);
   const eventId = await getPrimaryEventIdOrThrow(t.id);
@@ -59,7 +66,13 @@ export async function createTournamentWithName(name: string) {
 export async function listTournaments() {
   return prisma.tournament.findMany({
     orderBy: { updatedAt: "desc" },
-    select: { id: true, name: true, updatedAt: true, createdAt: true },
+    select: {
+      id: true,
+      name: true,
+      updatedAt: true,
+      createdAt: true,
+      trainingMode: true,
+    },
   });
 }
 
@@ -87,7 +100,12 @@ export async function duplicateTournament(sourceId: string, newName: string) {
 
   return prisma.$transaction(async (tx) => {
     const t = await tx.tournament.create({
-      data: { name: trimmed, maxTeams: src.maxTeams, eliminationMode: src.eliminationMode },
+      data: {
+        name: trimmed,
+        maxTeams: src.maxTeams,
+        eliminationMode: src.eliminationMode,
+        trainingMode: src.trainingMode,
+      },
     });
     const ev = await tx.event.create({
       data: { tournamentId: t.id, kind: primary.kind },

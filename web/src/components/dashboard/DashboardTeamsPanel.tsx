@@ -257,7 +257,7 @@ export function DashboardTeamsPanel() {
   }, [data?.teams]);
 
   const { data: masterTeamPayload, refetch: refetchMasterTeamNames } = useQuery({
-    queryKey: matbeastKeys.masterTeamNames(),
+    queryKey: matbeastKeys.masterTeamNames(tournamentId),
     queryFn: () => matbeastJson<{ names: string[] }>("/api/master-team-names"),
     enabled: ready && !!tournamentId,
   });
@@ -283,9 +283,11 @@ export function DashboardTeamsPanel() {
   }, [queryClient, tournamentId]);
 
   const invalidateMasterTeams = useCallback(() => {
-    void queryClient.invalidateQueries({ queryKey: matbeastKeys.masterTeamNames() });
+    void queryClient.invalidateQueries({
+      queryKey: matbeastKeys.masterTeamNames(tournamentId),
+    });
     void refetchMasterTeamNames();
-  }, [queryClient, refetchMasterTeamNames]);
+  }, [queryClient, refetchMasterTeamNames, tournamentId]);
 
   const patchTeam = useMutation({
     mutationFn: async ({

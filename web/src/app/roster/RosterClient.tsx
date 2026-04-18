@@ -1,7 +1,7 @@
 "use client";
 
 import type { BeltRank } from "@prisma/client";
-import { matbeastFetch } from "@/lib/matbeast-fetch";
+import { getMatBeastTournamentId, matbeastFetch } from "@/lib/matbeast-fetch";
 import { matbeastKeys } from "@/lib/matbeast-query-keys";
 import { matbeastJson } from "@/lib/matbeast-query";
 import { openScoreboardOverlayWindow } from "@/lib/open-scoreboard-overlay";
@@ -1196,6 +1196,7 @@ function PlayerEntryForm({
   liveTournamentId?: string | null;
 }) {
   const queryClient = useQueryClient();
+  const masterScopeId = liveTournamentId ?? getMatBeastTournamentId();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [masterPickId, setMasterPickId] = useState("");
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
@@ -1288,8 +1289,9 @@ function PlayerEntryForm({
   }, [teamsEffective]);
 
   const { data: masterTeamPayload, refetch: refetchMasterTeamNames } = useQuery({
-    queryKey: matbeastKeys.masterTeamNames(),
+    queryKey: matbeastKeys.masterTeamNames(masterScopeId),
     queryFn: () => matbeastJson<{ names: string[] }>("/api/master-team-names"),
+    enabled: Boolean(masterScopeId),
   });
   const masterTeamNames = useMemo<string[]>(
     () => masterTeamPayload?.names ?? [],
@@ -1390,10 +1392,10 @@ function PlayerEntryForm({
   }, [rowOfficialWeightDrafts]);
 
   const { data: masterPayload, refetch: refetchMasterProfiles } = useQuery({
-    queryKey: matbeastKeys.playerProfiles(),
+    queryKey: matbeastKeys.playerProfiles(masterScopeId),
     queryFn: () =>
       matbeastJson<{ profiles: MasterPlayerProfileRow[] }>("/api/player-profiles"),
-    enabled: showMasterProfilePicker,
+    enabled: showMasterProfilePicker && Boolean(masterScopeId),
   });
   const masterProfiles = useMemo<MasterPlayerProfileRow[]>(
     () => masterPayload?.profiles ?? [],
@@ -1461,7 +1463,9 @@ function PlayerEntryForm({
         body: JSON.stringify({ name: n }),
       });
       if (!res.ok) return;
-      await queryClient.invalidateQueries({ queryKey: matbeastKeys.masterTeamNames() });
+      await queryClient.invalidateQueries({
+        queryKey: matbeastKeys.masterTeamNames(masterScopeId),
+      });
       await refetchMasterTeamNames();
     } catch {
       /* ignore */
@@ -1776,7 +1780,7 @@ function PlayerEntryForm({
         throw new Error(j.error ?? "Delete failed");
       }
       await queryClient.invalidateQueries({
-        queryKey: matbeastKeys.playerProfiles(),
+        queryKey: matbeastKeys.playerProfiles(masterScopeId),
       });
       await refetchMasterProfiles();
       setMasterProfileDeleteDialogOpen(false);
@@ -1820,7 +1824,7 @@ function PlayerEntryForm({
         }
       }
       await queryClient.invalidateQueries({
-        queryKey: matbeastKeys.playerProfiles(),
+        queryKey: matbeastKeys.playerProfiles(masterScopeId),
       });
       await refetchMasterProfiles();
       if (liveTournamentId) {
@@ -2049,7 +2053,7 @@ function PlayerEntryForm({
         }
       }
       await queryClient.invalidateQueries({
-        queryKey: matbeastKeys.playerProfiles(),
+        queryKey: matbeastKeys.playerProfiles(masterScopeId),
       });
       await refetchMasterProfiles();
       if (liveTournamentId) {
@@ -2788,7 +2792,7 @@ function PlayerEntryForm({
                 className="inline-flex shrink-0 items-center justify-center rounded border border-zinc-600 p-0.5 text-zinc-400 hover:border-teal-700/50 hover:text-teal-200 disabled:opacity-30"
                 onClick={() => {
                   void queryClient.invalidateQueries({
-                    queryKey: matbeastKeys.playerProfiles(),
+                    queryKey: matbeastKeys.playerProfiles(masterScopeId),
                   });
                   void refetchMasterProfiles();
                 }}

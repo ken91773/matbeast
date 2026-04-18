@@ -5,12 +5,12 @@ import {
   isOverlayOutputBroadcast,
   openOverlayOutputChannel,
 } from "@/lib/overlay-output-broadcast";
-import { openScoreboardOverlayWindow } from "@/lib/open-scoreboard-overlay";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
- * Dashboard-only: drive the external overlay window live/stopped state and keep UI in sync
- * when the output window closes (broadcast `output-closed`).
+ * Dashboard-only: drive overlay LIVE/STOPPED via BroadcastChannel (iframe preview +
+ * any open output windows). Does not spawn Electron/browser windows — use
+ * Control / Roster "open overlay" for that.
  */
 export function useOverlayOutputLiveControl() {
   const [live, setLive] = useState(false);
@@ -52,18 +52,17 @@ export function useOverlayOutputLiveControl() {
   }, [setLiveAndBroadcast]);
 
   const activateOverlay = useCallback(() => {
-    if (!openScoreboardOverlayWindow()) return;
     setLiveAndBroadcast(true);
   }, [setLiveAndBroadcast]);
 
   const toggleLive = useCallback(() => {
     const next = !liveRef.current;
     if (next) {
-      activateOverlay();
+      setLiveAndBroadcast(true);
     } else {
       setLiveAndBroadcast(false);
     }
-  }, [activateOverlay, setLiveAndBroadcast]);
+  }, [setLiveAndBroadcast]);
 
   return {
     overlayOutputLive: live,

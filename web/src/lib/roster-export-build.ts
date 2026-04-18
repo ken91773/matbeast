@@ -82,6 +82,7 @@ export function wrapMatBeastEventFile(
   audioVolumePercent?: number,
   /** Board / on-disk file label; when set, `eventFileKey` in JSON follows this, not `eventName`. */
   eventFileKeySource?: string | null,
+  trainingMode?: boolean,
 ) {
   const key = normalizeEventFileKey(eventFileKeySource ?? eventName);
   return {
@@ -93,5 +94,7 @@ export function wrapMatBeastEventFile(
     roster,
     ...(bracket ? { bracket } : {}),
     ...(typeof audioVolumePercent === "number" ? { audioVolumePercent } : {}),
+    /** Always present so .matb files clearly state live vs training (home list also uses DB merge). */
+    trainingMode: Boolean(trainingMode),
   };
 }

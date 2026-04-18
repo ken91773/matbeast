@@ -1,7 +1,13 @@
 /**
  * Scoreboard + bracket output: two windows (Electron) or two popups (browser dev).
  * Dashboard preview uses `/overlay?preview=1` only — not these URLs.
+ *
+ * Demo variant: never opens external windows or browser popups. OVERLAY LIVE /
+ * STOPPED is driven only via BroadcastChannel so the in-dashboard iframe shows
+ * the barn-door / red-background behavior without spawning output windows.
  */
+import { isMatbeastDemo } from "@/lib/matbeast-variant-client";
+
 const BROWSER_SB_NAME = "MATBEAST_OVERLAY_SCOREBOARD";
 const BROWSER_BR_NAME = "MATBEAST_OVERLAY_BRACKET";
 
@@ -11,6 +17,10 @@ let browserBracketRef: Window | null = null;
 /** @returns true if overlay output was requested (Electron) or popups opened (browser). */
 export function openScoreboardOverlayWindow(): boolean {
   if (typeof window === "undefined") return false;
+
+  if (isMatbeastDemo()) {
+    return true;
+  }
 
   const desktop = window.matBeastDesktop;
   if (desktop?.openScoreboardOverlayWindow) {

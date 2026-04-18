@@ -2,6 +2,8 @@ import { Prisma, type BeltRank } from "@prisma/client";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { ensureMasterPlayerProfileTable } from "@/lib/master-player-profile-table";
+import { migrateMastersSplitIfNeeded } from "@/lib/migrate-masters-split";
+import { resolveUseTrainingMasters } from "@/lib/masters-training-mode";
 import { drainOutbox, queueOutboxOp } from "@/lib/cloud-sync";
 
 function isMissingMasterProfileTable(error: unknown): boolean {
@@ -9,7 +11,7 @@ function isMissingMasterProfileTable(error: unknown): boolean {
   if (error.code !== "P2021") return false;
   const table =
     typeof error.meta?.table === "string" ? error.meta.table.toLowerCase() : "";
-  return table.includes("masterplayerprofile");
+  return table.includes("masterplayerprofile") || table.includes("trainingmasterplayerprofile");
 }
 
 type Params = { params: Promise<{ id: string }> };
@@ -25,7 +27,8 @@ export async function PATCH(req: Request, { params }: Params) {
     return NextResponse.json({ error: "Missing id" }, { status: 400 });
   }
   try {
-    await ensureMasterPlayerProfileTable();
+    await migrateMastersSplitIfNeeded();
+    const training = await resolveUseTrainingMasters(req);
     const body = (await req.json()) as {
       firstName?: string;
       lastName?: string;
@@ -44,6 +47,28 @@ export async function PATCH(req: Request, { params }: Params) {
     if (!firstName || !lastName) {
       return NextResponse.json({ error: "firstName and lastName are required" }, { status: 400 });
     }
+
+    if (training) {
+      const row = await prisma.trainingMasterPlayerProfile.update({
+        where: { id },
+        data: {
+          firstName,
+          lastName,
+          nickname: body.nickname?.trim() || null,
+          academyName: body.academyName?.trim() || null,
+          unofficialWeight: body.unofficialWeight ?? null,
+          heightFeet: body.heightFeet ?? null,
+          heightInches: body.heightInches ?? null,
+          age: body.age ?? null,
+          beltRank: parseBelt(body.beltRank),
+          profilePhotoUrl: body.profilePhotoUrl?.trim() || null,
+          headShotUrl: body.headShotUrl?.trim() || null,
+        },
+      });
+      return NextResponse.json(row);
+    }
+
+    await ensureMasterPlayerProfileTable();
     const row = await prisma.masterPlayerProfile.update({
       where: { id },
       data: {
@@ -93,15 +118,21 @@ export async function PATCH(req: Request, { params }: Params) {
   }
 }
 
-export async function DELETE(_req: Request, { params }: Params) {
+export async function DELETE(req: Request, { params }: Params) {
   const { id } = await params;
   if (!id?.trim()) {
     return NextResponse.json({ error: "Missing id" }, { status: 400 });
   }
   try {
+    await migrateMastersSplitIfNeeded();
+    const training = await resolveUseTrainingMasters(req);
+
+    if (training) {
+      await prisma.trainingMasterPlayerProfile.delete({ where: { id } });
+      return NextResponse.json({ ok: true });
+    }
+
     await ensureMasterPlayerProfileTable();
-    // Capture identity + cloud id BEFORE deleting so the outbox op has
-    // enough info to delete the corresponding cloud row.
     const existing = await prisma.masterPlayerProfile.findUnique({
       where: { id },
       select: { firstName: true, lastName: true, cloudId: true },

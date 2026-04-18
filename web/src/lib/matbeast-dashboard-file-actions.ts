@@ -9,6 +9,10 @@ import {
 } from "@/lib/roster-export-build";
 import { parseMatBeastEventFileJson } from "@/lib/roster-file-parse";
 import { normalizeEventFileKey } from "@/lib/event-file-key";
+import {
+  findTournamentIdForFilePath,
+  registerOpenEventFilePath,
+} from "@/lib/matbeast-open-file-registry";
 import { getEventDiskPath, setEventDiskPath } from "@/lib/matbeast-disk-path";
 import { markTournamentClean, markTournamentDirty } from "@/lib/matbeast-document-dirty";
 import { matbeastKeys } from "@/lib/matbeast-query-keys";
@@ -19,6 +23,7 @@ import {
   markCloudUnreachable,
   probeCloud,
 } from "@/lib/matbeast-cloud-online";
+import { isMatbeastDemo } from "@/lib/matbeast-variant-client";
 
 /**
  * On-disk extension for exported event envelopes (payload is JSON).
@@ -70,6 +75,75 @@ function downloadEventFile(filename: string, text: string) {
   a.download = name;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+type OpenEventPick =
+  | { ok: true; filePath: string; text: string }
+  | { ok: false; canceled?: boolean; error?: string };
+
+/**
+ * Reads an event envelope from disk. Uses the native Electron open dialog when
+ * `showOpenEventDialog` is available; otherwise falls back to a hidden file
+ * input so File ▸ Restore / Open still works if the preload API is missing or
+ * not exposed as a function (seen in some packaged builds).
+ */
+async function pickOpenedEventFileContents(): Promise<OpenEventPick> {
+  const desk =
+    typeof window !== "undefined" ? window.matBeastDesktop : undefined;
+  if (typeof desk?.showOpenEventDialog === "function") {
+    return desk.showOpenEventDialog();
+  }
+  if (typeof window === "undefined") {
+    return { ok: false, error: "Not in a browser context." };
+  }
+  return pickOpenedEventFileViaHiddenInput();
+}
+
+function pickOpenedEventFileViaHiddenInput(): Promise<OpenEventPick> {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".matb,.json,.mat,application/json";
+    let settled = false;
+    const finish = (r: OpenEventPick) => {
+      if (settled) return;
+      settled = true;
+      input.remove();
+      resolve(r);
+    };
+
+    const onWindowFocus = () => {
+      window.removeEventListener("focus", onWindowFocus);
+      window.setTimeout(() => {
+        if (settled) return;
+        if (!input.files?.length) {
+          finish({ ok: false, canceled: true });
+        }
+      }, 450);
+    };
+    window.addEventListener("focus", onWindowFocus);
+
+    input.addEventListener("change", () => {
+      window.removeEventListener("focus", onWindowFocus);
+      const file = input.files?.[0];
+      if (!file) {
+        finish({ ok: false, canceled: true });
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        const text = typeof reader.result === "string" ? reader.result : "";
+        finish({ ok: true, filePath: file.name, text });
+      };
+      reader.onerror = () => {
+        finish({ ok: false, error: "Could not read file" });
+      };
+      reader.readAsText(file);
+    });
+
+    document.body.appendChild(input);
+    input.click();
+  });
 }
 
 function rosterLabelToDefaultDiskFilename(rosterFileLabel: string) {
@@ -184,12 +258,23 @@ export async function buildEnvelopeText(args: {
   } catch {
     // Keep save robust if bracket read fails.
   }
+  let trainingMode = false;
+  try {
+    const boardRes = await matbeastFetch("/api/board");
+    if (boardRes.ok) {
+      const b = (await boardRes.json()) as { trainingMode?: boolean };
+      trainingMode = Boolean(b.trainingMode);
+    }
+  } catch {
+    /* ignore */
+  }
   const envelope = wrapMatBeastEventFile(
     eventTitle,
     roster,
     bracket,
     getAudioVolumePercent(),
     rosterFileLabel,
+    trainingMode,
   );
   return {
     text: JSON.stringify(envelope, null, 2),
@@ -262,6 +347,24 @@ export async function matbeastSaveTabById(
     if (!silent) window.alert("Open or create an event before saving.");
     emitSaveStatus("error", tabId, { silent, message: "Save failed" });
     return false;
+  }
+
+  /**
+   * Demo variant: skip the entire cloud pipeline. The user's edits
+   * were already persisted to the local SQLite by the individual
+   * mutation routes; "save" is a no-op beyond flipping the dirty
+   * flag and letting the UI emit a success state. Running the cloud
+   * pipeline in demo would issue `/api/cloud/events/push` calls
+   * that always fail ("cloud not configured") and leave the status
+   * badge stuck on "save failed".
+   */
+  if (isMatbeastDemo()) {
+    markTournamentClean(tabId);
+    emitSaveStatus("success", tabId, {
+      silent,
+      message: silent ? "" : "Saved",
+    });
+    return true;
   }
 
   let rosterFileName = "UNTITLED";
@@ -756,6 +859,7 @@ type CreateCloudUntitledResult =
 async function createCloudUntitledForNewTab(
   tournamentId: string,
   preferredName?: string,
+  opts?: { trainingMode?: boolean },
 ): Promise<CreateCloudUntitledResult> {
   try {
     const cfgRes = await fetch("/api/cloud/config", { cache: "no-store" });
@@ -805,6 +909,7 @@ async function createCloudUntitledForNewTab(
         tournamentId,
         envelope,
         name: cloudName,
+        trainingMode: Boolean(opts?.trainingMode),
       }),
     });
     if (upRes.status === 409) {
@@ -839,7 +944,7 @@ async function createCloudUntitledForNewTab(
 /** Creates a new server tournament and opens it as a new tab (desktop + web). */
 export async function matbeastCreateNewEventTab(opts: {
   queryClient: QueryClient;
-  openEventInTab: (id: string, name: string) => void;
+  openEventInTab: (id: string, name: string, trainingMode?: boolean) => void;
   refreshTournaments: () => Promise<void>;
   /**
    * Lets us rename the tab once the cloud picks an "UNTITLED(N)" slot.
@@ -856,6 +961,8 @@ export async function matbeastCreateNewEventTab(opts: {
    */
   eventName?: string;
   filename?: string;
+  /** Training event files use the separate TrainingMaster* lists. */
+  trainingMode?: boolean;
 }) {
   const {
     queryClient,
@@ -864,6 +971,7 @@ export async function matbeastCreateNewEventTab(opts: {
     updateTabName,
     eventName: requestedEventName,
     filename: requestedFilename,
+    trainingMode: requestedTrainingMode,
   } = opts;
 
   /**
@@ -874,22 +982,30 @@ export async function matbeastCreateNewEventTab(opts: {
    * filename slot reserved, no catalog row). The user's recovery
    * path from that state is murky, so we'd rather block creation
    * up front with a clear message than produce a half-synced tab.
+   *
+   * The demo variant is always offline-by-design, so the probe
+   * would always fail. We skip it entirely and the
+   * `createCloudUntitledForNewTab` call later in this function is
+   * similarly guarded so no cloud POST is ever issued.
    */
-  const probed = await probeCloud();
-  if (!probed.online) {
-    if (probed.reason === "not-configured") {
-      window.alert(
-        "Cloud sync is not configured on this machine. Configure it under " +
-          "Options ▸ CLOUD SYNC… before creating a new event.",
-      );
-    } else {
-      window.alert(
-        "Can't reach the cloud right now, so a new event can't be created. " +
-          "Check your internet connection and try again. Your existing open " +
-          "events will keep working and re-sync when the connection returns.",
-      );
+  const demoMode = isMatbeastDemo();
+  if (!demoMode) {
+    const probed = await probeCloud();
+    if (!probed.online) {
+      if (probed.reason === "not-configured") {
+        window.alert(
+          "Cloud sync is not configured on this machine. Configure it under " +
+            "Options ▸ CLOUD SYNC… before creating a new event.",
+        );
+      } else {
+        window.alert(
+          "Can't reach the cloud right now, so a new event can't be created. " +
+            "Check your internet connection and try again. Your existing open " +
+            "events will keep working and re-sync when the connection returns.",
+        );
+      }
+      return { ok: false } as const;
     }
-    return { ok: false } as const;
   }
 
   const requestedName =
@@ -897,16 +1013,24 @@ export async function matbeastCreateNewEventTab(opts: {
   const res = await fetch("/api/tournaments", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: requestedName }),
+    body: JSON.stringify({
+      name: requestedName,
+      trainingMode: Boolean(requestedTrainingMode),
+    }),
   });
-  const j = (await res.json()) as { id?: string; name?: string; error?: string };
+  const j = (await res.json()) as {
+    id?: string;
+    name?: string;
+    trainingMode?: boolean;
+    error?: string;
+  };
   if (!res.ok || !j.id) {
     window.alert(j.error ?? "Could not create event");
     return { ok: false } as const;
   }
   const initialLabel = (j.name ?? requestedName).trim() || requestedName;
   matbeastDebugLog("file:new-tab", "created tournament", j.id, initialLabel);
-  openEventInTab(j.id, initialLabel);
+  openEventInTab(j.id, initialLabel, Boolean(j.trainingMode));
   setAudioVolumePercent(100);
   const placeholderFileName =
     (requestedFilename ?? "").trim() || `${formatTodayMMDD()}-1`;
@@ -933,6 +1057,18 @@ export async function matbeastCreateNewEventTab(opts: {
   );
 
   /**
+   * Demo variant: no cloud to upload to, so we stop here with a
+   * clean local-only tournament. The placeholder filename we PATCH'd
+   * above is final. Returning `cloudSkipped: true` matches the same
+   * shape the offline/unconfigured production path uses so the
+   * caller (AppChrome's new-event dialog) doesn't need a
+   * demo-specific branch.
+   */
+  if (demoMode) {
+    return { ok: true, tournamentId: j.id, cloudSkipped: true } as const;
+  }
+
+  /**
    * Cloud-first new-event flow (added v0.8.2, dated in v0.8.5): if the
    * install is signed in, mirror the brand-new tournament to the cloud
    * immediately under the dialog-picked filename, or — when the caller
@@ -945,6 +1081,7 @@ export async function matbeastCreateNewEventTab(opts: {
   const cloudResult = await createCloudUntitledForNewTab(
     j.id,
     requestedFilename?.trim() || undefined,
+    { trainingMode: Boolean(j.trainingMode ?? requestedTrainingMode) },
   );
   if (cloudResult.status === "ok") {
     matbeastDebugLog(
@@ -1006,10 +1143,42 @@ export async function matbeastImportOpenedEventFile(opts: {
   filePath: string;
   text: string;
   queryClient: QueryClient;
-  openEventInTab: (id: string, name: string) => void;
+  openEventInTab: (id: string, name: string, trainingMode?: boolean) => void;
   refreshTournaments: () => Promise<void>;
+  /**
+   * When set (e.g. opening from cloud catalog), overrides `trainingMode`
+   * parsed from the file so metadata matches events saved before the
+   * envelope included `trainingMode`.
+   */
+  trainingModeOverride?: boolean;
+  /**
+   * When provided, opening the same `filePath` again focuses the existing
+   * tab instead of creating another tournament (desktop + cloud synthetic paths).
+   */
+  openTabs?: EventTab[];
+  selectTab?: (id: string) => void;
+  setShowHome?: (show: boolean) => void;
 }) {
-  const { filePath, text, queryClient, openEventInTab, refreshTournaments } = opts;
+  const {
+    filePath,
+    text,
+    queryClient,
+    openEventInTab,
+    refreshTournaments,
+    trainingModeOverride,
+    openTabs,
+    selectTab,
+    setShowHome,
+  } = opts;
+
+  const existingTid = findTournamentIdForFilePath(filePath);
+  if (existingTid && openTabs?.some((t) => t.id === existingTid)) {
+    selectTab?.(existingTid);
+    setShowHome?.(false);
+    matbeastDebugLog("file:import", "reuse open tab (same path)", existingTid, filePath);
+    return;
+  }
+
   let parsed: unknown;
   try {
     parsed = JSON.parse(text) as unknown;
@@ -1019,16 +1188,29 @@ export async function matbeastImportOpenedEventFile(opts: {
   }
   const fallbackName =
     filePath.split(/[/\\]/).pop()?.replace(EVENT_FILENAME_EXT_RE, "") ?? "Imported event";
-  const { eventName, document, bracket, audioVolumePercent } = parseMatBeastEventFileJson(
-    parsed,
-    fallbackName,
-  );
+  const {
+    eventName,
+    document,
+    bracket,
+    audioVolumePercent,
+    trainingMode: fileTrainingMode,
+  } = parseMatBeastEventFileJson(parsed, fallbackName);
+  const effectiveTrainingMode =
+    trainingModeOverride !== undefined ? trainingModeOverride : fileTrainingMode;
   const res = await fetch("/api/tournaments", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: eventName }),
+    body: JSON.stringify({
+      name: eventName,
+      trainingMode: effectiveTrainingMode,
+    }),
   });
-  const j = (await res.json()) as { id?: string; name?: string; error?: string };
+  const j = (await res.json()) as {
+    id?: string;
+    name?: string;
+    trainingMode?: boolean;
+    error?: string;
+  };
   if (!res.ok || !j.id) {
     window.alert(j.error ?? "Could not create event from file");
     return;
@@ -1036,7 +1218,7 @@ export async function matbeastImportOpenedEventFile(opts: {
   matbeastDebugLog("file:import", "open tab", j.id, j.name ?? eventName, {
     filePath,
   });
-  openEventInTab(j.id, j.name ?? eventName);
+  openEventInTab(j.id, j.name ?? eventName, j.trainingMode ?? effectiveTrainingMode);
   const fileKey = normalizeEventFileKey(eventName) ?? j.id;
   /**
    * `x-matbeast-skip-undo: "1"` is critical here.
@@ -1079,6 +1261,7 @@ export async function matbeastImportOpenedEventFile(opts: {
     setAudioVolumePercent(audioVolumePercent);
   }
   setEventDiskPath(fileKey, filePath);
+  registerOpenEventFilePath(j.id, filePath);
   const displayFile = eventNameFromPath(filePath);
   await syncBoardFileName(queryClient, displayFile, j.id);
   matbeastDebugLog("file:import", "syncBoardFileName", displayFile);
@@ -1196,6 +1379,7 @@ export async function matbeastSaveActiveTabAs(opts: {
       const pickedName = eventNameFromPath(pick.filePath);
       const pickedKey = normalizeEventFileKey(pickedName) ?? tid;
       setEventDiskPath(pickedKey, pick.filePath);
+      registerOpenEventFilePath(tid, pick.filePath);
       const w = await desk.writeTextFile(pick.filePath, text);
       if (!w.ok) window.alert(w.error ?? "Could not write file");
       if (w.ok) {
@@ -1239,15 +1423,10 @@ export async function matbeastSaveActiveTabAs(opts: {
  */
 export async function matbeastRestoreFromDiskToCloud(opts: {
   queryClient: QueryClient;
-  openEventInTab: (id: string, name: string) => void;
+  openEventInTab: (id: string, name: string, trainingMode?: boolean) => void;
   refreshTournaments: () => Promise<void>;
 }): Promise<void> {
-  const desk = typeof window !== "undefined" ? window.matBeastDesktop : undefined;
-  if (!desk?.showOpenEventDialog) {
-    window.alert("Restore is only available in the desktop app.");
-    return;
-  }
-  const pick = await desk.showOpenEventDialog();
+  const pick = await pickOpenedEventFileContents();
   if (!pick.ok) {
     if (pick.error) window.alert(pick.error);
     return;
@@ -1296,6 +1475,39 @@ export async function matbeastRestoreFromDiskToCloud(opts: {
   }
   if (typeof audioVolumePercent === "number") {
     setAudioVolumePercent(audioVolumePercent);
+  }
+
+  /**
+   * Demo / local-only: import into SQLite and assign a unique on-app filename.
+   * No cloud upload — the restore pipeline above is cloud-centric.
+   */
+  if (isMatbeastDemo()) {
+    let existing: string[] = [];
+    try {
+      const rfRes = await fetch("/api/tournaments/roster-filenames", {
+        cache: "no-store",
+      });
+      if (rfRes.ok) {
+        const data = (await rfRes.json()) as { names?: string[] };
+        existing = (data.names ?? []).map((n) => (n ?? "").trim()).filter(Boolean);
+      }
+    } catch {
+      /* best-effort */
+    }
+    const localName = pickRecoveredCloudFilename(stem, existing);
+    await matbeastFetch("/api/board", {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        "x-matbeast-tournament-id": j.id,
+        "x-matbeast-skip-undo": "1",
+      },
+      body: JSON.stringify({ currentRosterFileName: localName }),
+    });
+    await opts.queryClient.invalidateQueries({ queryKey: matbeastKeys.all });
+    await opts.refreshTournaments();
+    markTournamentClean(j.id);
+    return;
   }
 
   // Compute a non-colliding cloud filename of the form
@@ -1397,11 +1609,19 @@ export function pickRecoveredCloudFilename(
 /** Open file dialog (desktop) or request the in-app picker (web). */
 export async function matbeastOpenEventOrShowPicker(opts: {
   queryClient: QueryClient;
-  openEventInTab: (id: string, name: string) => void;
+  openEventInTab: (id: string, name: string, trainingMode?: boolean) => void;
   refreshTournaments: () => Promise<void>;
+  openTabs?: EventTab[];
+  selectTab?: (id: string) => void;
+  setShowHome?: (show: boolean) => void;
 }) {
   const desk = typeof window !== "undefined" ? window.matBeastDesktop : undefined;
-  if (desk?.showOpenEventDialog) {
+  const passThrough = {
+    openTabs: opts.openTabs,
+    selectTab: opts.selectTab,
+    setShowHome: opts.setShowHome,
+  };
+  if (typeof desk?.showOpenEventDialog === "function") {
     const r = await desk.showOpenEventDialog();
     if (!r.ok) {
       if (r.error) window.alert(r.error);
@@ -1413,6 +1633,23 @@ export async function matbeastOpenEventOrShowPicker(opts: {
       queryClient: opts.queryClient,
       openEventInTab: opts.openEventInTab,
       refreshTournaments: opts.refreshTournaments,
+      ...passThrough,
+    });
+    return;
+  }
+  if (desk?.isDesktopApp) {
+    const r = await pickOpenedEventFileViaHiddenInput();
+    if (!r.ok) {
+      if (r.error) window.alert(r.error);
+      return;
+    }
+    await matbeastImportOpenedEventFile({
+      filePath: r.filePath,
+      text: r.text,
+      queryClient: opts.queryClient,
+      openEventInTab: opts.openEventInTab,
+      refreshTournaments: opts.refreshTournaments,
+      ...passThrough,
     });
     return;
   }

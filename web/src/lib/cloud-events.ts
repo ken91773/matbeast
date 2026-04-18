@@ -20,6 +20,8 @@ export type CloudEventMeta = {
    * case so the homepage catalog never shows an empty label.
    */
   eventName: string | null;
+  /** Training event files (separate master lists). Omitted on older cloud rows → treat as false. */
+  trainingMode?: boolean;
   ownerUserId: string;
   currentVersion: number;
   currentBlobSha: string | null;
@@ -105,7 +107,7 @@ export async function listCloudEvents(): Promise<CloudEventMeta[]> {
  */
 export async function patchCloudEvent(
   cloudEventId: string,
-  patch: { name?: string; eventName?: string | null },
+  patch: { name?: string; eventName?: string | null; trainingMode?: boolean },
 ): Promise<
   | { kind: "ok"; event: CloudEventMeta }
   | { kind: "error"; status: number; message: string }
@@ -314,7 +316,7 @@ export async function pullCloudEventBlob(
 export async function createCloudEvent(
   name: string,
   bytes: Buffer,
-  opts?: { eventName?: string | null },
+  opts?: { eventName?: string | null; trainingMode?: boolean },
 ): Promise<
   | { kind: "ok"; event: CloudEventMeta }
   | {
@@ -342,6 +344,9 @@ export async function createCloudEvent(
       url.searchParams.set("name", name);
       if (opts?.eventName && opts.eventName.trim().length > 0) {
         url.searchParams.set("eventName", opts.eventName.trim());
+      }
+      if (opts?.trainingMode) {
+        url.searchParams.set("trainingMode", "1");
       }
       const r = await fetch(url.toString(), {
         method: "POST",

@@ -6,6 +6,10 @@
  * Disable:
  *   localStorage.removeItem("matbeastDebug")
  *
+ * Focus / keyboard routing (separate flag, same reload pattern):
+ *   localStorage.setItem("matbeastFocusDebug", "1")
+ *   localStorage.removeItem("matbeastFocusDebug")
+ *
  * Main-process logs (file menu injection, etc.) use env when launching:
  *   MATBEAST_DEBUG=1
  * (PowerShell: `$env:MATBEAST_DEBUG="1"; npm run desktop` or your start command.)

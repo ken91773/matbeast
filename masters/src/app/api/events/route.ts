@@ -25,6 +25,7 @@ export async function GET() {
       id: true,
       name: true,
       eventName: true,
+      trainingMode: true,
       ownerUserId: true,
       currentVersion: true,
       currentBlobSha: true,
@@ -64,6 +65,10 @@ export async function POST(req: NextRequest) {
       ? rawEventName.trim().slice(0, 200)
       : null;
 
+  const rawTm = req.nextUrl.searchParams.get("trainingMode");
+  const trainingMode =
+    rawTm === "1" || rawTm?.toLowerCase() === "true";
+
   const bytes = Buffer.from(await req.arrayBuffer());
   if (bytes.length === 0) {
     return NextResponse.json({ error: "empty body" }, { status: 400 });
@@ -101,6 +106,7 @@ export async function POST(req: NextRequest) {
       data: {
         name,
         eventName,
+        trainingMode,
         ownerUserId: a.userId,
         currentVersion: 1,
         currentBlobSha: sha,
@@ -130,6 +136,7 @@ export async function POST(req: NextRequest) {
         id: created.id,
         name: created.name,
         eventName: created.eventName,
+        trainingMode: created.trainingMode,
         currentVersion: created.currentVersion,
         currentBlobSha: created.currentBlobSha,
         sizeBytes: created.sizeBytes,

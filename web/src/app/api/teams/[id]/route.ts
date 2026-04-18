@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { upsertMasterTeamName } from "@/lib/master-team-names";
+import {
+  upsertMasterTeamName,
+  upsertTrainingMasterTeamName,
+} from "@/lib/master-team-names";
 import { ensureMasterTeamNameTable } from "@/lib/master-team-name-table";
 import {
   forbiddenUserChosenTeamNameMessage,
@@ -33,10 +36,14 @@ export async function PATCH(req: Request, { params }: Params) {
   };
 
   try {
-    const existing = await prisma.team.findUnique({ where: { id } });
+    const existing = await prisma.team.findUnique({
+      where: { id },
+      include: { event: { include: { tournament: true } } },
+    });
     if (!existing) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
+    const trainingMasters = existing.event.tournament.trainingMode;
 
     if (
       body.seedOrder !== undefined &&
@@ -97,12 +104,21 @@ export async function PATCH(req: Request, { params }: Params) {
       }
 
       const prevUpper = existing.name.trim().toUpperCase();
+      const upsertMaster = trainingMasters
+        ? upsertTrainingMasterTeamName
+        : upsertMasterTeamName;
       if (nameUpdate === "TBD" && prevUpper && prevUpper !== "TBD") {
         if (body.removeFromMasterTeamNames) {
-          await ensureMasterTeamNameTable();
-          await prisma.masterTeamName.deleteMany({ where: { name: prevUpper } });
+          if (trainingMasters) {
+            await prisma.trainingMasterTeamName.deleteMany({
+              where: { name: prevUpper },
+            });
+          } else {
+            await ensureMasterTeamNameTable();
+            await prisma.masterTeamName.deleteMany({ where: { name: prevUpper } });
+          }
         } else {
-          await upsertMasterTeamName(existing.name);
+          await upsertMaster(existing.name);
         }
       }
 
@@ -111,9 +127,9 @@ export async function PATCH(req: Request, { params }: Params) {
         data: { name: nameUpdate },
       });
       if (nameUpdate !== "TBD") {
-        await upsertMasterTeamName(nameUpdate);
+        await upsertMaster(nameUpdate);
       } else if (explicitUserTbd) {
-        await upsertMasterTeamName("TBD", { allowReservedTbd: true });
+        await upsertMaster("TBD", { allowReservedTbd: true });
       }
     }
 

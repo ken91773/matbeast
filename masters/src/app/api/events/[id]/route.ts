@@ -24,6 +24,7 @@ export async function GET(_req: NextRequest, ctx: Ctx) {
       id: true,
       name: true,
       eventName: true,
+      trainingMode: true,
       ownerUserId: true,
       currentVersion: true,
       currentBlobSha: true,
@@ -41,7 +42,7 @@ export async function GET(_req: NextRequest, ctx: Ctx) {
 }
 
 /**
- * PATCH /api/events/:id  body: { name?: string; eventName?: string | null }
+ * PATCH /api/events/:id  body: { name?: string; eventName?: string | null; trainingMode?: boolean }
  *
  * Renames an event's filename (`name`) and/or human event title
  * (`eventName`). Does NOT upload a new blob (use PUT /blob for that).
@@ -63,9 +64,11 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
   const hasName = typeof rawName === "string" && rawName.trim().length > 0;
   const rawEventName = (body as { eventName?: unknown })?.eventName;
   const hasEventName = "eventName" in (body as Record<string, unknown>);
-  if (!hasName && !hasEventName) {
+  const hasTrainingMode = "trainingMode" in (body as Record<string, unknown>);
+  const rawTrainingMode = (body as { trainingMode?: unknown })?.trainingMode;
+  if (!hasName && !hasEventName && !hasTrainingMode) {
     return NextResponse.json(
-      { error: "name or eventName required" },
+      { error: "name, eventName, or trainingMode required" },
       { status: 400 },
     );
   }
@@ -73,6 +76,7 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
   const data: {
     name?: string;
     eventName?: string | null;
+    trainingMode?: boolean;
     updatedByUserId: string;
     updatedByTokenId: string | null;
   } = {
@@ -122,6 +126,16 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
     }
   }
 
+  if (hasTrainingMode) {
+    if (typeof rawTrainingMode !== "boolean") {
+      return NextResponse.json(
+        { error: "trainingMode must be boolean" },
+        { status: 400 },
+      );
+    }
+    data.trainingMode = rawTrainingMode;
+  }
+
   try {
     const ev = await prisma.cloudEvent.update({
       where: { id },
@@ -130,6 +144,7 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
         id: true,
         name: true,
         eventName: true,
+        trainingMode: true,
         currentVersion: true,
         currentBlobSha: true,
         sizeBytes: true,

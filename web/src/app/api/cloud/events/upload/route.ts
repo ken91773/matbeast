@@ -17,13 +17,18 @@ export const dynamic = "force-dynamic";
  * Distinct from /push: /push assumes the cloud event already exists
  * and updates it; /upload creates. Called by "File -> Upload to cloud".
  *
- * Body: { tournamentId, envelope, name }
+ * Body: { tournamentId, envelope, name, trainingMode? }
+ *
+ * When `trainingMode` is omitted, it is read from the local tournament row.
+ * New-event creation passes it explicitly so the cloud catalog matches even if
+ * the DB read were to fail.
  */
 export async function POST(req: Request) {
   let body: {
     tournamentId?: string;
     envelope?: string;
     name?: string;
+    trainingMode?: boolean;
   };
   try {
     body = (await req.json()) as typeof body;
@@ -47,16 +52,23 @@ export async function POST(req: Request) {
   // without re-downloading the envelope. Best-effort: missing or
   // stale tournament is treated as "no eventName".
   let eventName: string | null = null;
+  let trainingModeFromDb = false;
   try {
     const t = await prisma.tournament.findUnique({
       where: { id: tournamentId },
-      select: { name: true },
+      select: { name: true, trainingMode: true },
     });
     eventName = t?.name?.trim() || null;
+    trainingModeFromDb = Boolean(t?.trainingMode);
   } catch {
     eventName = null;
+    trainingModeFromDb = false;
   }
-  const result = await createCloudEvent(name, bytes, { eventName });
+  const trainingMode =
+    body.trainingMode === undefined
+      ? trainingModeFromDb
+      : Boolean(body.trainingMode);
+  const result = await createCloudEvent(name, bytes, { eventName, trainingMode });
   if (result.kind !== "ok") {
     // eslint-disable-next-line no-console
     console.warn(

@@ -1,12 +1,26 @@
 "use client";
 
 import { DashboardFullWorkspace } from "@/components/dashboard/DashboardFullWorkspace";
+import DemoHomePanel from "@/components/DemoHomePanel";
 import { useEventWorkspace } from "@/components/EventWorkspaceProvider";
 import HomeCloudPanel from "@/components/HomeCloudPanel";
-import { useEffect } from "react";
+import { isMatbeastDemo } from "@/lib/matbeast-variant-client";
+import { useEffect, useState } from "react";
 
 export default function DashboardClient() {
   const { ready, openTabs, showHome } = useEventWorkspace();
+
+  /**
+   * Variant is exposed by the Electron preload on window load, so we
+   * read it after mount to avoid a server-render / hydration
+   * mismatch. The default ("production") matches the most common
+   * case and keeps the first paint's HomeCloudPanel identical to
+   * the legacy behaviour.
+   */
+  const [demoMode, setDemoMode] = useState(false);
+  useEffect(() => {
+    setDemoMode(isMatbeastDemo());
+  }, []);
 
   /**
    * Render modes:
@@ -46,7 +60,7 @@ export default function DashboardClient() {
         {!ready ? (
           <p className="px-1 py-8 text-center text-sm text-zinc-500">Starting workspace…</p>
         ) : renderHome ? (
-          <HomeCloudPanel />
+          demoMode ? <DemoHomePanel /> : <HomeCloudPanel />
         ) : (
           <DashboardFullWorkspace />
         )}

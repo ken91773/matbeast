@@ -106,12 +106,14 @@ export async function POST(req: Request) {
     try {
       const t = await prisma.tournament.findUnique({
         where: { id: tournamentId },
-        select: { name: true },
+        select: { name: true, trainingMode: true },
       });
       const nextEventName = t?.name?.trim() || null;
-      if (nextEventName) {
-        await patchCloudEvent(link.cloudEventId, { eventName: nextEventName });
-      }
+      const patch: { eventName?: string | null; trainingMode: boolean } = {
+        trainingMode: Boolean(t?.trainingMode),
+      };
+      if (nextEventName) patch.eventName = nextEventName;
+      await patchCloudEvent(link.cloudEventId, patch);
     } catch {
       /* ignore */
     }

@@ -9,6 +9,7 @@ import {
   subscribeCloudOnline,
   type CloudOnlineState,
 } from "@/lib/matbeast-cloud-online";
+import { isMatbeastDemo } from "@/lib/matbeast-variant-client";
 
 /* Mirror of cloud-events.ts SyncStatus but typed for client consumption. */
 type SyncStatus =
@@ -72,7 +73,28 @@ const PERSISTENT_FAIL_MS = 15_000;
  *
  * "NO CLOUD" (user hasn't configured cloud sync) renders nothing.
  */
-export default function CloudSyncBadge({
+/**
+ * Thin variant shim. In demo builds we never mount the full
+ * CloudSyncBadgeInner (and its effects / fetches), so the hook order
+ * stays trivially stable and we don't pay for cloud status polling
+ * just to render a muted label. Production builds take the normal
+ * path below.
+ */
+export default function CloudSyncBadge(props: { tournamentId: string | null }) {
+  if (isMatbeastDemo()) {
+    return (
+      <span
+        className="select-none text-[11px] font-semibold uppercase tracking-wider text-amber-300/80"
+        title="Demo build — cloud sync is disabled"
+      >
+        demo
+      </span>
+    );
+  }
+  return <CloudSyncBadgeInner {...props} />;
+}
+
+function CloudSyncBadgeInner({
   tournamentId,
 }: {
   tournamentId: string | null;

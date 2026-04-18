@@ -3,6 +3,8 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { ensureMasterTeamNameTable } from "@/lib/master-team-name-table";
 import { upsertMasterTeamName } from "@/lib/master-team-names";
+import { migrateMastersSplitIfNeeded } from "@/lib/migrate-masters-split";
+import { resolveUseTrainingMasters } from "@/lib/masters-training-mode";
 import {
   forbiddenUserChosenTeamNameMessage,
   isForbiddenUserChosenTeamName,
@@ -14,15 +16,28 @@ function isMissingMasterTeamNameTable(error: unknown): boolean {
   if (error.code !== "P2021") return false;
   const table =
     typeof error.meta?.table === "string" ? error.meta.table.toLowerCase() : "";
-  return table.includes("masterteamname");
+  return table.includes("masterteamname") || table.includes("trainingmasterteamname");
 }
 
 /** Global team name list (not scoped by tournament). */
-export async function GET() {
+export async function GET(req: Request) {
   try {
+    await migrateMastersSplitIfNeeded();
+    const training = await resolveUseTrainingMasters(req);
+    if (training) {
+      await prisma.trainingMasterTeamName.deleteMany({
+        where: {
+          name: { in: ["UNAFFILIATED", "NOT AFFILIATED"] },
+        },
+      });
+      const rows = await prisma.trainingMasterTeamName.findMany({
+        orderBy: { name: "asc" },
+        select: { name: true },
+      });
+      return NextResponse.json({ names: rows.map((n) => n.name) });
+    }
+
     await ensureMasterTeamNameTable();
-    // On-demand cloud sync: pull cloud rows into local + drain pending
-    // pushes. Failures are swallowed so we always serve cached local data.
     await syncTeamNames().catch(() => {
       /* offline / cloud error - fall back to local cache */
     });
@@ -50,6 +65,8 @@ export async function GET() {
 
 export async function POST(req: Request) {
   try {
+    await migrateMastersSplitIfNeeded();
+    const training = await resolveUseTrainingMasters(req);
     const body = (await req.json()) as { name?: string };
     const name = body.name?.trim().toUpperCase() ?? "";
     if (!name) {
@@ -61,9 +78,12 @@ export async function POST(req: Request) {
         { status: 400 },
       );
     }
+    if (training) {
+      await upsertTrainingOnly(name);
+      return NextResponse.json({ ok: true, name });
+    }
+
     await upsertMasterTeamName(name);
-    // Queue a cloud push and try to drain immediately. Both are
-    // best-effort; the local upsert above is what the UI cares about.
     await queueOutboxOp("team-name.upsert", { name }).catch(() => {});
     await drainOutbox().catch(() => {});
     return NextResponse.json({ ok: true, name });
@@ -79,17 +99,30 @@ export async function POST(req: Request) {
   }
 }
 
+async function upsertTrainingOnly(name: string): Promise<void> {
+  await prisma.trainingMasterTeamName.upsert({
+    where: { name },
+    create: { name },
+    update: {},
+  });
+}
+
 /** Remove a name from the global master list when it is not tied to an event slot update. */
 export async function DELETE(req: Request) {
   try {
+    await migrateMastersSplitIfNeeded();
+    const training = await resolveUseTrainingMasters(req);
     const body = (await req.json()) as { name?: string };
     const name = body.name?.trim().toUpperCase() ?? "";
     if (!name) {
       return NextResponse.json({ error: "name is required" }, { status: 400 });
     }
+    if (training) {
+      await prisma.trainingMasterTeamName.deleteMany({ where: { name } });
+      return NextResponse.json({ ok: true });
+    }
+
     await ensureMasterTeamNameTable();
-    // Capture the cloud id (if any) before deleting so the outbox op can
-    // hit the cloud's [id] DELETE directly.
     const existing = await prisma.masterTeamName.findUnique({
       where: { name },
       select: { cloudId: true },

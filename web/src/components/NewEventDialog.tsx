@@ -30,12 +30,17 @@ export default function NewEventDialog({
 }: {
   open: boolean;
   onClose: () => void;
-  onSubmit: (result: { eventName: string; filename: string }) => void;
+  onSubmit: (result: {
+    eventName: string;
+    filename: string;
+    trainingMode: boolean;
+  }) => void;
 }) {
   const [eventName, setEventName] = useState<string>("UNTITLED EVENT");
   const [filename, setFilename] = useState<string>("");
   const [existingNames, setExistingNames] = useState<string[] | null>(null);
   const [loadingDefaults, setLoadingDefaults] = useState<boolean>(false);
+  const [trainingMode, setTrainingMode] = useState(false);
   const eventNameInputRef = useRef<HTMLInputElement | null>(null);
 
   const refreshCatalogNames = useCallback(async () => {
@@ -64,17 +69,27 @@ export default function NewEventDialog({
   // Load defaults every time the dialog opens so reopening after
   // creating one event produces the next sequential `MMDD-N`.
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      // Closing while the catalog fetch is in flight must not leave
+      // `loadingDefaults` stuck true — the filename field stays disabled
+      // and feels like "typing doesn't work" on the next open.
+      setLoadingDefaults(false);
+      return;
+    }
     let cancelled = false;
     setEventName("UNTITLED EVENT");
     setFilename("");
+    setTrainingMode(false);
     setExistingNames(null);
     setLoadingDefaults(true);
     void (async () => {
-      const names = await refreshCatalogNames();
-      if (cancelled) return;
-      setFilename(pickNextDatedFilename(names));
-      setLoadingDefaults(false);
+      try {
+        const names = await refreshCatalogNames();
+        if (cancelled) return;
+        setFilename(pickNextDatedFilename(names));
+      } finally {
+        if (!cancelled) setLoadingDefaults(false);
+      }
     })();
     return () => {
       cancelled = true;
@@ -143,8 +158,9 @@ export default function NewEventDialog({
     onSubmit({
       eventName: trimmedEventName,
       filename: trimmedFilename,
+      trainingMode,
     });
-  }, [canSubmit, onSubmit, trimmedEventName, trimmedFilename]);
+  }, [canSubmit, onSubmit, trimmedEventName, trimmedFilename, trainingMode]);
 
   if (!open) return null;
   return (
@@ -207,6 +223,22 @@ export default function NewEventDialog({
                 Fetching cloud catalog to pick the next available slot…
               </p>
             ) : null}
+          </label>
+          <label className="flex cursor-pointer items-start gap-2 rounded border border-zinc-700/80 bg-zinc-900/40 px-2 py-2">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={trainingMode}
+              onChange={(e) => setTrainingMode(e.target.checked)}
+            />
+            <span>
+              <span className="block text-[11px] font-medium text-zinc-200">
+                Training mode
+              </span>
+              <span className="mt-0.5 block text-[10px] leading-snug text-zinc-500">
+                Uses sample name data
+              </span>
+            </span>
           </label>
         </div>
         <div className="flex items-center justify-end gap-2 border-t border-zinc-600 px-3 py-2">

@@ -5,6 +5,8 @@ import { useCallback, useEffect, useState } from "react";
 type CloudConfigSnapshot = {
   cloudBaseUrl: string;
   syncEnabled: boolean;
+  /** When false, live Master* lists are not downloaded from the cloud on each open. */
+  liveMastersPullFromCloud: boolean;
   tokenSet: boolean;
   tokenPreview: string;
   configured: boolean;
@@ -203,6 +205,22 @@ export default function CloudSettingsModal({
     }
   }, [cfg, reload]);
 
+  const toggleLiveMastersPull = useCallback(async () => {
+    if (!cfg) return;
+    try {
+      await fetch("/api/cloud/config", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          liveMastersPullFromCloud: !cfg.liveMastersPullFromCloud,
+        }),
+      });
+      await reload();
+    } catch {
+      /* ignore */
+    }
+  }, [cfg, reload]);
+
   const syncNow = useCallback(async () => {
     setSyncing(true);
     setLastSyncSummary(null);
@@ -294,6 +312,37 @@ export default function CloudSettingsModal({
                 {cfg.syncEnabled ? "Pause" : "Resume"}
               </button>
             </div>
+            <div>
+              Pull live masters from cloud:{" "}
+              <span
+                style={{
+                  color: (cfg.liveMastersPullFromCloud ?? true) ? "#86efac" : "#fbbf24",
+                }}
+              >
+                {(cfg.liveMastersPullFromCloud ?? true)
+                  ? "yes"
+                  : "no (live lists stay local)"}
+              </span>{" "}
+              <button
+                type="button"
+                onClick={toggleLiveMastersPull}
+                style={{
+                  ...buttonStyle,
+                  marginLeft: 8,
+                  padding: "4px 10px",
+                  fontSize: 12,
+                  backgroundColor: "#475569",
+                  color: "#fff",
+                }}
+              >
+                {(cfg.liveMastersPullFromCloud ?? true) ? "Pause pulls" : "Resume pulls"}
+              </button>
+            </div>
+            <p style={{ fontSize: 11, opacity: 0.7, marginTop: 4, maxWidth: 560, lineHeight: 1.45 }}>
+              After sample master data is moved into training-only lists, pulls can stay off so the
+              cloud does not refill your <strong>live</strong> master list. Resume when you want to
+              download live masters from Mat Beast Masters again.
+            </p>
             <div>Cloud URL: <code style={{ opacity: 0.8 }}>{cfg.cloudBaseUrl}</code></div>
             <div>Last team-names pull: {fmtDate(cfg.lastTeamNamesPullAt)}</div>
             <div>Last profiles pull: {fmtDate(cfg.lastProfilesPullAt)}</div>

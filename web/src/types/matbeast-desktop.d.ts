@@ -37,8 +37,26 @@ type WriteTextFileResult =
     };
 type ReadTextFileResult = { ok: true; text: string } | { ok: false; error?: string };
 
+type SampleEventMeta = {
+  fileName: string;
+  eventName: string | null;
+  sizeBytes: number;
+};
+
 interface MatBeastDesktopApi {
   isDesktopApp: boolean;
+  /**
+   * Build variant. "demo" disables cloud sync, hides cloud UI, and makes
+   * the Home page list bundled sample events instead of calling the
+   * masters service. "production" is the full app.
+   */
+  variant?: "production" | "demo";
+  /** Demo-only: list bundled sample events shipped with the installer. */
+  listSampleEvents?: () => Promise<{ ok: true; events: SampleEventMeta[] } | { ok: false; error?: string }>;
+  /** Demo-only: read a bundled sample event's .matb envelope text. */
+  readSampleEvent?: (
+    fileName: string,
+  ) => Promise<{ ok: true; text: string } | { ok: false; error?: string }>;
   /** Ensures scoreboard + bracket overlay output windows exist (Electron) and focuses them. */
   openScoreboardOverlayWindow?: () => Promise<{ ok: boolean }>;
   /** Push current tournament id to overlay output windows (desktop diagnostics). */
@@ -65,6 +83,8 @@ interface MatBeastDesktopApi {
     showingHome: boolean;
     hasTabs: boolean;
   }) => Promise<{ ok: boolean; changed?: boolean }>;
+  /** Focus the main dashboard window (desktop); helps OS keyboard routing after Alt-Tab / overlay windows. */
+  focusMainWindow?: () => Promise<{ ok: boolean }>;
   checkForUpdates: () => Promise<{ ok: boolean; reason?: string; state?: UpdateState }>;
   checkForUpdatesWithDebug: () => Promise<{
     ok: boolean;

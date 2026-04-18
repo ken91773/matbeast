@@ -69,4 +69,6 @@ export type BoardPayload = {
   leftCrossedSilhouettes: number[];
   rightCrossedSilhouettes: number[];
   updatedAt: string;
+  /** From Tournament.trainingMode — training files use TrainingMaster* lists. */
+  trainingMode?: boolean;
 };

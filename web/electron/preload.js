@@ -1,4 +1,5 @@
 const { contextBridge, ipcRenderer } = require("electron");
+const { getVariant } = require("./matbeast-variant.js");
 
 // File → app: main process uses webContents.executeJavaScript to dispatch
 // `matbeast-native-file` on window (see electron/main.js). Preload no longer
@@ -6,6 +7,18 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("matBeastDesktop", {
   isDesktopApp: true,
+  /**
+   * Build variant: "production" or "demo". The renderer uses this to
+   * hide cloud UI and render a different Home panel (bundled sample
+   * events instead of the cloud catalog). Read once at preload
+   * initialization; does not change mid-session.
+   */
+  variant: getVariant(),
+  /** Demo-only: list bundled sample event files (filename + eventName). */
+  listSampleEvents: () => ipcRenderer.invoke("demo:list-sample-events"),
+  /** Demo-only: read a bundled sample event's .matb text by filename. */
+  readSampleEvent: (fileName) =>
+    ipcRenderer.invoke("demo:read-sample-event", { fileName }),
   openScoreboardOverlayWindow: () => ipcRenderer.invoke("overlay:open"),
   setOverlayTournamentId: (tournamentId) =>
     ipcRenderer.invoke("overlay:set-tournament-id", { tournamentId }),
@@ -41,6 +54,8 @@ contextBridge.exposeInMainWorld("matBeastDesktop", {
     ipcRenderer
       .invoke("app:set-workspace-view-state", state)
       .catch(() => ({ ok: false })),
+  /** Bring the main dashboard window to the foreground (keyboard focus). */
+  focusMainWindow: () => ipcRenderer.invoke("app:focus-main-window"),
   checkForUpdates: () => ipcRenderer.invoke("app:check-for-updates"),
   checkForUpdatesWithDebug: () => ipcRenderer.invoke("app:check-for-updates-debug"),
   getRuntimeInfo: () => ipcRenderer.invoke("app:get-runtime-info"),

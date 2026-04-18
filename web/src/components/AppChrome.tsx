@@ -45,6 +45,7 @@ export default function AppChrome() {
   const queryClient = useQueryClient();
   const {
     tournamentId,
+    tournamentTrainingMode,
     ready,
     openTabs,
     tournaments,
@@ -53,6 +54,7 @@ export default function AppChrome() {
     selectTab,
     closeTab,
     updateTabName,
+    setShowHome,
   } = useEventWorkspace();
 
   const openTabsRef = useRef(openTabs);
@@ -569,8 +571,11 @@ export default function AppChrome() {
       queryClient,
       openEventInTab,
       refreshTournaments,
+      openTabs,
+      selectTab,
+      setShowHome,
     });
-  }, [openEventInTab, queryClient, refreshTournaments]);
+  }, [openEventInTab, openTabs, queryClient, refreshTournaments, selectTab, setShowHome]);
 
   /**
    * Open the rename dialog for a specific tab and prefill both fields
@@ -821,7 +826,11 @@ export default function AppChrome() {
   }, []);
 
   const handleNewEventSubmit = useCallback(
-    async (result: { eventName: string; filename: string }) => {
+    async (result: {
+      eventName: string;
+      filename: string;
+      trainingMode: boolean;
+    }) => {
       if (creatingNewEvent) return;
       setCreatingNewEvent(true);
       try {
@@ -832,6 +841,7 @@ export default function AppChrome() {
           updateTabName,
           eventName: result.eventName,
           filename: result.filename,
+          trainingMode: result.trainingMode,
         });
         if (created && "duplicate" in created && created.duplicate) {
           // A race produced a collision between opening the dialog
@@ -1018,6 +1028,14 @@ export default function AppChrome() {
                           ].join(" ")}
                         >
                           {saveFeedbackText}
+                        </span>
+                      ) : null}
+                      {tournamentTrainingMode ? (
+                        <span
+                          className="shrink-0 rounded border border-red-700/70 bg-red-950/50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-red-200"
+                          title="This event file uses training master lists only"
+                        >
+                          TRAINING MODE
                         </span>
                       ) : null}
                       <CloudSyncBadge tournamentId={tournamentId} />
@@ -1306,11 +1324,16 @@ export default function AppChrome() {
                     type="button"
                     className="w-full rounded px-2 py-1.5 text-left text-[11px] text-zinc-200 hover:bg-[#1473e6]/25"
                     onClick={() => {
-                      openEventInTab(t.id, t.name);
+                      openEventInTab(t.id, t.name, t.trainingMode);
                       setOpenPicker(false);
                     }}
                   >
-                    {t.name}
+                    <span className="block truncate">{t.name}</span>
+                    {t.trainingMode ? (
+                      <span className="mt-0.5 block text-[9px] font-semibold uppercase tracking-wide text-red-400/95">
+                        Training file
+                      </span>
+                    ) : null}
                   </button>
                 </li>
               ))}

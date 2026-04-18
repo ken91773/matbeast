@@ -83,6 +83,8 @@ model CloudEvent {
   /// for backwards compat with rows created before v0.8.4 — the UI
   /// falls back to `name` when this is empty.
   eventName       String?
+  /// Mirrors local `Tournament.trainingMode` — training files use TrainingMaster* lists.
+  trainingMode    Boolean   @default(false)
   ownerUserId     String
   currentVersion  Int       @default(0)
   currentBlobSha  String?

@@ -3,7 +3,11 @@ import { NextResponse } from "next/server";
 import { resolveTournamentIdFromRequest } from "@/lib/active-tournament-server";
 import { getEventIdOrThrow, getPrimaryEventIdOrThrow } from "@/lib/events";
 import { prisma } from "@/lib/prisma";
-import { upsertMasterTeamName } from "@/lib/master-team-names";
+import {
+  upsertMasterTeamName,
+  upsertTrainingMasterTeamName,
+} from "@/lib/master-team-names";
+import { tournamentUsesTrainingMasters } from "@/lib/masters-training-mode";
 import {
   forbiddenUserChosenTeamNameMessage,
   isForbiddenUserChosenTeamName,
@@ -123,7 +127,12 @@ export async function POST(req: Request) {
         seedOrder: body.seedOrder ?? count + 1,
       },
     });
-    await upsertMasterTeamName(name);
+    const training = await tournamentUsesTrainingMasters(tournamentId);
+    if (training) {
+      await upsertTrainingMasterTeamName(name);
+    } else {
+      await upsertMasterTeamName(name);
+    }
     return NextResponse.json(team);
   } catch (e) {
     console.error("[POST /api/teams]", e);

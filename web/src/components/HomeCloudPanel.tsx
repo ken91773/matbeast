@@ -9,6 +9,8 @@ type CloudEventMeta = {
   id: string;
   name: string;
   eventName: string | null;
+  /** From cloud catalog; older rows may omit (treat as live). */
+  trainingMode?: boolean;
   ownerUserId: string;
   currentVersion: number;
   currentBlobSha: string | null;
@@ -68,8 +70,13 @@ function sortKey(e: CloudEventMeta): number {
  */
 export default function HomeCloudPanel() {
   const queryClient = useQueryClient();
-  const { openEventInTab, refreshTournaments, openTabs } =
-    useEventWorkspace();
+  const {
+    openEventInTab,
+    refreshTournaments,
+    openTabs,
+    selectTab,
+    setShowHome,
+  } = useEventWorkspace();
 
   const openTabsRef = useRef(openTabs);
   useEffect(() => {
@@ -93,6 +100,8 @@ export default function HomeCloudPanel() {
     | null
   >(null);
   const renameInputRef = useRef<HTMLInputElement | null>(null);
+  /** Ignore blur briefly after opening the field (Electron double-click / focus races). */
+  const renameIgnoreBlurUntilRef = useRef<number>(0);
 
   const load = useCallback(async () => {
     setError(null);
@@ -161,6 +170,10 @@ export default function HomeCloudPanel() {
           queryClient,
           openEventInTab,
           refreshTournaments,
+          trainingModeOverride: meta.trainingMode,
+          openTabs,
+          selectTab,
+          setShowHome,
         });
         // Bind link via second pull with tournamentId.
         await new Promise<void>((res) => requestAnimationFrame(() => res()));
@@ -185,7 +198,7 @@ export default function HomeCloudPanel() {
         setBusyId(null);
       }
     },
-    [openEventInTab, queryClient, refreshTournaments],
+    [openEventInTab, openTabs, queryClient, refreshTournaments, selectTab, setShowHome],
   );
 
   const createNew = useCallback(async () => {
@@ -290,6 +303,27 @@ export default function HomeCloudPanel() {
       setBusyId(null);
     }
   }, [renameState, load, events]);
+
+  /** Stable for effect deps: changes only when a rename session starts, not on each keystroke. */
+  const renameFocusId = renameState?.id;
+  const renameInitialForFocus = renameState?.initial;
+
+  /**
+   * Open rename field → focus + select once per edit session (autoFocus alone
+   * is flaky in Electron). Do NOT depend on `draft` — that would re-run on
+   * every keystroke and `select()` would destroy multi-character typing.
+   */
+  useEffect(() => {
+    if (renameFocusId == null || renameInitialForFocus === undefined) return;
+    renameIgnoreBlurUntilRef.current = Date.now() + 280;
+    const t = window.setTimeout(() => {
+      const el = renameInputRef.current;
+      if (!el) return;
+      el.focus();
+      el.select();
+    }, 0);
+    return () => window.clearTimeout(t);
+  }, [renameFocusId, renameInitialForFocus]);
 
   const deleteCloudEvent = useCallback(
     async (meta: CloudEventMeta) => {
@@ -411,6 +445,7 @@ export default function HomeCloudPanel() {
             {sortedEvents.map((e) => {
               const eventTitle = (e.eventName ?? "").trim();
               const displayTitle = eventTitle.length > 0 ? eventTitle : e.name;
+              const isTraining = e.trainingMode === true;
               const showSecondary =
                 eventTitle.length > 0 && eventTitle !== e.name;
               const busy = busyId === e.id;
@@ -435,14 +470,18 @@ export default function HomeCloudPanel() {
                           if (ev.key === "Enter") void commitRename();
                           if (ev.key === "Escape") setRenameState(null);
                         }}
-                        onBlur={() => void commitRename()}
+                        onMouseDown={(ev) => ev.stopPropagation()}
+                        onBlur={() => {
+                          if (Date.now() < renameIgnoreBlurUntilRef.current) return;
+                          void commitRename();
+                        }}
                         className="m-0 w-full rounded border border-teal-700/60 bg-[#1e1e1e] px-1.5 py-0.5 text-[13px] font-semibold text-white outline-none"
                       />
                     ) : (
                       <p
                         className="m-0 cursor-text truncate rounded px-1 py-0.5 text-[13px] font-semibold text-zinc-100 hover:bg-white/5"
-                        title="Double-click to rename filename"
-                        onDoubleClick={(ev) => {
+                        title="Click to rename filename"
+                        onClick={(ev) => {
                           ev.preventDefault();
                           ev.stopPropagation();
                           setRenameState({
@@ -458,6 +497,11 @@ export default function HomeCloudPanel() {
                     {showSecondary ? (
                       <p className="m-0 truncate text-[11px] text-zinc-300">
                         {displayTitle}
+                      </p>
+                    ) : null}
+                    {isTraining ? (
+                      <p className="m-0 mt-0.5 truncate text-[11px] text-zinc-300">
+                        Training
                       </p>
                     ) : null}
                     <p className="m-0 mt-0.5 text-[10px] text-zinc-500">

@@ -15,3 +15,17 @@ export async function upsertMasterTeamName(
     update: {},
   });
 }
+
+export async function upsertTrainingMasterTeamName(
+  rawName: string,
+  opts?: { allowReservedTbd?: boolean },
+): Promise<void> {
+  const name = rawName.trim().toUpperCase();
+  if (!name) return;
+  if (name === "TBD" && !opts?.allowReservedTbd) return;
+  await prisma.trainingMasterTeamName.upsert({
+    where: { name },
+    create: { name },
+    update: {},
+  });
+}

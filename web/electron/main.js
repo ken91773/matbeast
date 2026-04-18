@@ -10,6 +10,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { autoUpdater } = require("electron-updater");
+const { isDemo } = require("./matbeast-variant.js");
 
 const devAppUrl = process.env.MAT_BEAST_DESKTOP_URL || "http://localhost:3000";
 const appIconPath = app.isPackaged
@@ -362,6 +363,22 @@ async function checkForUpdates() {
     return { ok: false, reason: "not-packaged" };
   }
 
+  /**
+   * Demo builds ship as a frozen snapshot and are not hooked up to
+   * the production auto-update feed. Short-circuit both the user-
+   * initiated "Check for Updates..." menu item and the deferred
+   * startup check in `scheduleDeferredAutoUpdateCheck()` so the demo
+   * never tries to pull a release manifest from the prod repo.
+   */
+  if (isDemo()) {
+    setUpdateState({
+      status: "disabled",
+      message: "Updates are disabled in the demo build.",
+      downloadedVersion: null,
+    });
+    return { ok: false, reason: "demo-variant" };
+  }
+
   if (isCheckingForUpdates) {
     setUpdateState({
       status: "checking",
@@ -569,6 +586,10 @@ function readUpdaterLogTail(maxChars = 6000) {
  */
 function scheduleDeferredAutoUpdateCheck() {
   if (!app.isPackaged) return;
+  if (isDemo()) {
+    appendUpdaterLog(`${nowIso()}  Auto update check skipped (demo variant)\n`);
+    return;
+  }
   if (process.env.MAT_BEAST_SKIP_AUTO_UPDATE_CHECK === "1") {
     appendUpdaterLog(`${nowIso()}  Auto update check skipped (MAT_BEAST_SKIP_AUTO_UPDATE_CHECK=1)\n`);
     return;
@@ -669,6 +690,7 @@ function ensureUserDatabaseFile() {
  * not exist") on the first query that reads it.
  */
 const ADDITIVE_COLUMN_PATCHES = [
+  { table: "Tournament", column: "trainingMode", ddl: "INTEGER NOT NULL DEFAULT 0" },
   { table: "Team", column: "overlayColor", ddl: "TEXT" },
   { table: "ResultLog", column: "tournamentId", ddl: "TEXT" },
   { table: "ResultLog", column: "leftTeamName", ddl: "TEXT" },
@@ -685,7 +707,48 @@ const ADDITIVE_COLUMN_PATCHES = [
   // cloud counterparts. Both nullable so the ALTER is safe on existing DBs.
   { table: "MasterTeamName", column: "cloudId", ddl: "TEXT" },
   { table: "MasterPlayerProfile", column: "cloudId", ddl: "TEXT" },
+  {
+    table: "CloudConfig",
+    column: "liveMastersPullFromCloud",
+    ddl: "INTEGER NOT NULL DEFAULT 1",
+  },
 ];
+
+/**
+ * New tables introduced after launch; created if missing before Prisma touches the DB.
+ * Must stay aligned with `prisma/schema.prisma` (SQLite).
+ */
+const ENSURE_TRAINING_MASTER_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS "TrainingMasterPlayerProfile" (
+  "id" TEXT NOT NULL PRIMARY KEY,
+  "firstName" TEXT NOT NULL,
+  "lastName" TEXT NOT NULL,
+  "nickname" TEXT,
+  "academyName" TEXT,
+  "unofficialWeight" REAL,
+  "heightFeet" INTEGER,
+  "heightInches" INTEGER,
+  "age" INTEGER,
+  "beltRank" TEXT NOT NULL,
+  "profilePhotoUrl" TEXT,
+  "headShotUrl" TEXT,
+  "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS "TrainingMasterPlayerProfile_firstName_lastName_key"
+  ON "TrainingMasterPlayerProfile"("firstName","lastName");
+CREATE TABLE IF NOT EXISTS "TrainingMasterTeamName" (
+  "id" TEXT NOT NULL PRIMARY KEY,
+  "name" TEXT NOT NULL,
+  "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS "TrainingMasterTeamName_name_key" ON "TrainingMasterTeamName"("name");
+CREATE TABLE IF NOT EXISTS "AppSchemaMigration" (
+  "id" TEXT NOT NULL PRIMARY KEY,
+  "appliedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+`;
 
 /**
  * Structural drifts (PK renames, missing tables) that `ALTER TABLE ADD
@@ -814,6 +877,12 @@ for (const p of patches) {
     }
   }
 }
+try {
+  db.exec(${JSON.stringify(ENSURE_TRAINING_MASTER_SCHEMA_SQL)});
+  applied.push("ensureTrainingTables");
+} catch (e) {
+  applied.push(\`ensureTrainingTables=ERR:\${e.message}\`);
+}
 const drift = [];
 for (const r of driftRulesRaw) {
   let fn;
@@ -890,6 +959,13 @@ process.exit(0);
             applied.push(`${p.table}.${p.column}=ERR:${e?.message || e}`);
           }
         }
+      }
+      try {
+        db.run(ENSURE_TRAINING_MASTER_SCHEMA_SQL);
+        applied.push("ensureTrainingTables");
+        changed = true;
+      } catch (e) {
+        applied.push(`ensureTrainingTables=ERR:${e?.message || e}`);
       }
       for (const rule of STRUCTURAL_DRIFT_RULES) {
         try {
@@ -1475,6 +1551,7 @@ function buildMenuTemplate() {
         label: "Home page",
         click: () => sendFileMenuAction("home"),
       };
+  const demoMode = isDemo();
   return [
     {
       label: "File",
@@ -1529,8 +1606,12 @@ function buildMenuTemplate() {
             refreshApplicationMenu();
           },
         },
-        { type: "separator" },
-        { label: "CLOUD SYNC...", click: () => sendOptionsMenuAction("cloud") },
+        ...(demoMode
+          ? []
+          : [
+              { type: "separator" },
+              { label: "CLOUD SYNC...", click: () => sendOptionsMenuAction("cloud") },
+            ]),
       ],
     },
     {
@@ -1540,14 +1621,18 @@ function buildMenuTemplate() {
     {
       label: "Help",
       submenu: [
+        ...(demoMode
+          ? []
+          : [
+              {
+                label: "Check for Updates…",
+                click: () =>
+                  mainWindow?.webContents?.send("matbeast-help-action", "check-updates"),
+              },
+              { type: "separator" },
+            ]),
         {
-          label: "Check for Updates…",
-          click: () =>
-            mainWindow?.webContents?.send("matbeast-help-action", "check-updates"),
-        },
-        { type: "separator" },
-        {
-          label: "Mat Beast Score Project",
+          label: demoMode ? "Mat Beast Score Project (Demo build)" : "Mat Beast Score Project",
           click: async () => {
             await shell.openExternal(appUrl);
           },
@@ -1645,6 +1730,84 @@ if (!gotSingleInstanceLock) {
       }
       const img = await win.webContents.capturePage();
       return { ok: true, dataUrl: img.toDataURL() };
+    } catch (error) {
+      return { ok: false, error: String(error?.message || error) };
+    }
+  });
+
+  /**
+   * Demo-only IPC: list and read the .matb sample events bundled
+   * into the installer via the `build/demo-seed/sample-events/` ->
+   * `sample-events/` extraResource mapping. In a production build
+   * the directory is either absent or empty (variant-prep.mjs wipes
+   * it), so these handlers return an empty list and degrade
+   * gracefully even if the renderer calls them accidentally.
+   *
+   * Path strategy:
+   *   - Packaged: `<process.resourcesPath>/sample-events/`
+   *   - Dev:      `<repo>/web/build/demo-seed/sample-events/`
+   *
+   * We only enumerate `.matb` files and never traverse
+   * subdirectories; the envelope is a single-file JSON blob so a
+   * nested layout would be a bug in variant-prep.mjs.
+   */
+  const resolveSampleEventsDir = () => {
+    if (app.isPackaged && process.resourcesPath) {
+      return path.join(process.resourcesPath, "sample-events");
+    }
+    return path.join(__dirname, "..", "build", "demo-seed", "sample-events");
+  };
+
+  ipcMain.handle("demo:list-sample-events", async () => {
+    try {
+      const dir = resolveSampleEventsDir();
+      if (!fs.existsSync(dir)) {
+        return { ok: true, events: [] };
+      }
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      const events = [];
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        if (!entry.name.toLowerCase().endsWith(".matb")) continue;
+        const full = path.join(dir, entry.name);
+        let eventName = null;
+        try {
+          const text = fs.readFileSync(full, "utf8");
+          const parsed = JSON.parse(text);
+          if (parsed && typeof parsed.eventName === "string") {
+            eventName = parsed.eventName;
+          }
+        } catch {
+          // Unreadable/corrupt envelopes still get listed so the
+          // user can see the file; the open flow will surface the
+          // actual parse error downstream.
+        }
+        events.push({
+          fileName: entry.name,
+          eventName,
+          sizeBytes: fs.statSync(full).size,
+        });
+      }
+      events.sort((a, b) => a.fileName.localeCompare(b.fileName));
+      return { ok: true, events };
+    } catch (error) {
+      return { ok: false, error: String(error?.message || error) };
+    }
+  });
+
+  ipcMain.handle("demo:read-sample-event", async (_event, payload) => {
+    try {
+      const fileName =
+        payload && typeof payload.fileName === "string" ? payload.fileName : "";
+      if (!fileName || fileName.includes("/") || fileName.includes("\\") || fileName.includes("..")) {
+        return { ok: false, error: "invalid-file-name" };
+      }
+      const full = path.join(resolveSampleEventsDir(), fileName);
+      if (!fs.existsSync(full)) {
+        return { ok: false, error: "not-found" };
+      }
+      const text = fs.readFileSync(full, "utf8");
+      return { ok: true, text };
     } catch (error) {
       return { ok: false, error: String(error?.message || error) };
     }
@@ -1873,6 +2036,19 @@ if (!gotSingleInstanceLock) {
     workspaceViewState.hasTabs = nextHasTabs;
     refreshApplicationMenu();
     return { ok: true, changed: true };
+  });
+
+  ipcMain.handle("app:focus-main-window", async () => {
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.show();
+        mainWindow.focus();
+        mainWindow.webContents.focus();
+      }
+    } catch {
+      /* ignore */
+    }
+    return { ok: true };
   });
 
   refreshApplicationMenu();

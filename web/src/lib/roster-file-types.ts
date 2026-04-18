@@ -64,4 +64,6 @@ export type MatBeastEventEnvelope = {
   };
   /** Optional persisted local audio volume (0-100). */
   audioVolumePercent?: number;
+  /** When true, this file was created as a training event (separate master lists). */
+  trainingMode?: boolean;
 };
