@@ -1,0 +1,153 @@
+// Mat Beast Masters — cloud schema (Postgres / Neon)
+// Run: npx prisma generate && npx prisma db push
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum BeltRank {
+  WHITE
+  BLUE
+  PURPLE
+  BROWN
+  BLACK
+}
+
+/// Global athlete profiles. Mirrors web/prisma/schema.prisma MasterPlayerProfile.
+/// Names normalized uppercase by the API layer for dedup.
+model MasterPlayerProfile {
+  id          String  @id @default(cuid())
+  firstName   String
+  lastName    String
+  nickname    String?
+  academyName String?
+
+  unofficialWeight Float?
+  heightFeet       Int?
+  heightInches     Int?
+  age              Int?
+  beltRank         BeltRank
+
+  profilePhotoUrl String?
+  headShotUrl     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Clerk user id of the user who originally created this profile.
+  createdByUserId String?
+  /// Clerk user id of the user who last updated this profile.
+  updatedByUserId String?
+
+  @@unique([firstName, lastName])
+}
+
+/// Global team name list. Mirrors web/prisma/schema.prisma MasterTeamName.
+model MasterTeamName {
+  id   String @id @default(cuid())
+  name String @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  createdByUserId String?
+  updatedByUserId String?
+}
+
+/// A tournament / event shared via the cloud. The actual event data
+/// (roster, bracket, results) lives in CloudEventBlob rows as raw .matb
+/// JSON bytes; this table tracks metadata only so "list my events" is
+/// fast without transferring MBs of blob.
+///
+/// Design decisions (v0.4.0):
+///   - No soft lock column (user chose last-save-wins for 5-user scale).
+///   - No delete cascade to blobs: we soft-delete via `deletedAt`.
+///   - `currentVersion` is an integer that monotonically increments on
+///     every successful PUT /api/events/:id/blob. Clients send
+///     `expectedVersion` on push; mismatch => 409 Conflict.
+///   - `currentBlobSha` is SHA-256 hex of the latest blob. Lets the
+///     desktop decide SYNCED vs NOT SYNCED without downloading the blob
+///     itself (quick metadata GET).
+model CloudEvent {
+  id              String    @id @default(cuid())
+  /// Filename-style identifier users pick (e.g. "UNTITLED",
+  /// "regionals-2025"). Mirrors the local `currentRosterFileName`.
+  name            String
+  /// Human-readable event title shown beneath the filename in the
+  /// homepage catalog. Mirrors the local `Tournament.name`. Nullable
+  /// for backwards compat with rows created before v0.8.4 — the UI
+  /// falls back to `name` when this is empty.
+  eventName       String?
+  ownerUserId     String
+  currentVersion  Int       @default(0)
+  currentBlobSha  String?
+  sizeBytes       Int       @default(0)
+  deletedAt       DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  createdByUserId String
+  updatedByUserId String
+  /// Token id that performed the last update, for audit in the UI.
+  updatedByTokenId String?
+
+  blobs CloudEventBlob[]
+
+  @@index([ownerUserId])
+  @@index([deletedAt])
+}
+
+/// Versioned immutable snapshots of an event's .matb payload. Every
+/// successful PUT /api/events/:id/blob appends one row. Stored as raw
+/// bytes in Postgres (Bytes type = bytea). Typical size <5 MB.
+///
+/// NOT exposed through a versions-listing UI in v0.4.0; retained as an
+/// audit trail for future rollback features and to debug corruption.
+model CloudEventBlob {
+  id               String   @id @default(cuid())
+  eventId          String
+  event            CloudEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  version          Int
+  blob             Bytes
+  sha256           String
+  sizeBytes        Int
+  createdAt        DateTime @default(now())
+  createdByUserId  String
+  createdByTokenId String?
+
+  @@unique([eventId, version])
+  @@index([eventId, createdAt])
+}
+
+/// Long-lived API tokens issued to desktop installations so they can call
+/// the cloud API without going through a Clerk session each time.
+///
+/// The plaintext token is shown to the user EXACTLY ONCE at mint time;
+/// only the SHA-256 hash is stored here. Token format on the wire is
+/// "mbk_<base64url>" (Mat Beast key).
+///
+/// Revocation is instant: `revokedAt` is checked on every request.
+model DesktopToken {
+  id           String    @id @default(cuid())
+  /// Clerk user ID who owns this token.
+  userId       String
+  /// Human label shown in the admin UI ("Ken's laptop", "Cage iPad").
+  label        String
+  /// SHA-256 hex digest of the plaintext token. Lookup key.
+  tokenHash    String    @unique
+  /// Last 4 chars of the plaintext token for visual identification.
+  tokenPreview String
+  createdAt    DateTime  @default(now())
+  /// Updated by the auth middleware on each successful API call.
+  lastUsedAt   DateTime?
+  /// When set, the token is rejected by middleware. Null = active.
+  revokedAt    DateTime?
+  /// Clerk user ID who revoked this token (may differ from owner).
+  revokedByUserId String?
+
+  @@index([userId])
+}

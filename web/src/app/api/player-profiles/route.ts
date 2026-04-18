@@ -2,6 +2,7 @@ import { Prisma, type BeltRank } from "@prisma/client";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { ensureMasterPlayerProfileTable } from "@/lib/master-player-profile-table";
+import { drainOutbox, queueOutboxOp, syncProfiles } from "@/lib/cloud-sync";
 
 const BELTS: readonly BeltRank[] = [
   "WHITE",
@@ -25,10 +26,45 @@ function isMissingMasterProfileTable(error: unknown): boolean {
   return table.includes("masterplayerprofile");
 }
 
+/** Push a fully-shaped profile.upsert op to the cloud outbox + drain. */
+async function queueProfileUpsertOp(row: {
+  firstName: string;
+  lastName: string;
+  nickname: string | null;
+  academyName: string | null;
+  unofficialWeight: number | null;
+  heightFeet: number | null;
+  heightInches: number | null;
+  age: number | null;
+  beltRank: BeltRank;
+  profilePhotoUrl: string | null;
+  headShotUrl: string | null;
+}): Promise<void> {
+  await queueOutboxOp("profile.upsert", {
+    firstName: row.firstName,
+    lastName: row.lastName,
+    nickname: row.nickname,
+    academyName: row.academyName,
+    unofficialWeight: row.unofficialWeight,
+    heightFeet: row.heightFeet,
+    heightInches: row.heightInches,
+    age: row.age,
+    beltRank: row.beltRank,
+    profilePhotoUrl: row.profilePhotoUrl,
+    headShotUrl: row.headShotUrl,
+  }).catch(() => {});
+  await drainOutbox().catch(() => {});
+}
+
 /** Global master list (not scoped by tournament). */
 export async function GET() {
   try {
     await ensureMasterPlayerProfileTable();
+    // On-demand cloud sync: pull cloud rows + drain pending pushes.
+    // Failures are swallowed so we always serve cached local data.
+    await syncProfiles().catch(() => {
+      /* offline / cloud error - fall back to local cache */
+    });
     const profiles = await prisma.masterPlayerProfile.findMany({
       orderBy: [{ lastName: "asc" }, { firstName: "asc" }],
     });
@@ -116,6 +152,7 @@ export async function POST(req: Request) {
         where: { id: existing.id },
         data: merged,
       });
+      await queueProfileUpsertOp(row);
       return NextResponse.json(row);
     }
 
@@ -135,6 +172,7 @@ export async function POST(req: Request) {
       },
     });
 
+    await queueProfileUpsertOp(row);
     return NextResponse.json(row);
   } catch (e) {
     if (isMissingMasterProfileTable(e)) {

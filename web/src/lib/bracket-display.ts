@@ -71,14 +71,31 @@ export function namedTeamCount(teamOptions: BracketTeamRef[]) {
 }
 
 export function buildBracketProjection(data: BracketPayload | null | undefined, teamOptions: BracketTeamRef[]) {
+  /**
+   * Defensive array guards — the overlay iframe re-runs this on every tab
+   * switch, and during the remount window the cached react-query bracket
+   * payload for the new tournament can briefly arrive with
+   * `quarterFinals` / `semiFinals` missing or non-array (e.g. an error
+   * shape that only has `{ error }`). Calling `.find` on `undefined` in
+   * that path produced the minified "C.find is not a function" crash
+   * captured by the overlay error boundary. Treat any non-array as "no
+   * matches recorded yet" and fall through to the placeholder branch.
+   */
+  const quarterFinalsList: BracketMatchJson[] = Array.isArray(data?.quarterFinals)
+    ? (data!.quarterFinals as BracketMatchJson[])
+    : [];
+  const semiFinalsList: BracketMatchJson[] = Array.isArray(data?.semiFinals)
+    ? (data!.semiFinals as BracketMatchJson[])
+    : [];
+
   const quarterSlots: BracketMatchJson[] = [0, 1, 2, 3].map(
     (idx) =>
-      data?.quarterFinals.find((m) => m.bracketIndex === idx) ??
+      quarterFinalsList.find((m) => m.bracketIndex === idx) ??
       placeholderMatch(`quarter-placeholder-${idx}`, "QUARTER_FINAL", idx),
   );
 
   const projectedSemiSlots: BracketMatchJson[] = [0, 1].map((idx) => {
-    const existing = data?.semiFinals.find((m) => m.bracketIndex === idx);
+    const existing = semiFinalsList.find((m) => m.bracketIndex === idx);
     if (existing) return existing;
     const [leftQf, rightQf] =
       idx === 0 ? [quarterSlots[0], quarterSlots[1]] : [quarterSlots[2], quarterSlots[3]];

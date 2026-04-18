@@ -7,6 +7,7 @@ import {
   forbiddenUserChosenTeamNameMessage,
   isForbiddenUserChosenTeamName,
 } from "@/lib/reserved-team-names";
+import { drainOutbox, queueOutboxOp, syncTeamNames } from "@/lib/cloud-sync";
 
 function isMissingMasterTeamNameTable(error: unknown): boolean {
   if (!(error instanceof Prisma.PrismaClientKnownRequestError)) return false;
@@ -20,6 +21,11 @@ function isMissingMasterTeamNameTable(error: unknown): boolean {
 export async function GET() {
   try {
     await ensureMasterTeamNameTable();
+    // On-demand cloud sync: pull cloud rows into local + drain pending
+    // pushes. Failures are swallowed so we always serve cached local data.
+    await syncTeamNames().catch(() => {
+      /* offline / cloud error - fall back to local cache */
+    });
     await prisma.masterTeamName.deleteMany({
       where: {
         name: { in: ["UNAFFILIATED", "NOT AFFILIATED"] },
@@ -56,6 +62,10 @@ export async function POST(req: Request) {
       );
     }
     await upsertMasterTeamName(name);
+    // Queue a cloud push and try to drain immediately. Both are
+    // best-effort; the local upsert above is what the UI cares about.
+    await queueOutboxOp("team-name.upsert", { name }).catch(() => {});
+    await drainOutbox().catch(() => {});
     return NextResponse.json({ ok: true, name });
   } catch (e) {
     if (isMissingMasterTeamNameTable(e)) {
@@ -78,7 +88,18 @@ export async function DELETE(req: Request) {
       return NextResponse.json({ error: "name is required" }, { status: 400 });
     }
     await ensureMasterTeamNameTable();
+    // Capture the cloud id (if any) before deleting so the outbox op can
+    // hit the cloud's [id] DELETE directly.
+    const existing = await prisma.masterTeamName.findUnique({
+      where: { name },
+      select: { cloudId: true },
+    });
     await prisma.masterTeamName.deleteMany({ where: { name } });
+    await queueOutboxOp("team-name.delete", {
+      name,
+      cloudId: existing?.cloudId ?? null,
+    }).catch(() => {});
+    await drainOutbox().catch(() => {});
     return NextResponse.json({ ok: true });
   } catch (e) {
     if (isMissingMasterTeamNameTable(e)) {

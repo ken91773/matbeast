@@ -195,11 +195,27 @@ export default function OverlayClient() {
     return () => window.removeEventListener("matbeast-overlay-tournament-id", onTournamentId);
   }, []);
 
-  /** Output window bootstraps tabs from localStorage async; use server list for the canonical event name. */
-  const { data: tournamentsPayload } = useQuery({
+  /**
+   * Output window bootstraps tabs from localStorage async; use server list
+   * for the canonical event name.
+   *
+   * IMPORTANT: this shares its query key (`matbeastKeys.tournaments()`)
+   * with `EventWorkspaceProvider`, which expects `data` to be an
+   * `Array<TournamentSummary>`. React Query caches by key only, so
+   * whichever observer's queryFn writes last wins — a mismatched shape
+   * here corrupts the provider's cache and makes its tab-name sync
+   * effect crash with `find is not a function` the moment it runs
+   * after us. Normalize to the array shape (`select` unwraps the
+   * envelope) so both observers see the same thing.
+   */
+  const { data: tournamentsList } = useQuery({
     queryKey: matbeastKeys.tournaments(),
-    queryFn: () =>
-      matbeastJson<{ tournaments: Array<{ id: string; name: string }> }>("/api/tournaments"),
+    queryFn: async () => {
+      const j = await matbeastJson<{
+        tournaments?: Array<{ id: string; name: string; updatedAt?: string }>;
+      }>("/api/tournaments");
+      return Array.isArray(j?.tournaments) ? j.tournaments : [];
+    },
     enabled: !!overlayTournamentId,
     staleTime: 0,
     gcTime: 0,
@@ -207,6 +223,15 @@ export default function OverlayClient() {
     refetchOnMount: "always",
     refetchOnWindowFocus: true,
   });
+  /**
+   * Preserve the legacy `tournamentsPayload?.tournaments` read shape for
+   * downstream call sites without plumbing a rename through the whole
+   * file. Always an array (empty when the query hasn't resolved).
+   */
+  const tournamentsPayload = useMemo(
+    () => ({ tournaments: tournamentsList ?? [] }),
+    [tournamentsList],
+  );
 
   /**
    * Same board query as the rest of the app: `matbeastJson` forces `cache: "no-store"` on fetch.

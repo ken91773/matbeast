@@ -2,6 +2,7 @@ import { Prisma, type BeltRank } from "@prisma/client";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { ensureMasterPlayerProfileTable } from "@/lib/master-player-profile-table";
+import { drainOutbox, queueOutboxOp } from "@/lib/cloud-sync";
 
 function isMissingMasterProfileTable(error: unknown): boolean {
   if (!(error instanceof Prisma.PrismaClientKnownRequestError)) return false;
@@ -59,6 +60,20 @@ export async function PATCH(req: Request, { params }: Params) {
         headShotUrl: body.headShotUrl?.trim() || null,
       },
     });
+    await queueOutboxOp("profile.upsert", {
+      firstName: row.firstName,
+      lastName: row.lastName,
+      nickname: row.nickname,
+      academyName: row.academyName,
+      unofficialWeight: row.unofficialWeight,
+      heightFeet: row.heightFeet,
+      heightInches: row.heightInches,
+      age: row.age,
+      beltRank: row.beltRank,
+      profilePhotoUrl: row.profilePhotoUrl,
+      headShotUrl: row.headShotUrl,
+    }).catch(() => {});
+    await drainOutbox().catch(() => {});
     return NextResponse.json(row);
   } catch (e) {
     if (isMissingMasterProfileTable(e)) {
@@ -85,7 +100,21 @@ export async function DELETE(_req: Request, { params }: Params) {
   }
   try {
     await ensureMasterPlayerProfileTable();
+    // Capture identity + cloud id BEFORE deleting so the outbox op has
+    // enough info to delete the corresponding cloud row.
+    const existing = await prisma.masterPlayerProfile.findUnique({
+      where: { id },
+      select: { firstName: true, lastName: true, cloudId: true },
+    });
     await prisma.masterPlayerProfile.delete({ where: { id } });
+    if (existing) {
+      await queueOutboxOp("profile.delete", {
+        firstName: existing.firstName,
+        lastName: existing.lastName,
+        cloudId: existing.cloudId,
+      }).catch(() => {});
+      await drainOutbox().catch(() => {});
+    }
     return NextResponse.json({ ok: true });
   } catch (e) {
     if (isMissingMasterProfileTable(e)) {

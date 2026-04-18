@@ -1,6 +1,7 @@
 "use client";
 
 import AppChrome from "@/components/AppChrome";
+import CloudEventDialogs from "@/components/CloudEventDialogs";
 import { NativeFileMenuBridge } from "@/components/NativeFileMenuBridge";
 import { QuitSaveBridge } from "@/components/QuitSaveBridge";
 import { usePathname } from "next/navigation";
@@ -22,6 +23,7 @@ export default function RouteChromeShell({
       <NativeFileMenuBridge />
       <QuitSaveBridge />
       <AppChrome />
+      <CloudEventDialogs />
       <div className="min-h-0 flex-1 overflow-hidden">{children}</div>
     </div>
   );

@@ -43,6 +43,15 @@ type Ctx = {
   updateTabName: (id: string, name: string) => void;
   selectTournament: (id: string, name: string) => void;
   setActiveTournament: (id: string, name: string) => void;
+  /**
+   * When `true`, `DashboardClient` renders the `HomeCloudPanel` even if
+   * tabs are open. Lets the native File menu toggle between the home
+   * catalog and the active-event dashboard without closing any tabs.
+   * Resets automatically when the user opens an event from the
+   * homepage.
+   */
+  showHome: boolean;
+  setShowHome: (v: boolean) => void;
 };
 
 const EventWorkspaceContext = createContext<Ctx | null>(null);
@@ -94,12 +103,13 @@ export function EventWorkspaceProvider({
   const [openTabs, setOpenTabs] = useState<EventTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
+  const [showHome, setShowHome] = useState(false);
   const orphanRecoveryRef = useRef(false);
   const openTabsRef = useRef<EventTab[]>([]);
   const activeTabIdRef = useRef<string | null>(null);
 
   const {
-    data: tournaments = [],
+    data: tournamentsRaw,
     isFetched: tournamentsFetched,
     isError: tournamentsError,
     isFetching: tournamentsFetching,
@@ -108,6 +118,19 @@ export function EventWorkspaceProvider({
     queryFn: fetchTournaments,
     placeholderData: keepPreviousData,
   });
+  /**
+   * Defensive normalization: the `matbeastKeys.tournaments()` cache
+   * slot is shared with other observers (notably overlay-client, which
+   * mounts inside the same provider tree). If any of them ever writes
+   * a non-array shape, React Query's cache hands that back here
+   * unchanged — and every effect below calls `.find` / `.filter` on it.
+   * Coercing to `[]` on the way out of this hook keeps the provider
+   * from crashing the whole app on a shape mismatch.
+   */
+  const tournaments: TournamentSummary[] = useMemo(
+    () => (Array.isArray(tournamentsRaw) ? tournamentsRaw : []),
+    [tournamentsRaw],
+  );
 
   useEffect(() => {
     openTabsRef.current = openTabs;
@@ -377,6 +400,9 @@ export function EventWorkspaceProvider({
       openTabsRef.current = next;
       setOpenTabs(next);
       setActiveTabId(id);
+      // Opening or switching to an event always drops the "show home"
+      // override so the dashboard is visible for the new active tab.
+      setShowHome(false);
       invalidateAndBroadcast(id);
       persistTabsToStorage(next, id);
     },
@@ -445,6 +471,8 @@ export function EventWorkspaceProvider({
       updateTabName,
       selectTournament: openEventInTab,
       setActiveTournament: openEventInTab,
+      showHome,
+      setShowHome,
     }),
     [
       tournamentId,
@@ -458,6 +486,7 @@ export function EventWorkspaceProvider({
       closeTab,
       renameActiveTab,
       updateTabName,
+      showHome,
     ],
   );
 

@@ -1,0 +1,27 @@
+{
+  "name": "matbeast-masters",
+  "version": "0.4.0",
+  "private": true,
+  "description": "Mat Beast Masters - cloud service for shared master lists (player profiles, team names) and event file storage",
+  "scripts": {
+    "dev": "next dev --turbopack -p 3100",
+    "build": "prisma generate && next build",
+    "start": "next start -p 3100",
+    "lint": "next lint",
+    "postinstall": "prisma generate"
+  },
+  "dependencies": {
+    "@clerk/nextjs": "^7.2.3",
+    "@prisma/client": "^6.19.3",
+    "next": "^15.2.4",
+    "prisma": "^6.19.3",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "typescript": "^5"
+  }
+}

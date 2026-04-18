@@ -172,6 +172,10 @@ model MasterPlayerProfile {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  /// Mat Beast Masters cloud row id. Set after first push or pull; used
+  /// for direct DELETE/PATCH against the cloud. Null = never synced.
+  cloudId String?
+
   @@unique([firstName, lastName])
 }
 
@@ -182,6 +186,96 @@ model MasterTeamName {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  /// Mat Beast Masters cloud row id. Set after first push or pull. Null
+  /// = local-only (never synced to cloud yet).
+  cloudId String?
+}
+
+/// Single-row config for cloud sync against the Mat Beast Masters service.
+/// `id` is always the literal "default" — exactly one row exists.
+///
+/// IMPORTANT: this table is created lazily by ensureCloudConfigTable() at
+/// runtime, NOT by the bundled seed template. Older user DBs that predate
+/// the cloud feature get the table on first cloud-related API call.
+model CloudConfig {
+  id                  String    @id @default("default")
+  /// Plaintext desktop token (mbk_...). Empty string = not linked.
+  desktopToken        String    @default("")
+  /// Base URL of the cloud service. Defaults to production deployment.
+  cloudBaseUrl        String    @default("https://matbeast-masters.vercel.app")
+  /// True when sync is enabled. False = pretend the cloud doesn't exist.
+  syncEnabled         Boolean   @default(true)
+  /// Last successful master player profile pull completion time.
+  lastProfilesPullAt  DateTime?
+  /// Last successful master team name pull completion time.
+  lastTeamNamesPullAt DateTime?
+  /// Last sync error message (cleared automatically on next success).
+  lastSyncError       String?
+
+  updatedAt DateTime @updatedAt
+}
+
+/// Links a local Tournament to a cloud event in Mat Beast Masters.
+///
+/// One row per locally-open tournament that the user has linked to the
+/// cloud (either by "Open from cloud" or "Upload current to cloud").
+/// Tournaments without a row here are "local only" — saves go to disk,
+/// badge shows LOCAL ONLY.
+///
+/// Lazily created by ensureCloudEventLinkTable() for legacy user DBs.
+///
+/// Sync state fields (used to compute the header badge):
+///   baseVersion     — last cloud version we pushed OR pulled. The
+///                     expectedVersion header on PUT. If cloud moved
+///                     past this, we're in CONFLICT.
+///   lastSyncedSha   — sha256 of the blob after the last successful
+///                     push or pull. Comparing with currentLocalSha
+///                     tells us NOT-SYNCED vs SYNCED.
+///   currentLocalSha — sha256 of what the desktop most recently saved.
+///                     Updated on every save of this tournament.
+///   pendingPushAt   — non-null when a push is queued/retrying.
+///   lastError       — most recent cloud error string (for the badge
+///                     tooltip + force-sync dialog).
+model CloudEventLink {
+  tournamentId     String    @id
+  cloudEventId     String    @unique
+  baseVersion      Int       @default(0)
+  lastSyncedSha    String?
+  currentLocalSha  String?
+  /// Size in bytes of the blob we last synced (for "Size" display).
+  lastSyncedBytes  Int       @default(0)
+  lastPulledAt     DateTime?
+  lastPushedAt     DateTime?
+  pendingPushAt    DateTime?
+  lastError        String?
+  /// Path of the local mirror .matb file (offline cache). Set by the
+  /// sync helper when it saves a copy under %LOCALAPPDATA%.
+  localMirrorPath  String?
+}
+
+/// FIFO queue of master-list mutations the desktop wants to push to the
+/// cloud. Drained by the cloud sync helper. Successful ops are deleted;
+/// permanently-failing ops stay with `attempts >= 5` and a `lastError`.
+///
+/// Lazily created by ensureMasterCloudOutboxTable() — same self-heal
+/// pattern as MasterPlayerProfile / MasterTeamName.
+model MasterCloudOutbox {
+  id            String    @id @default(cuid())
+  /// One of:
+  ///   "team-name.upsert"   payload: { name }
+  ///   "team-name.delete"   payload: { name }
+  ///   "profile.upsert"     payload: { firstName, lastName, ...fields }
+  ///   "profile.delete"     payload: { id }   // cloud profile id
+  kind          String
+  /// JSON-encoded payload. Shape depends on `kind`.
+  payloadJson   String
+  createdAt     DateTime  @default(now())
+  attempts      Int       @default(0)
+  lastError     String?
+  lastAttemptAt DateTime?
+
+  @@index([createdAt])
 }
 
 /// Live mat state per tournament (event file)

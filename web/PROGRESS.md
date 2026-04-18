@@ -3,8 +3,978 @@
 ## Current Build Status
 - Desktop app rebuilt successfully multiple times.
 - Latest installer artifact:
+  - `dist/Mat Beast Scoreboard Setup 0.9.11.exe` (2026-04-17 —
+    Silenced the one-time "Reconnected to an existing cloud
+    event" info dialog. 0.9.10's orphan-link sweep is working
+    in the field (user confirmed the save succeeded), but the
+    companion notification in `uploadEnvelopeAsNewCloudEvent`
+    was firing every time the tab was reopened — each session
+    gets a fresh in-memory `Set`, so the "first adoption this
+    session" gate fires once per app launch for every tab the
+    user happens to have pinned. User feedback: "it worked
+    but whenever i open the file i get this annoying message.
+    Let's remove this." Removed the `window.alert`, the
+    `adoptedTabsNotifiedThisSession` set, and the comment
+    block that described the gate. Replaced with a silent
+    `matbeastDebugLog("save:auto-link", "adopted existing
+    cloud event (silent)", ...)` so post-mortems from
+    `bundled-server.log` still record which tab adopted
+    which cloud event, without any UI interruption. The
+    adopt path is otherwise unchanged — the save still
+    completes, the board is still patched to the cloud
+    filename, and the sync indicator still flips to
+    "synced" once the `CloudEventLink` is in place.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.10.exe` (2026-04-17 —
+    Orphan-link sweep in adopt. 0.9.9's diagnostics pinned the
+    failure: `PrismaClientKnownRequestError: Unique constraint
+    failed on the fields: (cloudEventId)` at the `link` stage.
+    Root cause: `CloudEventLink.cloudEventId` is `@unique` and
+    local SQLite already had stale rows claiming the target
+    `cloudEventId` under a different `tournamentId` (an
+    artefact of earlier sessions that imported the same cloud
+    event into a new tournament each time). The upsert is
+    keyed on `tournamentId`, so every adopt attempt tried to
+    INSERT a fresh row with a colliding `cloudEventId` and
+    tripped the constraint. Fix: before the upsert, the adopt
+    route now calls `prisma.cloudEventLink.findMany` /
+    `deleteMany` scoped to the target `cloudEventId` with
+    `NOT: { tournamentId }` to clear any orphan links, and
+    logs the cleared tournament IDs as
+    `[cloud-adopt] clearing orphan links {...}` for
+    post-mortem. The orphans are pure metadata — deleting
+    them doesn't touch the cloud event or the Tournament row
+    itself — so the sweep is safe for in-flight use. After
+    this build the first autosave on a rediscovered-orphan
+    tab should transparently adopt the existing cloud event,
+    fire the one-time "reconnected to existing cloud event"
+    alert, and flip the sync indicator to "synced".)
+  - `dist/Mat Beast Scoreboard Setup 0.9.9.exe` (2026-04-17 —
+    Adopt-route diagnostics. 0.9.8's adoption endpoint was
+    returning a bare HTTP 500 with no body, so the save-failed
+    dialog only said "Adopt-existing failed: HTTP 500" without
+    naming the failing step. Wrapped the whole adopt handler
+    in a stage-tagged try/catch ("meta" → "push" → "link") so
+    any thrown exception is logged to `bundled-server.log` as
+    `[cloud-adopt] threw {tournamentId, cloudEventId, stage,
+    message, stack}` and echoed back to the renderer as
+    `{ error, stage }`. The red "save failed" dialog now
+    displays `Adopt-existing failed: HTTP 500 @stage — detail`
+    so the next reproduction will identify whether the
+    failure is in the cloud-meta probe, the force-push, or
+    the local link upsert. No behavior change on the happy
+    path.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.8.exe` (2026-04-17 —
+    Adoption path plumbing fix. 0.9.7 added the orphaned-tab
+    adoption flow but it never triggered in practice because
+    `createCloudEvent` was wrapping the masters 409 body inside
+    its `message` string (`HTTP 409 {"error":"duplicate…,
+    "conflictingId":"cmo3soje…"}`) instead of surfacing
+    `conflictingId` as a typed field. The desktop proxy's JSON
+    response therefore had no top-level `conflictingId` either,
+    so the renderer's `upRes.json().conflictingId` read was
+    always undefined and the adoption branch never ran.
+    Fixed by: (a) `createCloudEvent` now JSON-parses the
+    masters body on error and returns
+    `{ kind: "error", status, message, conflictingId? }`,
+    (b) `/api/cloud/events/upload` hoists `conflictingId` to
+    the top-level response when the upstream returned 409, and
+    (c) its `[cloud-upload] create event failed` log line now
+    includes `conflictingId`. No change needed in the renderer
+    — the save pipeline already reads `parsed.conflictingId`
+    at the top level, it just never saw one before.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.7.exe` (2026-04-17 —
+    Orphaned LOCAL_ONLY recovery. 0.9.6 made the actual error
+    visible ("Auto-link upload failed: HTTP 409 — duplicate
+    filename") and exposed the real failure mode: a local tab
+    with no `CloudEventLink` whose filename already exists in
+    the cloud (e.g. a DB reset left the cloud event behind).
+    Every autosave POSTed `/upload`, masters rejected with 409,
+    the user's edits never reached the cloud. Added a new
+    desktop route `POST /api/cloud/events/adopt` that takes
+    `{ tournamentId, cloudEventId, envelope }`, fetches the
+    target cloud event's metadata, force-pushes the local
+    bytes with `X-Expected-Version: *`, and upserts a
+    `CloudEventLink` pointing at the adopted cloud event. The
+    auto-link save path now calls this endpoint when `/upload`
+    returns 409 with a `conflictingId`, so the first autosave
+    after an orphaned-tab reboot transparently reconnects and
+    uploads the in-memory edits. A one-time per-tab alert
+    tells the user that we reattached to an existing cloud
+    event rather than creating a duplicate, so if it's a
+    legitimately different event they can rename the filename
+    and the next autosave creates a fresh cloud event.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.6.exe` (2026-04-17 —
+    Real failure reasons. 0.9.5 made "save failed" clickable but
+    the dialog often said "No specific error message was
+    returned" because the per-tab `link.lastError` channel is
+    empty while a LOCAL_ONLY tab is still trying to auto-link
+    (upload). Added a `lastErrorMessage` field to
+    `matbeast-cloud-online` and had every `markCloudUnreachable`
+    call site in the save pipeline pass a real message — the
+    auto-link upload failure now reports the actual HTTP status
+    and body (e.g. `HTTP 409 duplicate filename`, `HTTP 502
+    cloud not configured`), and the regular `pushToCloudSync`
+    helper does the same on non-409 errors. The badge consults
+    `link.lastError` first, then falls back to
+    `cloudOnline.lastErrorMessage`, so clicking red "save
+    failed" now shows the actual cause whether the tab is
+    LOCAL_ONLY or already linked. Also added a
+    `[cloud-upload] create event failed` log line in the
+    `/api/cloud/events/upload` route to mirror the
+    `[cloud-push]` log added in 0.9.5.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.5.exe` (2026-04-17 —
+    Cloud-failure visibility. The new small-text indicator used to
+    show a persistent "connecting…" whenever the push pipeline was
+    hitting 502/401/timeout errors in a row, which let data-loss
+    risk hide in plain sight. The indicator now escalates to
+    "save failed" (red, clickable) after 15 seconds of sustained
+    failure; clicking opens an alert with the real HTTP/push
+    error message so the user can distinguish a quick network
+    blip from an auth reject or a structural 5xx. Hover tooltip
+    on the ambient "connecting…" also surfaces the underlying
+    error whenever the server reported one. The push route
+    (`/api/cloud/events/push`) now writes a `[cloud-push]` line
+    into `bundled-server.log` on every failed blob push so a
+    tester seeing "save failed" can capture the exact status +
+    message for post-mortem. No schema or behavior change for
+    the happy path — saves that succeed still flip the text back
+    to "synced" silently.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.4.exe` (2026-04-17 —
+    Cloud sync indicator redesign. The coloured CloudSyncBadge
+    chip (LOCAL ONLY / SYNCED / NOT SYNCED / CONNECTION LOST / NO
+    CLOUD) was drawing the user's eye during every 3-second poll.
+    Replaced with ambient small italic text next to the dashboard
+    toolbar that reduces to three labels: "synced", "saving…",
+    and "connecting…" (all seven upstream states collapse down
+    into those). The popover, refresh icon, and inline conflict
+    "Resolve…" button are gone — conflict resolution still fires
+    through the pre-existing `matbeast-cloud-conflict` event +
+    CloudEventDialogs modal, so that path is unchanged. When the
+    user has no cloud configured the indicator renders nothing at
+    all.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.3.exe` (2026-04-17 —
+    CONNECTION LOST false-positive fix. The badge's 30-second
+    cloud poll used to infer connectivity from `cloudMeta`
+    presence — a reachable-but-deleted event or a transient
+    single-endpoint blip would flip the header to CONNECTION LOST
+    even while the save pipeline was successfully pushing to
+    `/api/cloud/events/push`. The desktop proxy
+    `/api/cloud/events/status` now returns an explicit
+    `cloudProbe: "ok" | "not-found" | "unreachable" |
+    "not-configured" | "skipped"` discriminator; the renderer
+    only marks the cloud unreachable on `"unreachable"` and
+    marks reachable on both `"ok"` and `"not-found"`. Legacy
+    fallback is preserved for mixed-version server/renderer
+    combinations.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.2.exe` (2026-04-17 —
+    Filename uniqueness enforcement. Masters now rejects duplicate
+    filenames on upload (POST /api/events) and rename (PATCH
+    /api/events/:id) with a 409 + `code: "duplicate_filename"`
+    body; the server-side copy route auto-resolves collisions by
+    appending ` (2)`, ` (3)`, … so "Copy" always succeeds. All
+    three desktop proxy routes (`/upload`, `/rename`, `/:id/name`)
+    preserve 409 intact instead of collapsing to 502. The client
+    side covers every rename surface: NewEventDialog disables
+    Create when the filename matches an existing cloud event
+    (with a red inline warning); HomeCloudPanel pre-checks the
+    cached catalog on inline filename rename and handles 409 from
+    the server; the dashboard-header rename dialog fetches a
+    fresh catalog before committing the rename and also handles
+    409 from the mirror call. Race between dialog-open and Create
+    (someone else uploads the same name in between) rolls the
+    half-created tournament back and leaves the dialog open.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.1.exe` (2026-04-17 — Tab
+    UX pass: every tab now claims an equal share of the header
+    width (1 tab → 100%, 2 → 50/50, 3 → 33/33/33, …) and the
+    entire tab area is a switch target, not just the title label.
+    "New event" (from both the File menu and the homepage) now
+    pops a dialog that collects the Event title (default
+    `UNTITLED EVENT`) and Filename (default next free `MMDD-N`
+    from a live cloud probe, with an inline collision warning)
+    before the event is actually created. Patch-number rollover
+    extended to 3 digits — the next patch after 0.9.9 will be
+    0.9.10, not 0.10.0.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.0.exe` (2026-04-17 —
+    connectivity-aware New event + close-tab flow. "New event" now
+    blocks unless the cloud is reachable (so you never create a
+    permanently LOCAL ONLY tab by accident). The cloud badge now
+    displays `CONNECTION LOST` (red) when the masters host is
+    unreachable, `NO CLOUD` when the install isn't configured, and
+    flips back to `SYNCED` automatically on reconnect — the badge
+    also queues a silent re-push for its tournament on reconnect so
+    any edits made while offline reach the cloud without user
+    action. Closing a dirty tab while offline opens a "Not synced.
+    Backup to disk before closing?" dialog with Backup / Close
+    without backup / Cancel. Tab layout rebalanced so the active
+    tab's toolbar (filename, save feedback, badge, undo/redo)
+    claims 3× the header space of inactive tabs and only starts
+    compressing when enough tabs are open to exceed the bar.)
+  - `dist/Mat Beast Scoreboard Setup 0.8.9.exe` (2026-04-17 — saves
+    are now cloud-only. Disk writes are reserved for File ▸ Backup
+    copy to disk. Autosaves of `LOCAL ONLY` tabs auto-link to the
+    cloud. The "Save before closing?" modal is gone — closing a
+    dirty tab fires a silent cloud save and closes.)
+  - `dist/Mat Beast Scoreboard Setup 0.8.8.exe` (2026-04-17 — slim
+    File menu: Home page / Dashboard toggle, New event, Backup copy
+    to disk, Restore copy from disk. Restore uploads the recovered
+    envelope to the cloud under `<original>(recovered)`.)
+  - `dist/Mat Beast Scoreboard Setup 0.8.7.exe` (2026-04-17 — cloud-
+    first save pipeline: a local-disk permission error no longer
+    blocks the cloud push, the Electron IPC now returns a
+    structured `{ok:false,reason}` instead of throwing (so the
+    "Saving..." indicator always clears), bad stored disk paths
+    inside the install dir are auto-discarded, and the cloud-first
+    new-event flow now logs why its upload failed so future
+    "LOCAL ONLY" badge mysteries are actually diagnosable.)
+  - `dist/Mat Beast Scoreboard Setup 0.8.6.exe` (2026-04-17 — real
+    fix for the overlay-preview "Application error" on tab switch:
+    `EventWorkspaceProvider` and `overlay-client` shared the
+    `matbeastKeys.tournaments()` React Query cache slot but wrote
+    different shapes (`Array<TournamentSummary>` vs
+    `{ tournaments: [...] }`). Whichever queryFn fetched last
+    overwrote the cache, so the provider's tab-name sync effect
+    crashed with `find is not a function`. Normalized
+    overlay-client's queryFn to return the array and added a
+    defensive `Array.isArray` guard on the provider side.)
+  - `dist/Mat Beast Scoreboard Setup 0.8.5.exe` (2026-04-17 — dated
+    filename convention (`MMDD-N`), fixed the dashboard header
+    rename dialog (Electron focus race), split rename into
+    separate Event name + Filename fields, added a double-clickable
+    filename indicator in the dashboard header, and added
+    homepage in-place filename rename via double-click.)
+  - `dist/Mat Beast Scoreboard Setup 0.8.4.exe` (2026-04-17 — homepage
+    catalog overhaul: hides the internal revision number, shows the
+    tournament event name beneath the filename, adds a 3-dot actions
+    menu per row with "Make a copy" (server-side duplicate prefixed
+    with "Copy of ") and "Delete" (soft-delete on masters + local
+    link drop), and sorts by whichever of createdAt/updatedAt is
+    later. Requires matbeast-masters v0.4.1 which adds the
+    `CloudEvent.eventName` column and a /copy endpoint; already
+    deployed to `matbeast-masters.vercel.app` via Neon
+    `prisma db push`.)
+  - `dist/Mat Beast Scoreboard Setup 0.8.3.exe` (2026-04-17 — fixes the
+    overlay-preview "Application error" on tab switch: `buildBracketProjection`
+    now guards against a partial bracket payload where
+    `quarterFinals`/`semiFinals` arrive missing or non-array during the
+    iframe remount window. Error captured via v0.8.2 diagnostics
+    (`TypeError: C.find is not a function`) and pinned to
+    `src/lib/bracket-display.ts:76`.)
+  - `dist/Mat Beast Scoreboard Setup 0.8.2.exe` (2026-04-17 — cloud-first
+    new-event flow with auto-`UNTITLED(N)` naming, homepage cloud catalog,
+    tab-rename → cloud rename propagation, and a `global-error` +
+    `/api/diagnostics/client-error` reporter so overlay/layout crashes land
+    in `bundled-server.log` for triage.)
+  - `dist/Mat Beast Scoreboard Setup 0.8.1.exe` (2026-04-17 — cloud upload
+    default name now mirrors current roster filename; friendly
+    "not configured" notice replaces the generic HTTP 502 surface on
+    Open/Upload when sync is paused or tokenless.)
+  - `dist/Mat Beast Scoreboard Setup 0.8.0.exe` (2026-04-17 — cloud
+    event files: Open-from-cloud and Upload-to-cloud in the File menu,
+    auto-push on every save, CloudSyncBadge on the header with force-
+    sync button, conflict prompt (overwrite / keep cloud / save local
+    copy), powered by matbeast-masters v0.4.0.)
+  - `dist/Mat Beast Scoreboard Setup 0.7.0.exe` (2026-04-17 — cloud sync
+    v1: on-demand pull+push of master player profiles and master team
+    names, with local outbox for offline writes; Cloud sync settings
+    modal under Options menu; revocable desktop tokens minted from the
+    `matbeast-masters` cloud service.)
   - `dist/Mat Beast Scoreboard Setup 0.6.0.exe` (2026-04-17 2:34 PM — DB
     schema-drift auto-heal + bundled-server.log rotation)
+
+## v0.8.9 — Cloud-only save pipeline, auto-link LOCAL ONLY tabs, no more close prompt (2026-04-17)
+
+### What the user reported
+- **Autosave kept popping "Refusing to save to a relative path:
+  0417-1.matb"** on every edit. Tracked down to
+  `app.getPath("documents")` returning `""` on this machine
+  (likely OneDrive-redirected Documents or a broken known-folder
+  registry key), so `getDefaultEventSavePath` produced the bare
+  filename. v0.8.7's guard correctly refused that path, but the
+  autosave retry-storm made the refusal visible to the user.
+- **"LOCAL ONLY" badge + missing cloud sync.** The original
+  tournament was never linked to the cloud because its first-save
+  upload failed silently. Every subsequent save went through the
+  disk-mirror branch and skipped the cloud entirely.
+- **Close prompt after ~every edit** ("Save changes before
+  closing?") — not useful when the cloud is the source of truth.
+
+### Fixes
+1. **Cloud-only save pipeline** (`matbeastSaveTabById`). The disk
+   mirror branch is gone. The flow now is:
+   - If the tab has a `CloudEventLink` → `/api/cloud/events/push`.
+   - If not linked and cloud is configured → auto-upload via
+     `/api/cloud/events/upload` under the current filename
+     (falling back to a fresh `MMDD-N` when the board still holds
+     the placeholder "UNTITLED"). This flips the badge from
+     `LOCAL_ONLY` to `SYNCED` on the next poll.
+   - If not linked and cloud is not configured → warn the user
+     once per session, mark the tab clean, and succeed. The
+     recourse is File ▸ Backup copy to disk.
+2. **Close-tab prompt removed.** `requestCloseTab` fires a silent
+   cloud save and closes unconditionally. If the save fails, the
+   edits are still preserved in the tournament row in the local
+   DB — the next time the user opens the event and saves, the
+   cloud catches up.
+3. **One-shot "cloud not configured" notice**
+   (`cloudNotConfiguredWarnedThisSession`) so the user sees the
+   message at most once per app run, not on every keystroke.
+4. **Backup copy to disk** is now the *only* path that writes a
+   .matb to disk. Restore still uploads to the cloud after
+   import.
+
+### Side effects / removed code
+- `forgetTournamentDocumentState` is no longer called from the
+  close-tab flow (closing is always a save-through, never a
+  discard). Still exported and still called from other paths
+  (DB reset, etc.).
+- `handleCloseDecision` deleted.
+- The "Save / Discard / Cancel" modal JSX deleted from
+  `AppChrome`.
+- Several helpers in `matbeast-dashboard-file-actions.ts` are now
+  unused by the normal save path but kept exported because Save As
+  and Import still rely on them: `getEventDiskPath`,
+  `setEventDiskPath`, `eventNameFromPath`, `pushToCloudAfterSave`.
+
+### Files touched
+- `web/src/lib/matbeast-dashboard-file-actions.ts`
+  — `matbeastSaveTabById` rewrite; new
+  `isTournamentLinkedToCloud`, `isCloudConfigured`,
+  `chooseAutoLinkCloudName`, `uploadEnvelopeAsNewCloudEvent` helpers;
+  session-scoped "cloud not configured" warning.
+- `web/src/components/AppChrome.tsx` — removed
+  `closePromptForTabId` state, `handleCloseDecision`, and the
+  modal. `requestCloseTab` now does a silent save + close.
+  Imported `matbeastDebugLog`, removed unused
+  `forgetTournamentDocumentState` import.
+- `web/package.json` — bumped to `0.8.9`.
+
+## v0.8.8 — Slim File menu & cloud-aware "Restore copy from disk" (2026-04-17)
+
+### Menu changes
+The native window File menu now has exactly four items:
+
+1. **Home page** ↔ **Dashboard** (toggle). The label swaps based on
+   what the renderer is currently showing. Switching to "Home page"
+   surfaces the cloud catalog *without closing any open event tabs*;
+   switching back to "Dashboard" returns to the last-active event.
+2. **New event** — same as clicking "Create new event" on the home
+   page.
+3. **Backup copy to disk** — writes the current event envelope to a
+   user-chosen `.matb` file. Pure backup; doesn't retarget the
+   cloud link.
+4. **Restore copy from disk** — pick a `.matb` / `.json` / `.mat`
+   file, import it into a fresh tab, and upload it to the cloud as
+   `<original-stem>(recovered)` (with `(recovered)(1)`,
+   `(recovered)(2)` fallbacks on collision). Never overwrites
+   whatever is currently in the cloud under the original name.
+
+Everything else (Open Event…, Open Recent, Save, Save As,
+Open from Cloud, Upload to Cloud, Dashboard shortcut, Open Overlay
+Output Windows, Quit) has been removed from the File menu per the
+user's spec. Alt+F4 / window close still quits.
+
+### Implementation
+- `EventWorkspaceProvider` — added `showHome: boolean` +
+  `setShowHome` context fields. Cleared whenever the user opens or
+  switches to a tab via `openEventInTab`.
+- `DashboardClient` — renders `HomeCloudPanel` when `showHome` is
+  true (even with tabs open). Publishes the view state to Electron
+  main via a new `setWorkspaceViewState` IPC so the native menu
+  label stays in sync.
+- `electron/main.js` —
+  - New `workspaceViewState` object tracks `{showingHome, hasTabs}`.
+  - `buildMenuTemplate()` emits only the four items, with the
+    first one conditionally labelled **Home page** or **Dashboard**.
+  - New `app:set-workspace-view-state` IPC handler calls
+    `refreshApplicationMenu()` only when the reported state
+    changed.
+  - Added `home`, `dashboard`, `backupToDisk`, `restoreFromDisk`
+    to the allow-list in `sendFileMenuAction`.
+- `electron/preload.js` — exposed `setWorkspaceViewState` with a
+  `.catch()` guard so renderer effects can never leak a rejection.
+- `src/types/matbeast-desktop.d.ts` — typed the new preload surface.
+- `src/components/NativeFileMenuBridge.tsx` — handles `home`,
+  `dashboard`, `backupToDisk`, and `restoreFromDisk` actions.
+  `backupToDisk` reuses `matbeastSaveActiveTabAs`.
+- `src/lib/matbeast-dashboard-file-actions.ts` —
+  - New `matbeastRestoreFromDiskToCloud(…)` helper: picks a file,
+    creates a fresh tournament, imports roster/bracket, picks a
+    non-colliding `<stem>(recovered)[(N)]` cloud filename, uploads
+    the envelope, syncs `currentRosterFileName`, and links the
+    tournament to the new cloud event so future saves sync.
+  - New `pickRecoveredCloudFilename(stem, existing)` helper with
+    sequential collision handling.
+
+## v0.8.7 — Cloud-first save, EPERM-safe disk mirror, no more stuck "Saving..." (2026-04-17)
+
+### What the user saw (all from one test session)
+1. **"Saving..." notification stuck.** Close-tab → Save prompt → click
+   Save → big Electron dialog reading
+   `Error invoking remote method 'app:write-text-file': Error: EPERM:
+   operation not permitted, open
+   'C:\Program Files\Mat Beast Scoreboard\0417-1.matb'`. The header
+   indicator never cleared.
+2. **Badge often says "LOCAL ONLY"** even after the user believed an
+   event was cloud-backed.
+3. **Cloud copy is stale.** Reopening a cloud event loses the edits
+   the user made since the last successful save.
+
+### Root causes
+- **Stored disk path pointing into `C:\Program Files\…`.** Earlier
+  builds let the Electron "Save" dialog default to a relative
+  filename; if the user ever pressed Save without navigating, Node
+  resolved that against the main process cwd — which is the install
+  folder when the app is launched from the Start Menu. That path
+  was cached in `localStorage` under `matbeast-disk-path::…` and
+  every subsequent save re-used it. Windows (correctly) denies
+  writes there for non-admin processes → `EPERM`.
+- **Main-process `app:write-text-file` handler didn't catch the
+  EPERM.** `await fs.promises.writeFile(...)` threw, Electron's
+  `ipcRenderer.invoke` rejected the promise, and the renderer's
+  `const w = await desk.writeTextFile(...)` escaped the entire
+  save flow before it could `emitSaveStatus("error")`. Hence the
+  stuck "Saving..." indicator.
+- **Local-write failure short-circuited cloud push.** The old save
+  flow ran disk-write first and only pushed to the cloud if disk
+  succeeded. So when EPERM hit, nothing ever landed in the cloud
+  — confirming the user's "edits aren't saved".
+- **No logging on the cloud-first new-event flow.** When the initial
+  cloud upload failed silently (offline / 502 / token revoked),
+  the event stayed local-only forever with no trace in
+  `bundled-server.log` of *why*.
+
+### Fixes
+- `electron/main.js` — `app:write-text-file` now:
+  - Validates `filePath` is absolute.
+  - Rejects writes inside the app install directory with a
+    user-friendly `reason: "inside-install-dir"` error.
+  - Catches fs errors (EPERM/EACCES → `reason: "permission"`).
+  - Never throws back up the IPC channel.
+- `electron/preload.js` — wraps the `invoke` in `.catch()` so even
+  a genuinely unexpected rejection still resolves to
+  `{ok:false, reason:"ipc-rejected"}`.
+- `src/types/matbeast-desktop.d.ts` — added the structured
+  `reason` enum so the renderer can branch.
+- `src/lib/matbeast-dashboard-file-actions.ts` — `matbeastSaveTabById`
+  is now cloud-first:
+  1. Probes `/api/cloud/events/status` to see if the tab is linked.
+  2. Pushes to the cloud synchronously when linked (the cloud is
+     authoritative for cloud-linked events).
+  3. Writes the local disk mirror best-effort. Skipped entirely
+     for cloud-linked events that don't have a user-chosen disk
+     path (Save As is how you opt in to a local copy).
+  4. If the disk write fails with `inside-install-dir` /
+     `permission`, clears the bad `matbeast-disk-path::…`
+     localStorage entry so the next save isn't poisoned by the
+     same stale path.
+  5. Save is a success whenever the authoritative side
+     succeeded; disk failures surface a non-modal "Saved to cloud
+     (local copy skipped)" message for linked events.
+  6. The `emitSaveStatus("error", …)` path always runs on
+     failure, so the header chip always clears to either
+     "File saved" or "Save failed".
+- `createCloudUntitledForNewTab` now logs (via `matbeastDebugLog`)
+  every failure mode — config-not-configured, list fetch failed,
+  upload non-2xx with a snippet of the server body, thrown
+  exception — so next time an event ends up LOCAL ONLY we can
+  grep `bundled-server.log` for `file:new-tab cloud upload …` and
+  actually see why.
+
+### Files touched
+- `web/electron/main.js`
+- `web/electron/preload.js`
+- `web/src/types/matbeast-desktop.d.ts`
+- `web/src/lib/matbeast-dashboard-file-actions.ts`
+  (`matbeastSaveTabById` rewrite, new `pushToCloudSync` helper,
+  logging added to `createCloudUntitledForNewTab`)
+- `web/package.json` — bumped to `0.8.7`.
+
+### Migration note for existing installs
+- The first save after upgrading will notice any stale
+  `matbeast-disk-path::…` entry pointing into the install dir,
+  fail that specific write with the new structured reason, and
+  clear the entry. The cloud push still happens, so the save is
+  preserved. The *next* save will use `getDefaultEventSavePath`
+  (`Documents\<filename>.matb`) instead.
+
+## v0.8.6 — Real fix for overlay-preview `find is not a function` on tab switch (2026-04-17)
+
+### What shipped
+- **Root cause.** Two `useQuery` observers — one in
+  `EventWorkspaceProvider` (app-root provider) and one in
+  `overlay-client.tsx` — share the cache slot
+  `matbeastKeys.tournaments()`. The provider's queryFn returns
+  `Array<TournamentSummary>`; the overlay-client's queryFn used to
+  return the HTTP envelope `{ tournaments: [...] }`. React Query
+  caches by key only, so whichever observer refetched last
+  overwrote the cache. When the object-shape write won the race
+  (reliably on tab switch, because `overlayTournamentId` changing
+  retriggers the overlay query), the provider's tab-name sync
+  effect at `EventWorkspaceProvider.tsx:265–279` ran
+  `tournaments.find(...)` on the object and crashed the whole
+  iframe via `global-error`.
+- **Stack trace confirmation.** v0.8.2 diagnostics captured
+  `TypeError: C.find is not a function` with a useState frame
+  inside chunk `4160`. De-minifying that chunk (it's
+  `EventWorkspaceProvider`) showed the exact `setOpenTabs(prev =>
+  prev.map(tab => C.find(t => t.id === tab.id) ...))` pattern,
+  confirming the cache-shape collision hypothesis rather than the
+  v0.8.3 `buildBracketProjection` hypothesis (which did also
+  exist, but wasn't the source of this crash).
+- **Fixes**
+  - `web/src/app/overlay/overlay-client.tsx` — the `tournaments`
+    query now unwraps the `{ tournaments: [...] }` HTTP envelope
+    to the array shape, matching the provider. A small
+    `useMemo`-backed alias re-wraps to `{ tournaments }` for the
+    two consumers already reading `tournamentsPayload?.tournaments`
+    downstream.
+  - `web/src/components/EventWorkspaceProvider.tsx` — added
+    defensive `Array.isArray(tournamentsRaw) ? ... : []`
+    normalization so any future shape regression can't crash the
+    app. All downstream effects now always see an array.
+- `web/package.json` — bumped to `0.8.6`.
+
+### Why the v0.8.3 fix didn't stop this
+- v0.8.3 added `Array.isArray` guards to `buildBracketProjection`
+  in `src/lib/bracket-display.ts`, fixing a different non-array
+  `.find` crash in the same minified pattern (`[0..N].map((idx)
+  => list.find(...))`). That was a real bug but not the source
+  of this error — the v0.8.4 log entries also showed
+  `ua=matbeastscore/0.8.4` crashing with the same
+  `C.find is not a function`, pointing to a second, distinct
+  site.
+
+## v0.8.5 — Dated filenames, split rename, in-place homepage edit (2026-04-17)
+
+### What shipped
+- **Dated filename convention for new events.** `UNTITLED`, `UNTITLED(1)`,
+  ... is out. The cloud-first new-event flow now picks `MMDD-N` —
+  today's month+day followed by a per-day sequential counter — so
+  the first event created on April 17 is `0417-1`, the second is
+  `0417-2`, and yesterday's `0416-*` names never collide with today.
+  Holes are filled (deleting `0417-2` while `0417-1` and `0417-3`
+  exist yields `0417-2` on the next new event). Implemented in
+  `pickNextDatedFilename(existingNames, now?)` in
+  `web/src/lib/matbeast-dashboard-file-actions.ts`; the old export
+  `pickNextUntitledName` is retained as a shim that forwards to the
+  new picker so any stray call sites keep working.
+- **New events no longer rewrite the tab label to the filename.**
+  Previously the cloud-first flow set both `Tournament.name` and
+  `currentRosterFileName` to the cloud filename, which left every
+  brand-new event looking like `0417-1` in both the tab and the
+  filename indicator — with `eventName` equal to `name`, the
+  homepage's "event name under filename" secondary line was
+  always hidden. v0.8.5 only rewrites the filename; the tab label
+  stays at the server default ("Untitled event") until the user
+  renames it via the new rename dialog.
+- **Rename dialog now edits both fields.** Double-clicking the tab
+  label opens the dialog focused on **Event name**; double-clicking
+  the filename indicator (now a clickable button immediately to
+  the right of the tab label) opens the same dialog focused on
+  **Filename**. Both are editable in the same modal and saved
+  together on `Save`/Enter. The dialog uses React `autoFocus` plus
+  a caret-to-end effect, which fixes the Electron focus race that
+  made keystrokes appear to do nothing in v0.8.4.
+- **Homepage catalog: double-click to rename filename in place.**
+  Clicking the filename label on a homepage row in edit mode spawns
+  an inline `<input>` that commits on Enter/blur (Esc cancels). The
+  rename hits a new desktop proxy
+  `PATCH /api/cloud/events/:id/name`, which forwards to the existing
+  masters `PATCH /events/:id` endpoint via `patchCloudEvent`.
+- **Separated rename route payloads.** `/api/cloud/events/rename`
+  now accepts `{ tournamentId, name?, eventName? }` (at least one
+  required) instead of always writing both to the same value; the
+  tab-rename path sends only the changed field, so renaming the
+  event name doesn't stomp the filename and vice versa.
+
+### Files touched
+- `web/src/lib/matbeast-dashboard-file-actions.ts` — added
+  `formatTodayMMDD`, `pickNextDatedFilename`; `matbeastCreateNewEventTab`
+  no longer renames `Tournament.name` to the cloud filename.
+- `web/src/components/AppChrome.tsx` — new `renameState` shape
+  (separate `eventNameDraft`/`filenameDraft`, `focusField`),
+  new double-click target on the header filename, dialog uses
+  `autoFocus`, caret-to-end via `setSelectionRange`, save path
+  writes `tournaments/:id` and `/api/board` (for
+  `currentRosterFileName`) and mirrors the delta to the cloud.
+- `web/src/app/api/cloud/events/rename/route.ts` — accepts and
+  forwards `name?` and `eventName?` separately.
+- `web/src/app/api/cloud/events/[id]/name/route.ts` (new) — desktop
+  proxy for in-place homepage filename edits.
+- `web/src/components/HomeCloudPanel.tsx` — inline-rename input,
+  `commitRename` callback, double-click on the filename label.
+- `web/package.json` — bumped to `0.8.5`.
+
+### Why this was needed
+- The v0.8.4 homepage secondary line ("event name under filename")
+  never appeared for freshly-created events because the v0.8.2
+  cloud-first flow synced both the tab label and the filename to
+  the same cloud-picked string, which meant `eventName === name`
+  and the HomeCloudPanel deliberately hid a duplicate.
+- User reported the dashboard rename dialog was "opening but not
+  allowing actual editing". Root cause was the `useEffect` that
+  called `el.focus(); el.select();` inside a `requestAnimationFrame`
+  racing the Electron window-focus handoff — in practice the
+  select() took, the focus() returned, and then the top-level
+  keyboard listener received the first keystroke because the
+  input had momentarily lost focus. Replacing the manual focus
+  dance with `autoFocus` plus a caret-only selection restores
+  reliable typing.
+- The masters service already accepted separate `name` /
+  `eventName` on `PATCH /events/:id`, so no masters changes were
+  required for this release.
+
+## v0.8.4 — Homepage catalog: event-name, copy + delete, cleaner metadata (2026-04-17)
+
+### What shipped
+- **Version number hidden** on the homepage rows (it stays visible
+  in tooltips and the conflict prompt). The number was only ever
+  meaningful as a revision counter for conflict detection; removing
+  it from the primary catalog view stops "why did a 1-character
+  edit bump me to v3?" confusion.
+- **Event name shown under the filename.** Each row now reads:
+  - Line 1 (bold, primary): filename, e.g. `UNTITLED` /
+    `regionals-2025`.
+  - Line 2: the tournament's display event name from inside the
+    envelope, e.g. `Summer Grapple Open 2026`. Rendered only when
+    the event name actually differs from the filename, so rows on
+    fresh `UNTITLED` events stay single-line.
+  - Line 3 (dim): size · "updated Xm ago".
+- **Sorted newest-first** using `max(createdAt, updatedAt)`. The
+  previous build sorted by `updatedAt` only, which meant a
+  freshly-duplicated event whose blob timestamp lagged the row's
+  `createdAt` could drop a few positions.
+- **3-dot actions menu per row.** A kebab button next to "Open"
+  reveals two items:
+  - *Make a copy* — POSTs to `/api/cloud/events/:id/copy`. The
+    masters service server-side duplicates the latest blob into a
+    new `CloudEvent` with `eventName = "Copy of <original>"` (so
+    the copy is unambiguous in the catalog) and the bytes never
+    leave the cloud.
+  - *Delete* — DELETE on `/api/cloud/events/:id`. The masters
+    service soft-deletes (`deletedAt` set), and the desktop proxy
+    additionally drops any local `CloudEventLink` rows so the
+    desktop never tries to push/pull against the tombstone.
+    Guarded by a native `window.confirm` dialog.
+- **Background clicks close the menu** — a single `mousedown`
+  listener on the panel window dismisses the open menu.
+
+### New schema (masters)
+- `CloudEvent.eventName String?` (nullable, back-compat with rows
+  created before v0.8.4). Deployed to Neon via `prisma db push`.
+
+### New masters endpoints
+- `POST /api/events/:id/copy` — server-side duplicate of the latest
+  blob; returns the new event metadata.
+- `PATCH /api/events/:id` — now accepts optional `eventName` field
+  alongside `name`. At least one of the two must be present.
+
+### New desktop proxy endpoints
+- `DELETE /api/cloud/events/:id` — soft-delete + drop local
+  `CloudEventLink` rows.
+- `POST /api/cloud/events/:id/copy` — thin proxy to the masters
+  /copy endpoint.
+
+### Modified files
+- `src/components/HomeCloudPanel.tsx` — UI rewrite (two-line rows,
+  kebab menu, copy + delete handlers, newest-first sort).
+- `src/lib/cloud-events.ts` — `patchCloudEvent`, `copyCloudEvent`,
+  `deleteCloudEvent` helpers; `CloudEventMeta.eventName` field;
+  `createCloudEvent` now accepts optional `{ eventName }`.
+- `src/app/api/cloud/events/upload/route.ts` — includes the
+  current `Tournament.name` as `eventName` when creating cloud
+  events.
+- `src/app/api/cloud/events/push/route.ts` — after a successful
+  push, best-effort PATCHes `eventName` to keep the catalog
+  label aligned with the local tab title.
+- `src/app/api/cloud/events/rename/route.ts` — tab-rename now
+  updates BOTH the cloud filename (`name`) and the display
+  title (`eventName`).
+- `masters/prisma/schema.prisma` — `CloudEvent.eventName` column.
+- `masters/src/app/api/events/route.ts` — accepts `?eventName=`
+  on create, returns it on GET.
+- `masters/src/app/api/events/[id]/route.ts` — PATCH accepts
+  `eventName: string | null`; GET returns it.
+- `masters/src/app/api/events/[id]/copy/route.ts` — new /copy
+  endpoint.
+
+## v0.8.3 — Overlay tab-switch crash fix (2026-04-17)
+
+### What shipped
+- **Root cause**: The v0.8.2 diagnostics landed a clean stack in
+  `bundled-server.log`:
+  `TypeError: C.find is not a function` inside `[0,1,2,3].map` on
+  `http://127.0.0.1:.../overlay?preview=1&tournamentId=...`. That
+  pointed at `buildBracketProjection` in `src/lib/bracket-display.ts`,
+  where `data?.quarterFinals.find(...)` only short-circuits when
+  `data` itself is nullish. During the iframe remount that happens
+  on every tab switch, the cached react-query bracket payload for
+  the new tournament can briefly arrive with `quarterFinals` or
+  `semiFinals` missing / non-array (e.g. an error envelope shaped
+  `{ error }`). Calling `.find` on that non-array threw, the
+  overlay's error boundary caught it, and Next's built-in
+  "Application error" fallback rendered.
+- **Fix**: Added `Array.isArray(...)` guards in
+  `buildBracketProjection` so a malformed bracket payload degrades
+  to the placeholder match branch (same output as "no bracket data
+  yet") instead of throwing.
+- **Diagnostics stay in place**: the `global-error` +
+  `/api/diagnostics/client-error` reporter from v0.8.2 is unchanged,
+  so any future render-time crash still leaves a one-line JSON
+  trace in `bundled-server.log` instead of a blank "Application
+  error" screen.
+
+### Modified files
+- `src/lib/bracket-display.ts` — array guards before `.find`.
+
+## v0.8.2 — Cloud-first New Events + Home Catalog + Diagnostics (2026-04-17)
+
+### What shipped
+- **New Event = cloud event by default.** `File ▸ New Event` (and the
+  homepage "Create new event" button) now:
+  1. creates the local tournament as today,
+  2. checks `GET /api/cloud/config`; if sync is configured,
+  3. asks `GET /api/cloud/events` for existing cloud names,
+  4. picks the first free `UNTITLED`, `UNTITLED(1)`, `UNTITLED(2)`, … name,
+  5. uploads an empty envelope for the new tournament so it appears
+     immediately in the cloud catalog, and
+  6. renames the local tournament + dashboard tab label to match so
+     the two stay in lockstep.
+  If cloud is paused/offline, step 2 short-circuits and the event stays
+  purely local — the existing "link later" flow still works.
+- **Homepage lists the cloud catalog.** When no event tabs are open,
+  the dashboard now renders `HomeCloudPanel` in place of the empty
+  workspace. Lists every cloud event with name/version/size/updated
+  metadata, one-click "Open" (reuses the Open-from-Cloud pipeline),
+  and a prominent "+ Create new event" button. Shows a friendly
+  "Not configured" notice with a Cloud Settings shortcut when sync is
+  paused or tokenless, and a "Could not reach cloud" notice on
+  network errors so the homepage never goes blank.
+- **Tab rename → cloud rename.** Renaming a tab (double-click header
+  or File ▸ Rename) now also PATCHes the linked cloud event so the
+  catalog, Open-from-cloud dialog, and homepage list reflect the new
+  name without waiting for a fresh push.
+- **Client-error telemetry.** New `global-error.tsx` at the app root
+  and updated `overlay/error.tsx` both POST their error message,
+  stack, digest, URL, and UA to a new `/api/diagnostics/client-error`
+  route, which writes a single-line JSON record to `bundled-server.log`.
+  Reproducing the overlay-preview crash on tab switch now leaves a
+  usable trace we can grep without a devtools session.
+
+### New files
+- `src/components/HomeCloudPanel.tsx` — homepage cloud catalog UI.
+- `src/app/global-error.tsx` — root-level React error boundary.
+- `src/app/api/diagnostics/client-error/route.ts` — error sink.
+- `src/app/api/cloud/events/rename/route.ts` — PATCH bridge that
+  forwards a local tournament rename to the linked cloud event.
+
+### Modified files
+- `src/lib/matbeast-dashboard-file-actions.ts` — `pickNextUntitledName`
+  + `createCloudUntitledForNewTab`; `matbeastCreateNewEventTab` runs
+  the cloud-first flow and fixes the tournaments rename URL to
+  `/api/tournaments/[id]`.
+- `src/components/NativeFileMenuBridge.tsx` — threads `updateTabName`
+  through so the new-event flow can relabel the freshly-opened tab.
+- `src/components/DashboardClient.tsx` — renders `HomeCloudPanel` when
+  `openTabs.length === 0`.
+- `src/components/AppChrome.tsx` — `saveRenamedTab` POSTs to
+  `/api/cloud/events/rename` and broadcasts
+  `matbeast-cloud-sync-changed` so the badge and catalog refresh.
+- `src/lib/cloud-events.ts` — `renameCloudEvent(cloudEventId, name)`
+  wrapper around the masters `PATCH /api/events/[id]` endpoint.
+- `src/app/overlay/error.tsx` — pipes overlay errors into the
+  diagnostic sink.
+
+### Known open
+- Overlay-preview "Application error" on tab switch is still reported
+  in the wild. The v0.8.2 diagnostics are the setup for the fix —
+  the next reproduction will land a concrete error+stack in
+  `bundled-server.log` under the `overlay-error` or `global-error`
+  scope, which we will use to land the actual patch in v0.8.3.
+
+## v0.8.1 — Cloud Upload UX Fixes (2026-04-17)
+
+- **Upload dialog default name** now reads `currentRosterFileName`
+  from `/api/board` first and falls back to the tab label only when
+  the roster filename is empty / `UNTITLED`. Fixes the report that
+  "save to cloud defaulted to the event name instead of the
+  filename".
+- **Friendly not-configured notice.** Both `CloudUploadDialog` and
+  `CloudOpenDialog` now preflight `GET /api/cloud/config` and, when
+  `configured: false`, render an inline `NotConfiguredNotice` with a
+  one-click "Open Cloud Settings" button instead of surfacing the
+  generic `HTTP 502 {"error":"cloud not configured"}` from the
+  upload/list endpoints.
+
+## v0.8.0 — Cloud Event Files (2026-04-17)
+
+### What shipped
+- **Shared event files in the cloud.** Any `.matb` event can be
+  uploaded and then opened on any other signed-in desktop. All
+  tournament state — roster, brackets, results, audio volume — travels
+  as a single opaque JSON blob stored in Neon Postgres (`bytea`).
+- **Auto-push on save.** Every successful disk save triggers a
+  best-effort cloud push for tournaments linked to a cloud event.
+  Disk save is the source of truth; cloud failures never turn a
+  successful save into a failure.
+- **CloudSyncBadge on the dashboard header.** Shows one of six
+  states per active tab: `LOCAL ONLY`, `SYNCED`, `NOT SYNCED`,
+  `SYNCING`, `CONFLICT`, `OFFLINE`. A force-sync icon next to it
+  retries the push immediately. Badge polls local state every 3 s
+  and the cloud metadata every 30 s.
+- **Conflict prompt** (last-save-wins protected by a version fence):
+  if someone else pushed a newer version, the next push returns
+  409 and the user sees a three-button prompt — Overwrite cloud,
+  Keep cloud, or Save mine as a local-only copy.
+- **Two new File menu items**: `Open from Cloud…` and `Upload Current
+  to Cloud…`. Open reuses the existing import pipeline so each cloud
+  event becomes a new local tournament (same way disk opens work).
+- **Offline resilience**: users can save locally as always; the badge
+  will read NOT SYNCED / OFFLINE. When connectivity returns, the next
+  save flushes the pending bytes to the cloud.
+
+### New files
+- `src/lib/cloud-events.ts` — sync engine: hash helpers, pull/push
+  clients, link-row upsert, `computeStatus()` state machine for the
+  badge.
+- `src/app/api/cloud/events/*` — 6 route handlers: `GET /` (list),
+  `POST /push` (push with conflict detection), `POST /pull`
+  (download), `POST /upload` (create new cloud event), `GET /status`
+  (badge poll), `DELETE /link` (unlink).
+- `src/components/CloudSyncBadge.tsx` — the header badge + force-sync
+  button + details popover.
+- `src/components/CloudEventDialogs.tsx` — Open / Upload / Conflict
+  modal shell, mounted once in `RouteChromeShell`.
+
+### Schema additions (lazy-created, legacy DBs auto-heal)
+- `CloudEventLink` — one row per locally-linked tournament. Tracks
+  `baseVersion`, `lastSyncedSha`, `currentLocalSha`, `pendingPushAt`,
+  `lastError`, and an optional `localMirrorPath`. All fields are
+  created by `ensureCloudTables()` the first time any cloud route is
+  hit, so pre-0.8.0 user DBs get the table on first use without a
+  migration step.
+
+### Cloud side (matbeast-masters v0.4.0)
+- `CloudEvent` + `CloudEventBlob` models. Blob bytes live in Postgres
+  `bytea` (decision 1a) with a simple version counter and a SHA-256
+  over each version. Soft-delete via `deletedAt`.
+- `GET/POST /api/events`, `GET/PATCH/DELETE /api/events/:id`,
+  `GET/PUT /api/events/:id/blob`. Uploads use
+  `application/octet-stream`, so no base64 overhead. PUT requires
+  `X-Expected-Version: <N>` — the cloud returns 409 on mismatch
+  (decision 3b: last-save-wins, no soft lock).
+- `/events` admin page lists + renames + soft-deletes cloud events
+  for quick cleanup from the browser.
+
+### Design notes / known limitations
+- **Request body limit**: Vercel Hobby plan caps bodies at ~4.5 MB.
+  Events with many large profile photos can exceed this. The fix path
+  (deferred): switch `/events/:id/blob` to direct-to-storage uploads
+  via Vercel Blob or R2. For now, oversize events still work
+  offline / on disk, just not in the cloud.
+- **Delete semantics**: `DELETE /api/events/:id` is soft-delete only.
+  Local desktops that have the event still see LOCAL state because
+  their `CloudEventLink` row is intact; they'll just hit a 404 on the
+  next push and the badge flips to OFFLINE with a clear error.
+  Explicit unlink is available via `DELETE /api/cloud/events/link`.
+- **Conflict prompt policy** (decision 4a, prompt every time): we do
+  NOT silently auto-merge or auto-overwrite. Every 409 surfaces the
+  3-button dialog on the originating desktop. Users who never want
+  to see the dialog should coordinate out-of-band (group chat) — by
+  design we never assume who's "right".
+- **Badge polling cost**: the 30-second cloud metadata poll is a
+  tiny GET per active tab. Five users × a handful of tabs is trivial
+  on Neon's free tier. If this ever becomes expensive, bump to 60s
+  or switch to an SSE push.
+
+## v0.7.0 — Cloud Sync for Master Lists (2026-04-17)
+
+### What shipped
+- **Two master lists synced separately**: `MasterPlayerProfile` and
+  `MasterTeamName` each have their own independent pull+push cycle. You
+  can open the profiles panel without triggering a team-names sync and
+  vice versa.
+- **On-demand sync**: every GET of `/api/master-team-names` and
+  `/api/player-profiles` runs `syncTeamNames()` / `syncProfiles()` before
+  serving; every POST / PATCH / DELETE queues a `MasterCloudOutbox` op
+  and attempts an immediate drain. No background timers, no manual-sync
+  button requirement.
+- **Offline resilience**: pulls + drains are best-effort. Local SQLite
+  always wins — a cloud failure (no internet, cloud down, 401 from
+  revoked token) is swallowed and the route serves cached data. The
+  outbox drains the next time any sync succeeds. Cap: 5 attempts per op
+  before it's left for manual intervention.
+- **Revocable per-desktop auth**: each desktop install links with a
+  long-lived Mat Beast Masters token (`mbk_...`), pasted into
+  Options ▸ CLOUD SYNC... The token is stored hashed in the cloud DB;
+  admin (any signed-in Clerk user) can revoke any token at
+  `https://matbeast-masters.vercel.app/desktop-tokens` for an instant cutoff.
+  Revocation check happens on every cloud request — no cached JWT to
+  wait out.
+
+### New files
+- `src/lib/cloud-config.ts` — singleton CloudConfig row (token, base URL,
+  last-sync times, error, sync-enabled flag).
+- `src/lib/cloud-config-table.ts` — lazy CREATE TABLE IF NOT EXISTS for
+  CloudConfig + MasterCloudOutbox (same self-heal pattern as
+  `master-team-name-table.ts` / `master-player-profile-table.ts`).
+- `src/lib/cloud-sync.ts` — the sync engine. Exports `pullTeamNames()`,
+  `pullProfiles()`, `drainOutbox()`, `queueOutboxOp()`, and the bundled
+  `syncTeamNames()` / `syncProfiles()` used by the route handlers.
+- `src/app/api/cloud/config/route.ts` — GET/PATCH/DELETE local cloud
+  settings (token, base URL, sync-enabled).
+- `src/app/api/cloud/sync/route.ts` — POST with `{ kind:
+  "profiles" | "team-names" | "drain" | "all" }` to force a sync.
+- `src/components/CloudSettingsModal.tsx` — Cloud settings UI (status,
+  token paste, "Sync now", unlink, pause/resume).
+- `electron/main.js` — new menu entry `Options ▸ CLOUD SYNC...` dispatches
+  `matbeast-native-options` with `action: "cloud"` which `AppChrome`
+  listens for to open the modal.
+
+### Schema additions (lazy-created, not in seed template, so legacy user DBs upgrade silently)
+- `MasterTeamName.cloudId` (TEXT, nullable) — remote row id cached after
+  first push/pull so deletes can hit the cloud directly.
+- `MasterPlayerProfile.cloudId` (TEXT, nullable) — same.
+- `CloudConfig` (singleton) — one row, id always "default".
+- `MasterCloudOutbox` (FIFO queue of pending cloud writes).
+
+### Additive migration in `electron/main.js`
+Added `cloudId` TEXT to `ADDITIVE_COLUMN_PATCHES` for both
+`MasterTeamName` and `MasterPlayerProfile`. Existing user DBs get the
+column on next launch via the same ALTER-TABLE self-heal that handles
+the LiveScoreboardState evolutions. The CloudConfig / MasterCloudOutbox
+tables are lazy-created by `ensureCloudTables()` on first cloud-related
+API call, so no structural-drift trigger fires.
+
+### Cloud side (matbeast-masters v0.3.0)
+- `DesktopToken` model: id, userId, label, tokenHash (sha256),
+  tokenPreview (last 4), createdAt, lastUsedAt, revokedAt,
+  revokedByUserId. Instant revocation — checked on every request.
+- `POST /api/desktop-tokens` (mint, plaintext shown once),
+  `GET /api/desktop-tokens` (list), `DELETE /api/desktop-tokens/:id`
+  (revoke).
+- `/desktop-tokens` admin page with "Generate / Copy / Revoke" UI.
+- Middleware + `requireUserId()` accept `Authorization: Bearer mbk_...`
+  in addition to Clerk session cookies. 401 returned for Bearer failures
+  (NOT 404) so the desktop can distinguish "relink needed" from
+  "endpoint gone".
+
+### Design notes / known limitations
+- Dedup key is the natural key on both sides: `(firstName, lastName)`
+  for profiles, `name` for teams. Both sides normalize to UPPERCASE.
+  Two desktops creating "John Smith" independently end up with one row.
+- **Deletes do NOT propagate via pull**. If Desktop A deletes a profile
+  and pushes that delete to the cloud, Desktop B's local copy survives
+  until B explicitly deletes it. This is deliberate — avoids surprise
+  deletions of a local row that was added offline but hasn't been
+  pushed yet. Can be revisited if the group grows.
+- **Sync timeout is 12s**. If the venue has no internet, the first read
+  of the day pays a 12s cloud-timeout before falling back to cache.
+  Mitigate by toggling `syncEnabled` off in Cloud settings before the
+  venue.
+- Token is stored plaintext in the local SQLite under %LOCALAPPDATA%.
+  Per-user OS protection is the floor; OS keyring storage (keytar) is a
+  future upgrade if needed.
 
 ## Future Work Notes
 

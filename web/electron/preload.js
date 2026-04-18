@@ -15,12 +15,32 @@ contextBridge.exposeInMainWorld("matBeastDesktop", {
   showSaveEventDialog: (opts) => ipcRenderer.invoke("app:show-save-event-dialog", opts),
   getDefaultEventSavePath: (opts) =>
     ipcRenderer.invoke("app:get-default-event-save-path", opts),
+  /**
+   * Always resolve to a `{ok, ...}` shape — including for unexpected IPC
+   * rejections — so renderer `await desk.writeTextFile(...)` calls
+   * never escape the `emitSaveStatus("error")` path in the save flow.
+   * Prior behaviour let EPERM throw up the chain, leaving the header
+   * "Saving..." indicator stuck forever.
+   */
   writeTextFile: (filePath, text) =>
-    ipcRenderer.invoke("app:write-text-file", { filePath, text }),
+    ipcRenderer
+      .invoke("app:write-text-file", { filePath, text })
+      .catch((e) => ({ ok: false, reason: "ipc-rejected", error: String(e?.message || e) })),
   readTextFile: (filePath) => ipcRenderer.invoke("app:read-text-file", { filePath }),
   addRecentDocument: (filePath) =>
     ipcRenderer.invoke("app:add-recent-document", { filePath }),
   getDesktopPreferences: () => ipcRenderer.invoke("options:get-preferences"),
+  /**
+   * Publishes the dashboard/home-view state to the main process so the
+   * File menu's first item can toggle between "Home page" and
+   * "Dashboard" without the renderer also owning menu templating.
+   * Swallows rejections so a transient IPC hiccup can't throw out of
+   * the React effect that reports state.
+   */
+  setWorkspaceViewState: (state) =>
+    ipcRenderer
+      .invoke("app:set-workspace-view-state", state)
+      .catch(() => ({ ok: false })),
   checkForUpdates: () => ipcRenderer.invoke("app:check-for-updates"),
   checkForUpdatesWithDebug: () => ipcRenderer.invoke("app:check-for-updates-debug"),
   getRuntimeInfo: () => ipcRenderer.invoke("app:get-runtime-info"),

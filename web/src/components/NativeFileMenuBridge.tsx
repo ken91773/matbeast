@@ -8,9 +8,9 @@
  */
 import { useEventWorkspace } from "@/components/EventWorkspaceProvider";
 import {
-  matbeastCreateNewEventTab,
   matbeastImportOpenedEventFile,
   matbeastOpenEventOrShowPicker,
+  matbeastRestoreFromDiskToCloud,
   matbeastSaveActiveTab,
   matbeastSaveActiveTabAs,
 } from "@/lib/matbeast-dashboard-file-actions";
@@ -20,8 +20,14 @@ import { useEffect, useRef } from "react";
 
 export function NativeFileMenuBridge() {
   const queryClient = useQueryClient();
-  const { openEventInTab, refreshTournaments, selectTab, openTabs, ready } =
-    useEventWorkspace();
+  const {
+    openEventInTab,
+    refreshTournaments,
+    selectTab,
+    openTabs,
+    ready,
+    setShowHome,
+  } = useEventWorkspace();
   const openTabsRef = useRef(openTabs);
   openTabsRef.current = openTabs;
   const readyRef = useRef(ready);
@@ -43,15 +49,11 @@ export function NativeFileMenuBridge() {
         window.alert("Workspace is still loading. Try again in a moment.");
         return;
       }
-      try {
-        await matbeastCreateNewEventTab({
-          queryClient,
-          openEventInTab,
-          refreshTournaments,
-        });
-      } catch (e) {
-        window.alert(e instanceof Error ? e.message : "Could not create event");
-      }
+      // The actual create call now lives in AppChrome, wrapped in a
+      // dialog that collects the event title + filename up front.
+      // Dispatch the open request and let AppChrome take it from
+      // there.
+      window.dispatchEvent(new CustomEvent("matbeast-open-new-event-dialog"));
     },
     runOpen: async () => {
       if (!ready) {
@@ -125,7 +127,35 @@ export function NativeFileMenuBridge() {
         void h.runOpenRecent(d.filePath);
       }
       else if (d.action === "save") void h.runSave();
-      else if (d.action === "saveAs") void h.runSaveAs();
+      else if (d.action === "saveAs" || d.action === "backupToDisk") {
+        void h.runSaveAs();
+      } else if (d.action === "openCloud") {
+        window.dispatchEvent(new CustomEvent("matbeast-cloud-open-dialog"));
+      } else if (d.action === "uploadCloud") {
+        window.dispatchEvent(new CustomEvent("matbeast-cloud-upload-dialog"));
+      } else if (d.action === "home") {
+        // Show the cloud catalog without closing any open tabs.
+        setShowHome(true);
+      } else if (d.action === "dashboard") {
+        // Return to the last-active event tab.
+        setShowHome(false);
+      } else if (d.action === "restoreFromDisk") {
+        void (async () => {
+          if (!readyRef.current) {
+            window.alert("Workspace is still loading. Try again in a moment.");
+            return;
+          }
+          try {
+            await matbeastRestoreFromDiskToCloud({
+              queryClient,
+              openEventInTab,
+              refreshTournaments,
+            });
+          } catch (e) {
+            window.alert(e instanceof Error ? e.message : "Restore failed");
+          }
+        })();
+      }
     };
     window.addEventListener("matbeast-native-file", fn);
     return () => window.removeEventListener("matbeast-native-file", fn);

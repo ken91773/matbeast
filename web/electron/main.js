@@ -681,6 +681,10 @@ const ADDITIVE_COLUMN_PATCHES = [
   { table: "LiveScoreboardState", column: "sound0Enabled", ddl: "INTEGER NOT NULL DEFAULT 1" },
   { table: "LiveScoreboardState", column: "sound10PlayNonce", ddl: "INTEGER NOT NULL DEFAULT 0" },
   { table: "LiveScoreboardState", column: "sound0PlayNonce", ddl: "INTEGER NOT NULL DEFAULT 0" },
+  // v0.7.0 cloud sync — link local master rows to their Mat Beast Masters
+  // cloud counterparts. Both nullable so the ALTER is safe on existing DBs.
+  { table: "MasterTeamName", column: "cloudId", ddl: "TEXT" },
+  { table: "MasterPlayerProfile", column: "cloudId", ddl: "TEXT" },
 ];
 
 /**
@@ -1376,7 +1380,20 @@ function sendFileMenuAction(action) {
     hasMainWindow: Boolean(mainWindow && !mainWindow.isDestroyed()),
   });
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  const allowed = new Set(["new", "open", "load", "save", "saveAs", "openRecent"]);
+  const allowed = new Set([
+    "new",
+    "open",
+    "load",
+    "save",
+    "saveAs",
+    "openRecent",
+    "openCloud",
+    "uploadCloud",
+    "home",
+    "dashboard",
+    "backupToDisk",
+    "restoreFromDisk",
+  ]);
   if (!allowed.has(action)) return;
   const json = JSON.stringify(action);
   const code = `window.dispatchEvent(new CustomEvent("matbeast-native-file",{detail:{source:"menu",action:${json}}}));`;
@@ -1414,7 +1431,7 @@ function sendFileMenuOpenRecent(filePath) {
 
 function sendOptionsMenuAction(action, extra = {}) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  const allowed = new Set(["audio-output", "autosave-5m"]);
+  const allowed = new Set(["audio-output", "autosave-5m", "cloud"]);
   if (!allowed.has(action)) return;
   const payload = JSON.stringify({ source: "menu", action, ...extra });
   const code = `window.dispatchEvent(new CustomEvent("matbeast-native-options",{detail:${payload}}));`;
@@ -1423,53 +1440,59 @@ function sendOptionsMenuAction(action, extra = {}) {
   });
 }
 
+/**
+ * Tracks which view the renderer is showing so the File menu's
+ * first item can toggle between "Home page" and "Dashboard". Updated
+ * via `app:set-workspace-view-state` IPC from
+ * `DashboardClient` / `EventWorkspaceProvider`.
+ */
+const workspaceViewState = {
+  showingHome: true,
+  hasTabs: false,
+};
+
 function buildMenuTemplate() {
-  const recentDocuments = app.getRecentDocuments().filter((p) =>
-    /\.(json|mat|matb)$/i.test(String(p)),
-  );
-  const openRecentSubmenu =
-    recentDocuments.length > 0
-      ? recentDocuments.slice(0, 12).map((filePath) => ({
-          label: path.basename(filePath),
-          sublabel: filePath,
-          click: () => sendFileMenuOpenRecent(filePath),
-        }))
-      : [{ label: "No recent files", enabled: false }];
+  /**
+   * File menu toggle:
+   *  - When the dashboard is showing → item is "Home page" and
+   *    dispatches action `home` so the renderer sets
+   *    `showHome = true` without closing any tabs.
+   *  - When the home catalog is showing and at least one tab is
+   *    open → item is "Dashboard" and dispatches `dashboard`
+   *    which clears the override and returns to the last-active
+   *    event.
+   *  - When no tabs are open, the label stays "Home page" (the
+   *    user is already there; clicking is a harmless no-op).
+   */
+  const canToggleToDashboard =
+    workspaceViewState.showingHome && workspaceViewState.hasTabs;
+  const homeToggle = canToggleToDashboard
+    ? {
+        label: "Dashboard",
+        click: () => sendFileMenuAction("dashboard"),
+      }
+    : {
+        label: "Home page",
+        click: () => sendFileMenuAction("home"),
+      };
   return [
     {
       label: "File",
       submenu: [
+        homeToggle,
         {
-          label: "New Event…",
+          label: "New event",
           click: () => sendFileMenuAction("new"),
         },
-        {
-          label: "Open Event…",
-          click: () => sendFileMenuAction("open"),
-        },
-        {
-          label: "Open Recent",
-          submenu: openRecentSubmenu,
-        },
-        {
-          label: "Save",
-          click: () => sendFileMenuAction("save"),
-        },
-        {
-          label: "Save As…",
-          click: () => sendFileMenuAction("saveAs"),
-        },
         { type: "separator" },
         {
-          label: "Dashboard",
-          click: () => navigateMain("/"),
+          label: "Backup copy to disk",
+          click: () => sendFileMenuAction("backupToDisk"),
         },
         {
-          label: "Open Overlay Output Windows",
-          click: () => createOverlayWindows(),
+          label: "Restore copy from disk",
+          click: () => sendFileMenuAction("restoreFromDisk"),
         },
-        { type: "separator" },
-        { role: "quit" },
       ],
     },
     {
@@ -1506,6 +1529,8 @@ function buildMenuTemplate() {
             refreshApplicationMenu();
           },
         },
+        { type: "separator" },
+        { label: "CLOUD SYNC...", click: () => sendOptionsMenuAction("cloud") },
       ],
     },
     {
@@ -1727,18 +1752,69 @@ if (!gotSingleInstanceLock) {
     return { ok: true, filePath: path.join(docs, safe) };
   });
 
+  /**
+   * Write the event envelope to disk. Handles three historical failure
+   * modes that used to bubble up as Electron's generic "Error invoking
+   * remote method 'app:write-text-file'" alert:
+   *
+   *   1. A stored disk path inside `C:\Program Files\Mat Beast Scoreboard\`
+   *      left over from a version that defaulted the save dialog to the
+   *      install dir. Windows (correctly) denies that write with EPERM.
+   *   2. A non-absolute `filePath` that Node would resolve against the
+   *      Electron main process's cwd — which is the install dir when
+   *      the user launched from the Start Menu, so again EPERM.
+   *   3. Any other fs error (drive ejected, disk full, antivirus lock).
+   *
+   * In every case we now return `{ok:false, reason, error}` so the
+   * renderer can surface a coherent message, release the "Saving..."
+   * indicator, and (crucially) still push the envelope to the cloud.
+   */
   ipcMain.handle("app:write-text-file", async (_event, payload) => {
     const filePath = payload?.filePath;
     const text = payload?.text;
     if (typeof filePath !== "string" || !filePath) {
-      return { ok: false, error: "filePath required" };
+      return { ok: false, reason: "bad-args", error: "filePath required" };
     }
     if (typeof text !== "string") {
-      return { ok: false, error: "text required" };
+      return { ok: false, reason: "bad-args", error: "text required" };
     }
-    await fs.promises.writeFile(filePath, text, "utf8");
-    app.addRecentDocument(filePath);
-    refreshApplicationMenu();
+    if (!path.isAbsolute(filePath)) {
+      return {
+        ok: false,
+        reason: "not-absolute",
+        error: `Refusing to save to a relative path: ${filePath}`,
+      };
+    }
+    let installDir = "";
+    try {
+      installDir = path.dirname(app.getPath("exe"));
+    } catch {
+      installDir = "";
+    }
+    if (
+      installDir &&
+      filePath.toLowerCase().startsWith(installDir.toLowerCase() + path.sep)
+    ) {
+      return {
+        ok: false,
+        reason: "inside-install-dir",
+        error:
+          `Cannot save inside the app install folder (${installDir}). ` +
+          `Choose a location in your Documents folder (File ▸ Save As…).`,
+      };
+    }
+    try {
+      await fs.promises.writeFile(filePath, text, "utf8");
+    } catch (e) {
+      const code = (e && typeof e === "object" && "code" in e) ? String(e.code) : "";
+      return {
+        ok: false,
+        reason: code === "EPERM" || code === "EACCES" ? "permission" : "fs-error",
+        error: String(e?.message || e),
+      };
+    }
+    try { app.addRecentDocument(filePath); } catch { /* non-fatal */ }
+    try { refreshApplicationMenu(); } catch { /* non-fatal */ }
     return { ok: true };
   });
 
@@ -1777,6 +1853,27 @@ if (!gotSingleInstanceLock) {
   ipcMain.handle("options:get-preferences", async () => ({
     autoSaveEvery5Minutes: Boolean(desktopPreferences.autoSaveEvery5Minutes),
   }));
+
+  /**
+   * Renderer → main: publish current workspace view state so the File
+   * menu's first item can swap between "Home page" and "Dashboard".
+   * No-op when the reported state matches the cached state so we
+   * don't pointlessly rebuild the native menu on every React render.
+   */
+  ipcMain.handle("app:set-workspace-view-state", async (_event, payload) => {
+    const nextShowingHome = Boolean(payload?.showingHome);
+    const nextHasTabs = Boolean(payload?.hasTabs);
+    if (
+      workspaceViewState.showingHome === nextShowingHome &&
+      workspaceViewState.hasTabs === nextHasTabs
+    ) {
+      return { ok: true, changed: false };
+    }
+    workspaceViewState.showingHome = nextShowingHome;
+    workspaceViewState.hasTabs = nextHasTabs;
+    refreshApplicationMenu();
+    return { ok: true, changed: true };
+  });
 
   refreshApplicationMenu();
   createMainWindow();

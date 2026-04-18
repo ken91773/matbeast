@@ -18,7 +18,23 @@ type DefaultEventSavePathResult =
   | { ok: true; filePath: string }
   | { ok: false; error?: string };
 
-type WriteTextFileResult = { ok: true } | { ok: false; error?: string };
+type WriteTextFileResult =
+  | { ok: true }
+  | {
+      ok: false;
+      /**
+       * Structured reason so the renderer can branch on "recoverable vs
+       * fatal" without string-matching the Windows error message.
+       */
+      reason?:
+        | "bad-args"
+        | "not-absolute"
+        | "inside-install-dir"
+        | "permission"
+        | "fs-error"
+        | "ipc-rejected";
+      error?: string;
+    };
 type ReadTextFileResult = { ok: true; text: string } | { ok: false; error?: string };
 
 interface MatBeastDesktopApi {
@@ -44,6 +60,11 @@ interface MatBeastDesktopApi {
   addRecentDocument?: (filePath: string) => Promise<{ ok: true } | { ok: false }>;
   /** Pull current desktop preferences (closes the render-mount vs. did-finish-load race). */
   getDesktopPreferences?: () => Promise<{ autoSaveEvery5Minutes: boolean }>;
+  /** Inform the main process whether the renderer is showing the home catalog or the event dashboard. */
+  setWorkspaceViewState?: (state: {
+    showingHome: boolean;
+    hasTabs: boolean;
+  }) => Promise<{ ok: boolean; changed?: boolean }>;
   checkForUpdates: () => Promise<{ ok: boolean; reason?: string; state?: UpdateState }>;
   checkForUpdatesWithDebug: () => Promise<{
     ok: boolean;
