@@ -22,8 +22,18 @@ export type { BracketMatchJson } from "@/lib/bracket-display";
 
 type TeamRefWithOverlay = TeamRef & { overlayColor?: string | null };
 
-/** Single shared BYE row in edit dropdowns; resolves to a real TBD team id on save. */
+/** Walkover row; prefers a roster team literally named BYE, else falls back to TBD slots. */
+function restoreDashboardKeyboardFocusAfterBracketWork() {
+  try {
+    void window.matBeastDesktop?.restoreWebKeyboardFocus?.();
+  } catch {
+    /* ignore */
+  }
+}
+
 const BYE_SELECT_VALUE = "__MATBEAST_BYE__";
+/** Clears the slot visually (unassigned); resolves to TBD-named roster rows only, not BYE-named teams. */
+const BLANK_SELECT_VALUE = "__MATBEAST_BLANK__";
 
 type BracketOptionRow = { value: string; label: string };
 
@@ -36,6 +46,7 @@ function bracketDropdownRows(teamOptions: TeamRef[]): BracketOptionRow[] {
     .sort((a, b) => a.seedOrder - b.seedOrder);
   const rows: BracketOptionRow[] = [];
   if (byes.length > 0) {
+    rows.push({ value: BLANK_SELECT_VALUE, label: "" });
     rows.push({ value: BYE_SELECT_VALUE, label: "BYE" });
   }
   for (const t of named) {
@@ -51,57 +62,75 @@ function resolveBracketMatchTeamIds(
   m: BracketMatchJson,
   teamOptions: TeamRef[],
 ): { homeTeamId: string; awayTeamId: string } {
-  const byes = teamOptions
+  const tbdPool = teamOptions
     .filter(isTbdTeamRef)
     .sort((a, b) => a.seedOrder - b.seedOrder);
-  if (byes.length === 0) {
-    if (homePick === BYE_SELECT_VALUE || awayPick === BYE_SELECT_VALUE) {
-      throw new Error("No BYE teams in roster");
-    }
-    return { homeTeamId: homePick, awayTeamId: awayPick };
-  }
+  const byeNamePool = teamOptions
+    .filter((t) => (t.name || "").trim().toUpperCase() === "BYE")
+    .sort((a, b) => a.seedOrder - b.seedOrder);
 
-  const resolveSide = (
-    raw: string,
+  const pickPool = (pick: string) =>
+    pick === BYE_SELECT_VALUE && byeNamePool.length > 0 ? byeNamePool : tbdPool;
+
+  const resolveSentinel = (
+    pick: string,
     otherFixed: string | undefined,
     current: TeamRef,
   ): string => {
-    if (raw !== BYE_SELECT_VALUE) return raw;
-    if (isTbdTeamRef(current) && (!otherFixed || current.id !== otherFixed)) {
+    if (pick !== BLANK_SELECT_VALUE && pick !== BYE_SELECT_VALUE) return pick;
+    const pool = pickPool(pick);
+    if (pool.length === 0) {
+      throw new Error("No blank/BYE slots in roster — add a TBD team on the Teams card");
+    }
+    const inPool = pool.some((p) => p.id === current.id);
+    if (inPool && (!otherFixed || current.id !== otherFixed)) {
       return current.id;
     }
-    const alt = byes.find((b) => b.id !== otherFixed);
+    const alt = pool.find((b) => b.id !== otherFixed);
     if (!alt) {
       throw new Error("Need two distinct teams for this match");
     }
     return alt.id;
   };
 
-  if (homePick !== BYE_SELECT_VALUE && awayPick !== BYE_SELECT_VALUE) {
-    return { homeTeamId: homePick, awayTeamId: awayPick };
+  const hp = homePick;
+  const ap = awayPick;
+  const hIsSentinel = hp === BLANK_SELECT_VALUE || hp === BYE_SELECT_VALUE;
+  const aIsSentinel = ap === BLANK_SELECT_VALUE || ap === BYE_SELECT_VALUE;
+
+  if (tbdPool.length === 0) {
+    if (hIsSentinel || aIsSentinel) {
+      throw new Error("No blank/BYE slots in roster — add a TBD team on the Teams card");
+    }
+    return { homeTeamId: hp, awayTeamId: ap };
   }
-  if (homePick === BYE_SELECT_VALUE && awayPick === BYE_SELECT_VALUE) {
-    const h = resolveSide(BYE_SELECT_VALUE, undefined, m.homeTeam);
-    let a = resolveSide(BYE_SELECT_VALUE, h, m.awayTeam);
+
+  if (!hIsSentinel && !aIsSentinel) {
+    return { homeTeamId: hp, awayTeamId: ap };
+  }
+  if (hIsSentinel && aIsSentinel) {
+    const h = resolveSentinel(hp, undefined, m.homeTeam);
+    let a = resolveSentinel(ap, h, m.awayTeam);
     if (h === a) {
-      const second = byes.find((b) => b.id !== h);
+      const pool = pickPool(ap);
+      const second = pool.find((b) => b.id !== h);
       if (!second) {
-        throw new Error("Need two distinct BYE slots for this match");
+        throw new Error("Need two distinct slots for this match");
       }
       a = second.id;
     }
     return { homeTeamId: h, awayTeamId: a };
   }
-  if (homePick === BYE_SELECT_VALUE) {
-    const awayId = awayPick;
-    const homeId = resolveSide(BYE_SELECT_VALUE, awayId, m.homeTeam);
+  if (hIsSentinel) {
+    const awayId = ap;
+    const homeId = resolveSentinel(hp, awayId, m.homeTeam);
     if (homeId === awayId) {
       throw new Error("Home and away must be different");
     }
     return { homeTeamId: homeId, awayTeamId: awayId };
   }
-  const homeId = homePick;
-  const awayId = resolveSide(BYE_SELECT_VALUE, homeId, m.awayTeam);
+  const homeId = hp;
+  const awayId = resolveSentinel(ap, homeId, m.awayTeam);
   if (homeId === awayId) {
     throw new Error("Home and away must be different");
   }
@@ -247,10 +276,10 @@ function MatchCard({
 }) {
   const [editingTeams, setEditingTeams] = useState(false);
   const [homePick, setHomePick] = useState(
-    isTbdTeamRef(m.homeTeam) ? BYE_SELECT_VALUE : m.homeTeam.id,
+    isTbdTeamRef(m.homeTeam) ? BLANK_SELECT_VALUE : m.homeTeam.id,
   );
   const [awayPick, setAwayPick] = useState(
-    isTbdTeamRef(m.awayTeam) ? BYE_SELECT_VALUE : m.awayTeam.id,
+    isTbdTeamRef(m.awayTeam) ? BLANK_SELECT_VALUE : m.awayTeam.id,
   );
   const canSaveTeams = useMemo(() => {
     try {
@@ -263,8 +292,8 @@ function MatchCard({
 
   useEffect(() => {
     if (editingTeams) return;
-    setHomePick(isTbdTeamRef(m.homeTeam) ? BYE_SELECT_VALUE : m.homeTeam.id);
-    setAwayPick(isTbdTeamRef(m.awayTeam) ? BYE_SELECT_VALUE : m.awayTeam.id);
+    setHomePick(isTbdTeamRef(m.homeTeam) ? BLANK_SELECT_VALUE : m.homeTeam.id);
+    setAwayPick(isTbdTeamRef(m.awayTeam) ? BLANK_SELECT_VALUE : m.awayTeam.id);
   }, [m.homeTeam, m.awayTeam, editingTeams]);
   const dropdownRows = bracketDropdownRows(teamOptions);
   const homeWon = m.winnerTeamId === m.homeTeam.id;
@@ -311,7 +340,13 @@ function MatchCard({
               onChange={(e) => setHomePick(e.target.value)}
             >
               {dropdownRows.map((row) => (
-                <option key={`home-${m.id}-${row.value}`} value={row.value}>
+                <option
+                  key={`home-${m.id}-${row.value}`}
+                  value={row.value}
+                  aria-label={
+                    row.value === BLANK_SELECT_VALUE ? "Empty slot" : undefined
+                  }
+                >
                   {row.label}
                 </option>
               ))}
@@ -322,7 +357,13 @@ function MatchCard({
               onChange={(e) => setAwayPick(e.target.value)}
             >
               {dropdownRows.map((row) => (
-                <option key={`away-${m.id}-${row.value}`} value={row.value}>
+                <option
+                  key={`away-${m.id}-${row.value}`}
+                  value={row.value}
+                  aria-label={
+                    row.value === BLANK_SELECT_VALUE ? "Empty slot" : undefined
+                  }
+                >
                   {row.label}
                 </option>
               ))}
@@ -358,10 +399,10 @@ function MatchCard({
                   disabled={busy}
                   onClick={() => {
                     setHomePick(
-                      isTbdTeamRef(m.homeTeam) ? BYE_SELECT_VALUE : m.homeTeam.id,
+                      isTbdTeamRef(m.homeTeam) ? BLANK_SELECT_VALUE : m.homeTeam.id,
                     );
                     setAwayPick(
-                      isTbdTeamRef(m.awayTeam) ? BYE_SELECT_VALUE : m.awayTeam.id,
+                      isTbdTeamRef(m.awayTeam) ? BLANK_SELECT_VALUE : m.awayTeam.id,
                     );
                     setEditingTeams(false);
                   }}
@@ -396,7 +437,9 @@ function MatchCard({
                     : undefined
                 }
               >
-                {teamLabel(m.homeTeam, hideTbdNames)}
+                {teamLabel(m.homeTeam, hideTbdNames, {
+                  byeWordForBlankTbdOnCard: Boolean(hideTbdNames && !placeholder),
+                })}
               </button>
               <button
                 type="button"
@@ -439,7 +482,9 @@ function MatchCard({
                     : undefined
                 }
               >
-                {teamLabel(m.awayTeam, hideTbdNames)}
+                {teamLabel(m.awayTeam, hideTbdNames, {
+                  byeWordForBlankTbdOnCard: Boolean(hideTbdNames && !placeholder),
+                })}
               </button>
               <button
                 type="button"
@@ -448,10 +493,10 @@ function MatchCard({
                 onClick={() => {
                   if (placeholder) return;
                   setHomePick(
-                    isTbdTeamRef(m.homeTeam) ? BYE_SELECT_VALUE : m.homeTeam.id,
+                    isTbdTeamRef(m.homeTeam) ? BLANK_SELECT_VALUE : m.homeTeam.id,
                   );
                   setAwayPick(
-                    isTbdTeamRef(m.awayTeam) ? BYE_SELECT_VALUE : m.awayTeam.id,
+                    isTbdTeamRef(m.awayTeam) ? BLANK_SELECT_VALUE : m.awayTeam.id,
                   );
                   setEditingTeams(true);
                 }}
@@ -460,6 +505,16 @@ function MatchCard({
                 <TeamEditIcon className="h-2.5 w-2.5" />
               </button>
             </div>
+            {m.winnerTeamId && !placeholder ? (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void onPickWinner(m.id, null)}
+                className="mt-0.5 w-full rounded border border-zinc-600 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-300 hover:border-zinc-500 hover:bg-zinc-800/80 disabled:opacity-40"
+              >
+                Clear winner
+              </button>
+            ) : null}
           </>
         ) : null}
       </div>
@@ -536,6 +591,9 @@ export default function BracketPanel({ embed = false }: { embed?: boolean }) {
     onSuccess: (payload) => {
       queryClient.setQueryData(matbeastKeys.bracket(tournamentId), payload);
     },
+    onSettled: () => {
+      restoreDashboardKeyboardFocusAfterBracketWork();
+    },
   });
 
   const pickMutation = useMutation({
@@ -563,6 +621,9 @@ export default function BracketPanel({ embed = false }: { embed?: boolean }) {
         queryKey: matbeastKeys.board(tournamentId),
       });
     },
+    onSettled: () => {
+      restoreDashboardKeyboardFocusAfterBracketWork();
+    },
   });
   const editTeamsMutation = useMutation({
     mutationFn: async ({
@@ -587,6 +648,9 @@ export default function BracketPanel({ embed = false }: { embed?: boolean }) {
     },
     onSuccess: (payload) => {
       queryClient.setQueryData(matbeastKeys.bracket(tournamentId), payload);
+    },
+    onSettled: () => {
+      restoreDashboardKeyboardFocusAfterBracketWork();
     },
   });
 

@@ -216,7 +216,7 @@ function UnlockIcon({ className }: { className?: string }) {
 }
 
 export function DashboardTeamsPanel() {
-  const { tournamentId, ready } = useEventWorkspace();
+  const { tournamentId, ready, tournamentTrainingMode } = useEventWorkspace();
   const queryClient = useQueryClient();
   const [selectedMasterTeam, setSelectedMasterTeam] = useState("");
   const [newTeamDialogOpen, setNewTeamDialogOpen] = useState(false);
@@ -229,6 +229,27 @@ export function DashboardTeamsPanel() {
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [dragLocked, setDragLocked] = useState(false);
   const [overlayColorTeamId, setOverlayColorTeamId] = useState<string | null>(null);
+  const newTeamNameInputRef = useRef<HTMLInputElement>(null);
+  const addTeamSelectRef = useRef<HTMLSelectElement>(null);
+
+  useEffect(() => {
+    if (!newTeamDialogOpen) return;
+    /**
+     * Opening the dialog from a native `<select>` often leaves OS/Electron focus
+     * on the closed dropdown so the modal `<input>` ignores keys until refocus.
+     * Defer `focus()` past the close event + layout (double rAF).
+     */
+    let cancelled = false;
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (cancelled) return;
+        newTeamNameInputRef.current?.focus({ preventScroll: true });
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [newTeamDialogOpen]);
 
   useEffect(() => {
     return () => {
@@ -257,8 +278,11 @@ export function DashboardTeamsPanel() {
   }, [data?.teams]);
 
   const { data: masterTeamPayload, refetch: refetchMasterTeamNames } = useQuery({
-    queryKey: matbeastKeys.masterTeamNames(tournamentId),
-    queryFn: () => matbeastJson<{ names: string[] }>("/api/master-team-names"),
+    queryKey: matbeastKeys.masterTeamNames(tournamentId, tournamentTrainingMode),
+    queryFn: () =>
+      matbeastJson<{ names: string[] }>(
+        `/api/master-team-names?tournamentId=${encodeURIComponent(tournamentId!)}&useTrainingMasters=${tournamentTrainingMode ? "1" : "0"}`,
+      ),
     enabled: ready && !!tournamentId,
   });
   const masterTeamNames = useMemo<string[]>(
@@ -284,10 +308,10 @@ export function DashboardTeamsPanel() {
 
   const invalidateMasterTeams = useCallback(() => {
     void queryClient.invalidateQueries({
-      queryKey: matbeastKeys.masterTeamNames(tournamentId),
+      queryKey: matbeastKeys.masterTeamNames(tournamentId, tournamentTrainingMode),
     });
     void refetchMasterTeamNames();
-  }, [queryClient, refetchMasterTeamNames, tournamentId]);
+  }, [queryClient, refetchMasterTeamNames, tournamentId, tournamentTrainingMode]);
 
   const patchTeam = useMutation({
     mutationFn: async ({
@@ -304,7 +328,13 @@ export function DashboardTeamsPanel() {
       const res = await matbeastFetch(`/api/teams/${id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, overlayColor, removeFromMasterTeamNames }),
+        body: JSON.stringify({
+          name,
+          overlayColor,
+          removeFromMasterTeamNames,
+          tournamentId: tournamentId ?? undefined,
+          useTrainingMasters: tournamentTrainingMode,
+        }),
       });
       if (!res.ok) {
         const j = (await res.json()) as { error?: string };
@@ -339,6 +369,7 @@ export function DashboardTeamsPanel() {
 
   const onAddTeam = useCallback(() => {
     if (selectedMasterTeam === TEAM_ADD_NOT_LISTED) {
+      addTeamSelectRef.current?.blur();
       setNewTeamNameDraft("");
       setNewTeamDialogOpen(true);
       return;
@@ -376,7 +407,11 @@ export function DashboardTeamsPanel() {
       const res = await matbeastFetch("/api/master-team-names", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name }),
+        body: JSON.stringify({
+          name,
+          tournamentId,
+          useTrainingMasters: tournamentTrainingMode,
+        }),
       });
       if (!res.ok) {
         const j = (await res.json()) as { error?: string };
@@ -412,6 +447,7 @@ export function DashboardTeamsPanel() {
     patchTeam,
     teamsSorted,
     tournamentId,
+    tournamentTrainingMode,
   ]);
 
   const onClearFromEventOnly = useCallback(
@@ -444,7 +480,11 @@ export function DashboardTeamsPanel() {
         const res = await matbeastFetch("/api/master-team-names", {
           method: "DELETE",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name }),
+          body: JSON.stringify({
+            name,
+            tournamentId,
+            useTrainingMasters: tournamentTrainingMode,
+          }),
         });
         if (!res.ok) {
           const j = (await res.json()) as { error?: string };
@@ -464,6 +504,8 @@ export function DashboardTeamsPanel() {
     patchTeam,
     selectedMasterTeam,
     teamsSorted,
+    tournamentId,
+    tournamentTrainingMode,
   ]);
 
   const onDragStart = (index: number) => {
@@ -517,8 +559,8 @@ export function DashboardTeamsPanel() {
               if the event already has 8 named teams, only the master list is updated.
             </p>
             <input
+              ref={newTeamNameInputRef}
               type="text"
-              autoFocus
               value={newTeamNameDraft}
               onChange={(e) => setNewTeamNameDraft(e.target.value.toUpperCase())}
               className="mt-3 w-full rounded border border-zinc-600 bg-black/30 px-2 py-1.5 text-[12px] uppercase text-zinc-100 outline-none focus:border-teal-700/60"
@@ -604,10 +646,12 @@ export function DashboardTeamsPanel() {
           <label className="text-zinc-500">
             <span className="block">Add team to event</span>
             <select
+              ref={addTeamSelectRef}
               value={selectedMasterTeam}
               onChange={(e) => {
                 const v = e.target.value;
                 if (v === TEAM_ADD_NOT_LISTED) {
+                  (e.target as HTMLSelectElement).blur();
                   setNewTeamNameDraft("");
                   setNewTeamDialogOpen(true);
                   setSelectedMasterTeam("");

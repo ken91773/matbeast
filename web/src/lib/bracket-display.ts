@@ -27,10 +27,29 @@ export function normalizeBracketPayload(
   };
 }
 
-export function teamLabel(t: BracketTeamRef, blankWhenTbd = false) {
+export type TeamLabelOptions = {
+  /**
+   * With `blankWhenTbd`, bracket **placeholders** stay visually empty (unknown slot).
+   * Real matches that pair bye-marker teams (`TBD`/empty from roster) should read
+   * "BYE" on the dashboard card while the overlay keeps `blankWhenTbd` without this
+   * flag so walkovers stay blank there.
+   */
+  byeWordForBlankTbdOnCard?: boolean;
+};
+
+export function teamLabel(
+  t: BracketTeamRef,
+  blankWhenTbd = false,
+  opts?: TeamLabelOptions,
+) {
   const n = (t.name || "TBD").trim() || "TBD";
-  if (blankWhenTbd && n.toUpperCase() === "TBD" && t.seedOrder === 0) return "";
-  const shown = n.toUpperCase() === "TBD" ? "BYE" : n;
+  const nu = n.toUpperCase();
+  /** Dashboard bracket cards: unassigned roster rows are named TBD — show empty, not the word BYE. */
+  if (blankWhenTbd && (nu === "TBD" || nu === "")) {
+    if (opts?.byeWordForBlankTbdOnCard) return "BYE";
+    return "";
+  }
+  const shown = nu === "TBD" ? "BYE" : n;
   if (shown === "BYE") return "BYE";
   return `#${t.seedOrder} ${shown}`;
 }

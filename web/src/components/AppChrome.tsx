@@ -95,6 +95,8 @@ export default function AppChrome() {
    */
   const [newEventDialogOpen, setNewEventDialogOpen] = useState(false);
   const [creatingNewEvent, setCreatingNewEvent] = useState(false);
+  /** Synchronous guard — state alone allows double-submit (Enter + Create in one tick). */
+  const creatingNewEventRef = useRef(false);
 
   // Keep a live copy of the global online signal so `requestCloseTab`
   // can make its decision synchronously.
@@ -455,8 +457,9 @@ export default function AppChrome() {
 
   const { data: board } = useQuery({
     queryKey: matbeastKeys.board(tournamentId),
-    queryFn: () =>
+    queryFn: ({ signal }) =>
       matbeastJson<BoardPayload>("/api/board", {
+        signal,
         headers: { [MATBEAST_TOURNAMENT_HEADER]: tournamentId! },
       }),
     enabled: ready && !!tournamentId,
@@ -831,7 +834,8 @@ export default function AppChrome() {
       filename: string;
       trainingMode: boolean;
     }) => {
-      if (creatingNewEvent) return;
+      if (creatingNewEventRef.current) return;
+      creatingNewEventRef.current = true;
       setCreatingNewEvent(true);
       try {
         const created = await matbeastCreateNewEventTab({
@@ -874,16 +878,11 @@ export default function AppChrome() {
           e instanceof Error ? e.message : "Could not create event",
         );
       } finally {
+        creatingNewEventRef.current = false;
         setCreatingNewEvent(false);
       }
     },
-    [
-      creatingNewEvent,
-      queryClient,
-      openEventInTab,
-      refreshTournaments,
-      updateTabName,
-    ],
+    [queryClient, openEventInTab, refreshTournaments, updateTabName],
   );
 
   if (typeof window !== "undefined" && window.location.pathname === "/overlay") {
@@ -1065,7 +1064,7 @@ export default function AppChrome() {
                   ) : null}
                   <button
                     type="button"
-                    className="shrink-0 px-1 py-1 text-zinc-500 hover:text-white"
+                    className="shrink-0 px-1 py-1 text-white hover:bg-white/15"
                     aria-label={`Close ${tab.name}`}
                     title="Close tab"
                     onClick={(e) => {
@@ -1216,6 +1215,7 @@ export default function AppChrome() {
 
       <NewEventDialog
         open={newEventDialogOpen}
+        submitting={creatingNewEvent}
         onClose={() => {
           if (creatingNewEvent) return;
           setNewEventDialogOpen(false);

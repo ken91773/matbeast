@@ -3,6 +3,7 @@
 import {
   getMatBeastTournamentId,
   setMatBeastTournamentId,
+  syncMatBeastActiveTabContextToClientStorage,
 } from "@/lib/matbeast-fetch";
 import { matbeastDebugLog } from "@/lib/matbeast-debug-log";
 import { unregisterOpenEventFilePath } from "@/lib/matbeast-open-file-registry";
@@ -83,7 +84,13 @@ function readStoredTabs(): EventTab[] {
           typeof (x as EventTab).id === "string" &&
           typeof (x as EventTab).name === "string",
       )
-      .map((x) => ({ id: x.id, name: x.name }));
+      .map((x) => ({
+        id: x.id,
+        name: x.name,
+        ...(typeof (x as EventTab).trainingMode === "boolean"
+          ? { trainingMode: (x as EventTab).trainingMode }
+          : {}),
+      }));
   } catch {
     return [];
   }
@@ -163,6 +170,12 @@ export function EventWorkspaceProvider({
       if (e.key !== ACTIVE_TOURNAMENT_STORAGE_KEY) return;
       const nextId = e.newValue;
       if (!nextId || nextId === activeTabIdRef.current) return;
+      /** Main window wrote tab list + active id first; mirror tabs so `trainingMode` matches. */
+      const diskTabs = readStoredTabs();
+      if (diskTabs.length > 0) {
+        openTabsRef.current = diskTabs;
+        setOpenTabs(diskTabs);
+      }
       activeTabIdRef.current = nextId;
       setActiveTabId(nextId);
       setMatBeastTournamentId(nextId);
@@ -191,7 +204,7 @@ export function EventWorkspaceProvider({
     if (typeof window === "undefined") return;
     try {
       localStorage.setItem(TABS_STORAGE_KEY, JSON.stringify(tabs));
-      setMatBeastTournamentId(activeId);
+      syncMatBeastActiveTabContextToClientStorage(activeId, tabs);
     } catch {
       /* ignore */
     }
@@ -199,7 +212,7 @@ export function EventWorkspaceProvider({
 
   const invalidateAndBroadcast = useCallback(
     (id: string) => {
-      setMatBeastTournamentId(id);
+      syncMatBeastActiveTabContextToClientStorage(id, openTabsRef.current);
       if (typeof window !== "undefined" && !window.location.pathname.startsWith("/overlay")) {
         void window.matBeastDesktop?.setOverlayTournamentId?.(id);
       }
@@ -248,7 +261,6 @@ export function EventWorkspaceProvider({
           openTabsRef.current = tabs;
           setOpenTabs(tabs);
           setActiveTabId(active);
-          setMatBeastTournamentId(active);
           persistTabsToStorage(tabs, active);
           return;
         }
@@ -290,7 +302,6 @@ export function EventWorkspaceProvider({
         openTabsRef.current = tabs;
         setOpenTabs(tabs);
         setActiveTabId(active);
-        setMatBeastTournamentId(active);
         persistTabsToStorage(tabs, active);
       } finally {
         if (!cancelled) {
@@ -357,7 +368,6 @@ export function EventWorkspaceProvider({
           openTabsRef.current = [];
           setOpenTabs([]);
           setActiveTabId(null);
-          setMatBeastTournamentId(null);
           persistTabsToStorage([], null);
           void queryClient.invalidateQueries({ queryKey: matbeastKeys.all });
         } else {
@@ -385,7 +395,6 @@ export function EventWorkspaceProvider({
     openTabsRef.current = [];
     setOpenTabs([]);
     setActiveTabId(null);
-    setMatBeastTournamentId(null);
     persistTabsToStorage([], null);
     void queryClient.invalidateQueries({ queryKey: matbeastKeys.all });
     orphanRecoveryRef.current = false;
@@ -456,7 +465,6 @@ export function EventWorkspaceProvider({
         openTabsRef.current = [];
         setOpenTabs([]);
         setActiveTabId(null);
-        setMatBeastTournamentId(null);
         persistTabsToStorage([], null);
         void queryClient.invalidateQueries({ queryKey: matbeastKeys.all });
         return;

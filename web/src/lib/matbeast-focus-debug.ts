@@ -7,8 +7,11 @@
  *   localStorage.removeItem("matbeastFocusDebug")
  *
  * Logs: window focus/blur, document visibility, capture-phase focusin
- * (target tag), and suspicious keydown (key + activeElement) when the
- * focused node is not a typical text field.
+ * (target tag), suspicious keydown (key + activeElement) when the
+ * focused node is not a typical text field, and **keyboard-nudge** lines
+ * whenever the app asks Electron to `restoreWebKeyboardFocus` (see
+ * `matbeast-panel-pointer-recovery.ts`) — use timestamps to correlate
+ * with moments typing felt dead until Alt+Tab.
  */
 
 const STORAGE_KEY = "matbeastFocusDebug";

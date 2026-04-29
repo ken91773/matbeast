@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { requireUserId } from "@/lib/auth";
+import { trainingModeFromMatbBytes } from "@/lib/matb-envelope-meta";
 
 export const dynamic = "force-dynamic";
 
@@ -123,6 +124,7 @@ export async function PUT(req: NextRequest, ctx: Ctx) {
   const { createHash } = await import("node:crypto");
   const sha = createHash("sha256").update(bytes).digest("hex");
   const nextVersion = ev.currentVersion + 1;
+  const parsedTrainingMode = trainingModeFromMatbBytes(bytes);
 
   const saved = await prisma.$transaction(async (tx) => {
     await tx.cloudEventBlob.create({
@@ -144,6 +146,9 @@ export async function PUT(req: NextRequest, ctx: Ctx) {
         sizeBytes: bytes.length,
         updatedByUserId: a.userId,
         updatedByTokenId: a.via === "token" ? a.tokenId : null,
+        ...(parsedTrainingMode !== undefined
+          ? { trainingMode: parsedTrainingMode }
+          : {}),
       },
       select: {
         currentVersion: true,

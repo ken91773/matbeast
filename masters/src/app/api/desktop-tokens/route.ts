@@ -8,20 +8,18 @@ export const dynamic = "force-dynamic";
 /**
  * GET /api/desktop-tokens
  *
- * Lists ALL desktop tokens across all users in this workspace. With ~5
- * trusted users we treat the workspace as a small admin team, so anyone
- * signed in can see (and revoke) anyone else's tokens. Tighten later if
- * we add real role separation.
+ * Lists desktop tokens for the signed-in user only. Users mint and revoke
+ * their own keys; they cannot see or manage other workspace members' tokens.
  */
 export async function GET() {
   const a = await requireUserId();
   if ("response" in a) return a.response;
 
   const tokens = await prisma.desktopToken.findMany({
+    where: { userId: a.userId },
     orderBy: [{ revokedAt: "asc" }, { createdAt: "desc" }],
     select: {
       id: true,
-      userId: true,
       label: true,
       tokenPreview: true,
       createdAt: true,
@@ -67,7 +65,6 @@ export async function POST(req: NextRequest) {
     },
     select: {
       id: true,
-      userId: true,
       label: true,
       tokenPreview: true,
       createdAt: true,

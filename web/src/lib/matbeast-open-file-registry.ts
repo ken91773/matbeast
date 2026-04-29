@@ -10,8 +10,15 @@ const pathToTournamentId = new Map<string, string>();
 const tournamentIdToPath = new Map<string, string>();
 
 export function normalizePathForLookup(filePath: string): string {
-  const t = filePath.trim();
+  let t = filePath.trim();
   if (!t) return "";
+  // Long-path prefixes break string equality with the same path from the picker.
+  if (t.startsWith("\\\\?\\")) {
+    t = t.slice(4);
+    if (t.startsWith("UNC\\")) {
+      t = `\\\\${t.slice(4)}`;
+    }
+  }
   const unified = t.replace(/\//g, "\\");
   if (typeof navigator !== "undefined" && /win/i.test(navigator.platform)) {
     return unified.toLowerCase();

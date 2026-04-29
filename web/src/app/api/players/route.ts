@@ -5,6 +5,8 @@ import { getPrimaryEventIdOrThrow } from "@/lib/events";
 import { prisma } from "@/lib/prisma";
 import { profileUpper } from "@/lib/profile-text";
 import { normalizeTeamLineup } from "@/lib/team-lineup";
+import { resolveUseTrainingMastersForProfileRequest } from "@/lib/masters-training-mode";
+import { upsertGlobalMasterPlayerFromRosterPlayer } from "@/lib/sync-roster-player-master-profile";
 
 const ALL_BELTS: BeltRank[] = ["WHITE", "BLUE", "PURPLE", "BROWN", "BLACK"];
 
@@ -68,6 +70,10 @@ function parseBody(raw: unknown) {
       typeof b.lineupConfirmed === "boolean" ? b.lineupConfirmed : undefined,
     weighedConfirmed:
       typeof b.weighedConfirmed === "boolean" ? b.weighedConfirmed : undefined,
+    /** When set, must match `/api/player-profiles` scoping (active tab vs team DB). */
+    tournamentId:
+      typeof b.tournamentId === "string" ? b.tournamentId.trim() : "",
+    ...("useTrainingMasters" in b ? { useTrainingMasters: b.useTrainingMasters } : {}),
   };
 }
 
@@ -125,10 +131,23 @@ export async function POST(req: Request) {
   const beltRank = p.beltRank;
   const team = await prisma.team.findUnique({
     where: { id: p.teamId },
+    include: { event: { include: { tournament: { select: { trainingMode: true } } } } },
   });
   if (!team) {
     return NextResponse.json({ error: "Team not found" }, { status: 400 });
   }
+  const tid =
+    typeof p.tournamentId === "string" ? p.tournamentId.trim() : "";
+  const useTrainingMasters = await resolveUseTrainingMastersForProfileRequest(
+    req,
+    {
+      tournamentId: tid || null,
+      teamId: p.teamId,
+      ...("useTrainingMasters" in p
+        ? { useTrainingMasters: (p as { useTrainingMasters?: unknown }).useTrainingMasters }
+        : {}),
+    },
+  );
 
   try {
     const player = await prisma.$transaction(async (tx) => {
@@ -170,6 +189,24 @@ export async function POST(req: Request) {
       });
       await normalizeTeamLineup(tx, p.teamId);
       return created;
+    });
+    await upsertGlobalMasterPlayerFromRosterPlayer(
+      {
+        firstName: player.firstName,
+        lastName: player.lastName,
+        nickname: player.nickname,
+        academyName: player.academyName,
+        unofficialWeight: player.unofficialWeight,
+        heightFeet: player.heightFeet,
+        heightInches: player.heightInches,
+        age: player.age,
+        beltRank: player.beltRank,
+        profilePhotoUrl: player.profilePhotoUrl,
+        headShotUrl: player.headShotUrl,
+      },
+      useTrainingMasters,
+    ).catch(() => {
+      /* master / cloud optional — roster row still created */
     });
     return NextResponse.json(player);
   } catch (e) {

@@ -17,6 +17,12 @@ import {
   setAudioVolumePercent,
 } from "@/lib/audio-output";
 import type { BoardPayload } from "@/types/board";
+import { OT_ROUND_DROPDOWN_LABELS } from "@/lib/ot-round-label";
+import {
+  formatWallMss,
+  scoreboardOtRedTimerStyle,
+  scoreboardTimerLineFromBoard,
+} from "@/lib/scoreboard-timer-display";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -29,12 +35,6 @@ type Player = {
   lineupOrder: number;
   team: { id: string; name: string };
 };
-
-function fmt(sec: number) {
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
 
 function displayName(p: Player) {
   const full = `${p.firstName} ${p.lastName}`.trim();
@@ -101,9 +101,7 @@ const ROUND_PRESETS = [
   "Quarter Finals",
   "Semi Finals",
   "Grand Final",
-  "OT ROUND 1",
-  "OT ROUND 2",
-  "OT ROUND 3",
+  ...OT_ROUND_DROPDOWN_LABELS,
 ] as const;
 const CUSTOM_PRESET = "CUSTOM";
 const CUSTOM_FIGHTER = "__CUSTOM__";
@@ -181,9 +179,10 @@ export default function ControlPanel({
     isLoading: boardLoading,
   } = useQuery({
     queryKey: matbeastKeys.board(tournamentId),
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const bRes = await matbeastFetch("/api/board", {
         cache: "no-store",
+        signal,
         headers: { [MATBEAST_TOURNAMENT_HEADER]: tournamentId! },
       });
       if (!bRes.ok) {
@@ -265,14 +264,29 @@ export default function ControlPanel({
   const boardErr =
     boardQueryError instanceof Error ? boardQueryError.message : null;
 
+  /**
+   * Do not include `board.updatedAt` here: it changes on every board PATCH, which
+   * resets `prevSecondsRef` in `useTimerAlertSounds` and **swallows boundary cues**.
+   *
+   * Do not include `timerRunning`: when the clock hits 0 the server sets
+   * `timerRunning` false on the same response as `secondsRemaining === 0`, so a
+   * run-bit in the key would clear `prevSecondsRef` before the 0-crossing check
+   * and the air horn would never fire (same class of bug for the 10s cue on pause).
+   */
+  const timerAudioResetKey = board
+    ? `${tournamentId ?? ""}|oi:${board.overtimeIndex}|ph:${board.timerPhase}|r:${board.timerRestMode ? 1 : 0}|u:${board.timerOtCountUpMode ? 1 : 0}|a:${board.timerOtArmedMode ? 1 : 0}|d:${board.timerOtCountdownMode ? 1 : 0}|dir:${board.otPlayDirection}|otr:${board.timerOtRoundMode ? 1 : 0}|cue:${board.timerCuesResetNonce ?? 0}`
+    : (tournamentId ?? undefined);
+
   useTimerAlertSounds(
     board?.secondsRemaining,
-    tournamentId ?? undefined,
+    timerAudioResetKey,
     board?.sound10Enabled,
     board?.sound0Enabled,
     board?.timerRestMode,
     board?.sound10PlayNonce,
     board?.sound0PlayNonce,
+    true,
+    board?.timerOtCountdownMode ?? false,
   );
 
   const pOpts = useMemo(() => {
@@ -318,6 +332,12 @@ export default function ControlPanel({
     if (opts?.skipUndo) {
       headers["x-matbeast-skip-undo"] = "1";
     }
+    // Abort in-flight GET /api/board (1s refetch) so a stale poll cannot overwrite
+    // this PATCH response (e.g. OT ELAPSED snapping back).
+    await queryClient.cancelQueries({
+      queryKey: matbeastKeys.board(tournamentId),
+      exact: true,
+    });
     const res = await matbeastFetch("/api/board", {
       method: "PATCH",
       headers,
@@ -339,10 +359,15 @@ export default function ControlPanel({
       return null;
     }
     const j = (await res.json()) as BoardPayload;
+    await queryClient.cancelQueries({
+      queryKey: matbeastKeys.board(tournamentId),
+      exact: true,
+    });
     queryClient.setQueryData(matbeastKeys.board(tournamentId), {
       ...j,
       resultsLog: Array.isArray(j.resultsLog) ? [...j.resultsLog] : [],
     });
+    setRoundDirty(false);
     const cmdType =
       typeof body.command === "object" &&
       body.command !== null &&
@@ -434,27 +459,23 @@ export default function ControlPanel({
   }
 
   async function applyFighters() {
-    const updated = await patch({
-      leftPlayerId: leftId && leftId !== CUSTOM_FIGHTER ? leftId : null,
-      rightPlayerId: rightId && rightId !== CUSTOM_FIGHTER ? rightId : null,
-      customLeftName:
-        leftId === CUSTOM_FIGHTER ? leftCustomName.trim().toUpperCase() : null,
-      customLeftTeamName:
-        leftId === CUSTOM_FIGHTER
-          ? leftCustomTeamName.trim().toUpperCase()
-          : null,
-      customRightName:
-        rightId === CUSTOM_FIGHTER ? rightCustomName.trim().toUpperCase() : null,
-      customRightTeamName:
-        rightId === CUSTOM_FIGHTER
-          ? rightCustomTeamName.trim().toUpperCase()
-          : null,
-      roundLabel,
-    });
-    if (updated) {
-      setRoundLabel(updated.roundLabel);
-      setRoundDirty(false);
+    /**
+     * APPLY commits the selected fighters and (only when the operator actually
+     * changed the round dropdown/input to a **different** label) the round
+     * label. Sending the same OT round label would otherwise re-run OT
+     * reconcile on the server and reset the secondary ELAPSED clock; the
+     * `roundDirty` + string compare guard keeps repeated APPLYs inside the
+     * same OT round from zeroing ELAPSED.
+     */
+    const body: Record<string, unknown> = fighterPayload();
+    if (
+      board &&
+      roundDirty &&
+      roundLabel.trim() !== (board.roundLabel ?? "").trim()
+    ) {
+      body.roundLabel = roundLabel;
     }
+    await patch(body);
   }
 
   if (!board) {
@@ -695,7 +716,7 @@ export default function ControlPanel({
                 <option value="Quarter Finals">Quarter Finals</option>
                 <option value="Semi Finals">Semi Finals</option>
                 <option value="Grand Final">Grand Final</option>
-                <option value="OT ROUND 1">OT ROUND 1</option>
+                <option value="OT ROUND1">OT ROUND1</option>
                 <option value="OT ROUND 2">OT ROUND 2</option>
                 <option value="OT ROUND 3">OT ROUND 3</option>
                 <option value={CUSTOM_PRESET}>CUSTOM</option>
@@ -714,6 +735,8 @@ export default function ControlPanel({
             <button
               type="button"
               className={`${actionBtn} bg-amber-600 text-black hover:bg-amber-500`}
+              title="Save fighter picks, custom names, and (only when you changed it) the round label. Does not reset OT elapsed for repeated APPLYs inside the same round."
+              aria-label="Apply fighters and round label to the board"
               onClick={() => applyFighters()}
             >
               APPLY
@@ -967,12 +990,63 @@ export default function ControlPanel({
               : "p-4"
           }
         >
-          <p
-            className={`font-mono text-4xl ${
-              board.timerRestMode ? "text-amber-300" : "text-white"
-            }`}
-          >
-            {fmt(board.secondsRemaining)}
+          <div className="flex flex-wrap items-center gap-2">
+            <p
+              className={`font-mono text-4xl ${
+                board.timerRestMode
+                  ? "text-amber-300"
+                  : scoreboardOtRedTimerStyle(board)
+                    ? "text-red-800"
+                    : "text-white"
+              }`}
+            >
+              {scoreboardTimerLineFromBoard(board)}
+            </p>
+            {board.timerOtRoundMode ? (
+              <>
+                <button
+                  type="button"
+                  title={
+                    board.otRoundTransferConsumed
+                      ? "Undo: restore match clock and OT elapsed before they were moved (paused only)"
+                      : "Move OT elapsed into the match clock; ELAPSED resets to 0 (paused only). Separate from APPLY (fighters)."
+                  }
+                  disabled={board.timerRunning}
+                  onClick={() =>
+                    void patch({ command: { type: "ot_round_transfer_elapsed_to_main" } })
+                  }
+                  className="inline-flex h-9 w-9 shrink-0 items-center justify-center self-end rounded border border-zinc-600 bg-zinc-800/80 text-zinc-200 hover:border-teal-600/60 hover:bg-zinc-800 hover:text-teal-100 disabled:cursor-not-allowed disabled:opacity-35"
+                >
+                  <svg
+                    className="h-5 w-5"
+                    viewBox="0 0 24 24"
+                    fill="currentColor"
+                    aria-hidden
+                  >
+                    <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
+                  </svg>
+                  <span className="sr-only">
+                    {board.otRoundTransferConsumed
+                      ? "Undo move OT elapsed to match clock"
+                      : "Move OT elapsed to match clock; reset ELAPSED"}
+                  </span>
+                </button>
+                <div className="flex flex-col items-center gap-0.5 leading-none">
+                  <span className="text-[0.625rem] font-semibold uppercase tracking-wide text-zinc-500">
+                    ELAPSED:
+                  </span>
+                  <p
+                    className="font-mono text-[1.575rem] leading-none text-yellow-300 tabular-nums"
+                    aria-label="Overtime elapsed"
+                  >
+                    {formatWallMss(board.otRoundElapsedSeconds)}
+                  </p>
+                </div>
+              </>
+            ) : null}
+          </div>
+          <p className="mt-1 text-xs font-medium uppercase tracking-wide text-zinc-400">
+            {board.roundLabel}
           </p>
           <div className="mt-4 flex flex-wrap gap-2">
             <button
@@ -1008,7 +1082,7 @@ export default function ControlPanel({
                 })
               }
             >
-              Reset 5:00
+              5:00
             </button>
             <button
               type="button"
@@ -1019,21 +1093,21 @@ export default function ControlPanel({
                 })
               }
             >
-              Reset 4:00
+              4:00
             </button>
             <button
               type="button"
               className="rounded bg-zinc-700 px-3 py-2 text-sm hover:bg-zinc-600"
               onClick={() => patch({ command: { type: "reset_timer_overtime" } })}
             >
-              Reset 1:00
+              1:00
             </button>
             <button
               type="button"
               className="rounded bg-amber-500 px-3 py-2 text-sm font-semibold text-black hover:bg-amber-400"
               onClick={() => patch({ command: { type: "set_timer_rest_period" } })}
             >
-              1:00 Rest
+              Rest
             </button>
           </div>
           <div className="mt-2 flex flex-wrap gap-2">

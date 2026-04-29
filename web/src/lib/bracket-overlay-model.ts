@@ -22,6 +22,12 @@ function stripSeedPrefix(label: string) {
   return (m?.[1] ?? t).trim();
 }
 
+/** Aligns with `isByeName` in bracket-engine — bye / TBD roster rows are not "real" names. */
+function isRosterByeLikeName(name: string | undefined): boolean {
+  const t = (name ?? "").trim().toUpperCase();
+  return t === "" || t === "TBD" || t === "BYE";
+}
+
 /** Match row may carry TBD/empty names; roster is source of truth for the same team id. */
 function resolveOverlayTeam(team: BracketTeamRef, teamById: Map<string, BracketTeamRef>): BracketTeamRef {
   const roster = teamById.get(team.id);
@@ -30,7 +36,7 @@ function resolveOverlayTeam(team: BracketTeamRef, teamById: Map<string, BracketT
   if (!isTbdLike) return team;
   if (!roster) return team;
   const rosterName = (roster.name || "").trim();
-  if (!rosterName || rosterName.toUpperCase() === "TBD") return team;
+  if (isRosterByeLikeName(rosterName)) return team;
   return {
     id: team.id,
     name: roster.name,
@@ -38,9 +44,20 @@ function resolveOverlayTeam(team: BracketTeamRef, teamById: Map<string, BracketT
   };
 }
 
+function matchUsesByeRosterTeam(
+  m: BracketMatchJson,
+  teamById: Map<string, BracketTeamRef>,
+): boolean {
+  for (const side of [m.homeTeam, m.awayTeam]) {
+    const r = teamById.get(side.id);
+    if (r && isRosterByeLikeName(r.name)) return true;
+  }
+  return false;
+}
+
 /**
- * Broadcast overlay: never use `teamLabel(..., true)` — it blanks TBD + seedOrder 0,
- * which is exactly what projected / placeholder bracket rows use before scores exist.
+ * Broadcast overlay: `teamLabel(..., true)` blanks unassigned (TBD/empty) names; overlay
+ * then strips BYE text so walkover sides stay visually empty when appropriate.
  */
 function overlayTextFromTeamRef(team: BracketTeamRef, teamById: Map<string, BracketTeamRef>) {
   const t = resolveOverlayTeam(team, teamById);
@@ -151,6 +168,12 @@ export function buildBracketOverlaySlots(args: {
   const projection = buildBracketProjection(args.bracket, teamOptions);
   const mode: 4 | 8 = namedTeamCount(teamOptions) > 4 ? 8 : 4;
 
+  /** True once bracket rows exist in the DB (Generate has run). Keeps overlay blank before that. */
+  const hasPersistedBracket =
+    (args.bracket?.quarterFinals?.length ?? 0) > 0 ||
+    (args.bracket?.semiFinals?.length ?? 0) > 0 ||
+    args.bracket?.grandFinal != null;
+
   const slotFromTeam = (team: BracketTeamRef, matchId: string | null): BracketOverlaySlot => {
     const resolved = resolveOverlayTeam(team, teamById);
     const bg = colorForTeamId(resolved.id, teamColorById);
@@ -176,9 +199,23 @@ export function buildBracketOverlaySlots(args: {
     slotFromTeam(gfSlot.awayTeam, gfSlot.id),
   ];
 
-  /** No DB bracket yet (or all placeholders): still show 1v4 / 2v3 from seeds for small fields. */
+  /**
+   * After Generate, if labels are still empty, show 1v4 / 2v3 from seeds for small fields.
+   * Do not seed names before any bracket rows exist — users expect a blank graphic until then.
+   *
+   * BYE sides render as empty text; `fourTeamSlots.every(!text)` becomes true and this block
+   * used to overwrite BYE slots with seeded team names — incorrect. Skip whenever semi/GF
+   * already reference a bye/TBD roster row.
+   */
+  const projectionHasByeRosterSlot = [
+    ...projection.semiSlots,
+    projection.grandFinalSlot,
+  ].some((m) => matchUsesByeRosterTeam(m, teamById));
+
   const namedN = namedTeamCount(teamOptions);
   if (
+    hasPersistedBracket &&
+    !projectionHasByeRosterSlot &&
     mode === 4 &&
     namedN >= 2 &&
     namedN <= 4 &&

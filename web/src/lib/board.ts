@@ -7,6 +7,11 @@ import type {
 import { Prisma } from "@prisma/client";
 import type { BoardPayload } from "@/types/board";
 import { normalizeEventFileKey } from "@/lib/event-file-key";
+import {
+  effectiveOtRoundElapsedSeconds,
+  foldOtRoundElapsedOrphanAnchorWhenPaused,
+  isOtRoundLabelFromDropdown,
+} from "@/lib/ot-round-label";
 import { prisma } from "./prisma";
 
 /**
@@ -67,6 +72,14 @@ async function recoverLegacyLiveScoreboardSchema() {
       "sound0Enabled" INTEGER NOT NULL DEFAULT 1,
       "sound10PlayNonce" INTEGER NOT NULL DEFAULT 0,
       "sound0PlayNonce" INTEGER NOT NULL DEFAULT 0,
+      "otPlayDirection" INTEGER NOT NULL DEFAULT 1,
+      "otRoundElapsedBaseSeconds" INTEGER NOT NULL DEFAULT 0,
+      "otRoundElapsedRunStartedAt" DATETIME,
+      "showFinalWinnerHighlight" INTEGER NOT NULL DEFAULT 1,
+      "timerCuesResetNonce" INTEGER NOT NULL DEFAULT 0,
+      "otRoundTransferConsumed" INTEGER NOT NULL DEFAULT 0,
+      "otRoundTransferUndoMainSeconds" INTEGER,
+      "otRoundTransferUndoElapsedTotal" INTEGER,
       "updatedAt" DATETIME NOT NULL,
       CONSTRAINT "LiveScoreboardState_tournamentId_fkey"
         FOREIGN KEY ("tournamentId") REFERENCES "Tournament" ("id")
@@ -299,7 +312,22 @@ export function toBoardPayload(
     sound0Enabled: state.sound0Enabled,
     sound10PlayNonce: state.sound10PlayNonce,
     sound0PlayNonce: state.sound0PlayNonce,
-    timerRestMode: state.overtimeIndex < 0,
+    timerRestMode: state.overtimeIndex === -1,
+    timerOtCountUpMode: state.overtimeIndex === -2,
+    timerOtArmedMode: state.overtimeIndex === -3,
+    timerOtCountdownMode: state.overtimeIndex === -4,
+    timerOtRoundMode: isOtRoundLabelFromDropdown(state.roundLabel),
+    otRoundElapsedSeconds: isOtRoundLabelFromDropdown(state.roundLabel)
+      ? effectiveOtRoundElapsedSeconds({
+          otRoundElapsedBaseSeconds: state.otRoundElapsedBaseSeconds,
+          otRoundElapsedRunStartedAt: state.otRoundElapsedRunStartedAt,
+          timerRunning: state.timerRunning,
+        })
+      : 0,
+    showFinalWinnerHighlight: state.showFinalWinnerHighlight,
+    timerCuesResetNonce: state.timerCuesResetNonce,
+    otRoundTransferConsumed: state.otRoundTransferConsumed,
+    otPlayDirection: state.otPlayDirection,
     leftCrossedSilhouettes: crossedFromCount(state.leftEliminatedCount),
     rightCrossedSilhouettes: crossedFromCount(state.rightEliminatedCount),
     updatedAt: state.updatedAt.toISOString(),
@@ -335,7 +363,69 @@ export async function ensureLiveScoreboardState(tournamentId: string) {
 }
 
 export async function getBoardPayload(tournamentId: string): Promise<BoardPayload> {
-  const state = await ensureLiveScoreboardState(tournamentId);
+  let state = await ensureLiveScoreboardState(tournamentId);
+  if (
+    state.timerRunning &&
+    state.timerEndsAt &&
+    state.timerEndsAt.getTime() <= Date.now()
+  ) {
+    if (
+      isOtRoundLabelFromDropdown(state.roundLabel) &&
+      state.otRoundElapsedRunStartedAt
+    ) {
+      const delta = Math.floor(
+        (Date.now() - state.otRoundElapsedRunStartedAt.getTime()) / 1000,
+      );
+      await prisma.liveScoreboardState.update({
+        where: { tournamentId },
+        data: {
+          timerSeconds: 0,
+          timerRunning: false,
+          timerEndsAt: null,
+          otRoundElapsedBaseSeconds: Math.max(
+            0,
+            state.otRoundElapsedBaseSeconds + delta,
+          ),
+          otRoundElapsedRunStartedAt: null,
+        },
+      });
+    } else {
+      await prisma.liveScoreboardState.update({
+        where: { tournamentId },
+        data: {
+          timerSeconds: 0,
+          timerRunning: false,
+          timerEndsAt: null,
+        },
+      });
+    }
+    state = await prisma.liveScoreboardState.findUniqueOrThrow({
+      where: { tournamentId },
+    });
+  }
+  if (
+    !state.timerRunning &&
+    isOtRoundLabelFromDropdown(state.roundLabel) &&
+    state.otRoundElapsedRunStartedAt
+  ) {
+    const fix = {
+      roundLabel: state.roundLabel,
+      timerRunning: state.timerRunning,
+      otRoundElapsedBaseSeconds: state.otRoundElapsedBaseSeconds,
+      otRoundElapsedRunStartedAt: state.otRoundElapsedRunStartedAt,
+    };
+    foldOtRoundElapsedOrphanAnchorWhenPaused(fix);
+    await prisma.liveScoreboardState.update({
+      where: { tournamentId },
+      data: {
+        otRoundElapsedBaseSeconds: fix.otRoundElapsedBaseSeconds,
+        otRoundElapsedRunStartedAt: fix.otRoundElapsedRunStartedAt,
+      },
+    });
+    state = await prisma.liveScoreboardState.findUniqueOrThrow({
+      where: { tournamentId },
+    });
+  }
   const [leftP, rightP] = await Promise.all([
     state.leftPlayerId
       ? prisma.player.findUnique({

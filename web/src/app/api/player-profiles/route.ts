@@ -3,8 +3,13 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { ensureMasterPlayerProfileTable } from "@/lib/master-player-profile-table";
 import { migrateMastersSplitIfNeeded } from "@/lib/migrate-masters-split";
-import { resolveUseTrainingMasters } from "@/lib/masters-training-mode";
-import { drainOutbox, queueOutboxOp, syncProfiles } from "@/lib/cloud-sync";
+import {
+  debugMasterProfileWrite,
+  resolveUseTrainingMastersForProfileRequest,
+} from "@/lib/masters-training-mode";
+import { queueProfileUpsertForCloud } from "@/lib/master-profile-outbox";
+import { jsonProfilePayload } from "@/lib/player-profile-master-response";
+import { syncProfiles } from "@/lib/cloud-sync";
 
 const BELTS: readonly BeltRank[] = [
   "WHITE",
@@ -28,46 +33,27 @@ function isMissingMasterProfileTable(error: unknown): boolean {
   return table.includes("masterplayerprofile") || table.includes("trainingmasterplayerprofile");
 }
 
-/** Push a fully-shaped profile.upsert op to the cloud outbox + drain. */
-async function queueProfileUpsertOp(row: {
-  firstName: string;
-  lastName: string;
-  nickname: string | null;
-  academyName: string | null;
-  unofficialWeight: number | null;
-  heightFeet: number | null;
-  heightInches: number | null;
-  age: number | null;
-  beltRank: BeltRank;
-  profilePhotoUrl: string | null;
-  headShotUrl: string | null;
-}): Promise<void> {
-  await queueOutboxOp("profile.upsert", {
-    firstName: row.firstName,
-    lastName: row.lastName,
-    nickname: row.nickname,
-    academyName: row.academyName,
-    unofficialWeight: row.unofficialWeight,
-    heightFeet: row.heightFeet,
-    heightInches: row.heightInches,
-    age: row.age,
-    beltRank: row.beltRank,
-    profilePhotoUrl: row.profilePhotoUrl,
-    headShotUrl: row.headShotUrl,
-  }).catch(() => {});
-  await drainOutbox().catch(() => {});
-}
-
 /** Global master list (not scoped by tournament). */
 export async function GET(req: Request) {
   try {
     await migrateMastersSplitIfNeeded();
-    const training = await resolveUseTrainingMasters(req);
+    const url = new URL(req.url);
+    const teamIdHint = url.searchParams.get("teamId");
+    const tournamentIdHint = url.searchParams.get("tournamentId");
+    const umRaw = url.searchParams.get("useTrainingMasters")?.trim().toLowerCase();
+    let useTrainingHint: boolean | undefined;
+    if (umRaw === "0" || umRaw === "false") useTrainingHint = false;
+    else if (umRaw === "1" || umRaw === "true") useTrainingHint = true;
+    const training = await resolveUseTrainingMastersForProfileRequest(req, {
+      teamId: teamIdHint,
+      tournamentId: tournamentIdHint,
+      ...(useTrainingHint !== undefined ? { useTrainingMasters: useTrainingHint } : {}),
+    });
     if (training) {
       const profiles = await prisma.trainingMasterPlayerProfile.findMany({
         orderBy: [{ lastName: "asc" }, { firstName: "asc" }],
       });
-      return NextResponse.json({ profiles });
+      return jsonProfilePayload({ profiles }, true);
     }
 
     await ensureMasterPlayerProfileTable();
@@ -77,7 +63,7 @@ export async function GET(req: Request) {
     const profiles = await prisma.masterPlayerProfile.findMany({
       orderBy: [{ lastName: "asc" }, { firstName: "asc" }],
     });
-    return NextResponse.json({ profiles });
+    return jsonProfilePayload({ profiles }, false);
   } catch (e) {
     if (isMissingMasterProfileTable(e)) {
       return NextResponse.json({ profiles: [] });
@@ -94,8 +80,9 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   try {
     await migrateMastersSplitIfNeeded();
-    const training = await resolveUseTrainingMasters(req);
     const body = (await req.json()) as {
+      tournamentId?: string;
+      teamId?: string;
       firstName?: string;
       lastName?: string;
       nickname?: string | null;
@@ -107,7 +94,17 @@ export async function POST(req: Request) {
       beltRank?: string;
       profilePhotoUrl?: string | null;
       headShotUrl?: string | null;
+      useTrainingMasters?: unknown;
     };
+    const tid =
+      typeof body.tournamentId === "string" ? body.tournamentId.trim() : "";
+    const training = await resolveUseTrainingMastersForProfileRequest(req, {
+      tournamentId: tid || null,
+      teamId: typeof body.teamId === "string" ? body.teamId.trim() || null : null,
+      ...("useTrainingMasters" in body
+        ? { useTrainingMasters: body.useTrainingMasters }
+        : {}),
+    });
     const firstName = body.firstName?.trim().toUpperCase() ?? "";
     const lastName = body.lastName?.trim().toUpperCase() ?? "";
     if (!firstName || !lastName) {
@@ -163,7 +160,16 @@ export async function POST(req: Request) {
           where: { id: existing.id },
           data: merged,
         });
-        return NextResponse.json(row);
+        debugMasterProfileWrite({
+          http: "POST 200",
+          route: "/api/player-profiles",
+          table: "TrainingMasterPlayerProfile",
+          action: "update",
+          id: row.id,
+          firstName: row.firstName,
+          lastName: row.lastName,
+        });
+        return jsonProfilePayload(row, true);
       }
 
       const row = await prisma.trainingMasterPlayerProfile.create({
@@ -181,7 +187,16 @@ export async function POST(req: Request) {
           headShotUrl: body.headShotUrl?.trim() || null,
         },
       });
-      return NextResponse.json(row);
+      debugMasterProfileWrite({
+        http: "POST 200",
+        route: "/api/player-profiles",
+        table: "TrainingMasterPlayerProfile",
+        action: "create",
+        id: row.id,
+        firstName: row.firstName,
+        lastName: row.lastName,
+      });
+      return jsonProfilePayload(row, true);
     }
 
     await ensureMasterPlayerProfileTable();
@@ -230,8 +245,17 @@ export async function POST(req: Request) {
         where: { id: existing.id },
         data: merged,
       });
-      await queueProfileUpsertOp(row);
-      return NextResponse.json(row);
+      await queueProfileUpsertForCloud(row);
+      debugMasterProfileWrite({
+        http: "POST 200",
+        route: "/api/player-profiles",
+        table: "MasterPlayerProfile",
+        action: "update",
+        id: row.id,
+        firstName: row.firstName,
+        lastName: row.lastName,
+      });
+      return jsonProfilePayload(row, false);
     }
 
     const row = await prisma.masterPlayerProfile.create({
@@ -250,8 +274,17 @@ export async function POST(req: Request) {
       },
     });
 
-    await queueProfileUpsertOp(row);
-    return NextResponse.json(row);
+    await queueProfileUpsertForCloud(row);
+    debugMasterProfileWrite({
+      http: "POST 200",
+      route: "/api/player-profiles",
+      table: "MasterPlayerProfile",
+      action: "create",
+      id: row.id,
+      firstName: row.firstName,
+      lastName: row.lastName,
+    });
+    return jsonProfilePayload(row, false);
   } catch (e) {
     if (isMissingMasterProfileTable(e)) {
       return NextResponse.json({ error: "Master profiles unavailable" }, { status: 503 });

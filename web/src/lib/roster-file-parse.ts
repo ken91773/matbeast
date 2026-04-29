@@ -80,13 +80,14 @@ export function parseRosterDocument(raw: unknown): RosterFileDocument {
             ALL_BELT_OPTIONS.includes(p.beltRank as BeltRank)
               ? (p.beltRank as BeltRank)
               : defaultBelt;
+          /** Match RosterClient / on-disk `.matb`: bench / unassigned slots use `null`, not a default slot. */
           const lineup =
             typeof p.lineupOrder === "number" &&
             Number.isInteger(p.lineupOrder) &&
             p.lineupOrder >= 1 &&
             p.lineupOrder <= 7
               ? p.lineupOrder
-              : 1;
+              : null;
           return {
             firstName: typeof p.firstName === "string" ? p.firstName : "",
             lastName: typeof p.lastName === "string" ? p.lastName : "",

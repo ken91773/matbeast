@@ -3,6 +3,8 @@ import type { BeltRank, Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { profileUpper } from "@/lib/profile-text";
 import { insertPlayerIntoTeamLineup, normalizeTeamLineup } from "@/lib/team-lineup";
+import { resolveUseTrainingMastersForProfileRequest } from "@/lib/masters-training-mode";
+import { upsertGlobalMasterPlayerFromRosterPlayer } from "@/lib/sync-roster-player-master-profile";
 
 const ALL_BELTS: BeltRank[] = ["WHITE", "BLUE", "PURPLE", "BROWN", "BLACK"];
 
@@ -138,6 +140,38 @@ export async function PATCH(req: Request, { params }: Params) {
         include: { team: true },
       });
     });
+    if (player) {
+      const tid =
+        typeof b.tournamentId === "string" ? b.tournamentId.trim() : "";
+      const useTrainingMasters = await resolveUseTrainingMastersForProfileRequest(
+        req,
+        {
+          tournamentId: tid || null,
+          teamId: player.teamId,
+          ...("useTrainingMasters" in b
+            ? { useTrainingMasters: b.useTrainingMasters }
+            : {}),
+        },
+      );
+      await upsertGlobalMasterPlayerFromRosterPlayer(
+        {
+          firstName: player.firstName,
+          lastName: player.lastName,
+          nickname: player.nickname,
+          academyName: player.academyName,
+          unofficialWeight: player.unofficialWeight,
+          heightFeet: player.heightFeet,
+          heightInches: player.heightInches,
+          age: player.age,
+          beltRank: player.beltRank,
+          profilePhotoUrl: player.profilePhotoUrl,
+          headShotUrl: player.headShotUrl,
+        },
+        useTrainingMasters,
+      ).catch(() => {
+        /* master / cloud optional */
+      });
+    }
     return NextResponse.json(player);
   } catch (e) {
     console.error("[PATCH /api/players]", id, e);

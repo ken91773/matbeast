@@ -389,12 +389,13 @@ export default function CloudSettingsModal({
         {/* LINK / RELINK */}
         <div style={sectionTitle}>Desktop token</div>
         <p style={{ fontSize: 13, lineHeight: 1.6 }}>
-          Generate a token at{" "}
+          Sign in at{" "}
           <code style={{ opacity: 0.85 }}>
             {(cfg?.cloudBaseUrl ?? "https://matbeast-masters.vercel.app").replace(/\/+$/, "")}
             /desktop-tokens
-          </code>
-          , then paste it below and click <strong>Save token</strong>.
+          </code>{" "}
+          (your account only lists tokens you created), generate a token, then paste it below and
+          click <strong>Save token</strong>.
         </p>
         <input
           type="password"

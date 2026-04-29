@@ -5,6 +5,7 @@ import {
   buildEnvelopeTextForActiveTab,
   matbeastImportOpenedEventFile,
   matbeastSaveTabById,
+  tryFocusExistingTabForCloudEvent,
 } from "@/lib/matbeast-dashboard-file-actions";
 import { matbeastKeys } from "@/lib/matbeast-query-keys";
 import { useQueryClient } from "@tanstack/react-query";
@@ -13,6 +14,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 type CloudEventMeta = {
   id: string;
   name: string;
+  /**
+   * Human-readable event title stored alongside the filename. Null for
+   * rows created before v0.8.4. v0.9.36 uses this as the authoritative
+   * display title when opening from cloud, healing the legacy bug
+   * where the cloud blob's envelope had the FILENAME mistakenly
+   * written into its `eventName` field.
+   */
+  eventName: string | null;
   ownerUserId: string;
   currentVersion: number;
   currentBlobSha: string | null;
@@ -101,6 +110,18 @@ export default function CloudEventDialogs() {
 
   const handleCloudOpen = useCallback(
     async (cloudEventId: string) => {
+      const focused = await tryFocusExistingTabForCloudEvent({
+        cloudEventId,
+        openTabs,
+        selectTab,
+        setShowHome,
+      });
+      if (focused) {
+        void queryClient.invalidateQueries({ queryKey: matbeastKeys.all });
+        close();
+        return;
+      }
+
       // Pull blob.
       const r = await fetch("/api/cloud/events/pull", {
         method: "POST",
@@ -127,6 +148,15 @@ export default function CloudEventDialogs() {
         openTabs,
         selectTab,
         setShowHome,
+        cloudEventId: meta.id,
+        /**
+         * v0.9.36: prefer the cloud catalog's display title over the
+         * envelope's `eventName` when both are present. Heals events
+         * whose blob was uploaded by an older build with the
+         * filename mistakenly written into the envelope. See
+         * `matbeastImportOpenedEventFile` JSDoc.
+         */
+        displayNameOverride: meta.eventName ?? null,
       });
 
       // matbeastImportOpenedEventFile creates a tournament + opens a tab.
@@ -680,7 +710,7 @@ function NotConfiguredNotice({
   const reason = !status
     ? "Cloud settings could not be read."
     : !status.tokenSet
-      ? "No desktop token is saved on this install. Paste one from the Mat Beast Masters admin page."
+      ? "No desktop token is saved on this install. Sign in at Mat Beast Masters → Desktop tokens and paste a token you generated there."
       : !status.syncEnabled
         ? "Cloud sync is paused. Re-enable it in Cloud Sync settings."
         : "Cloud is not configured.";

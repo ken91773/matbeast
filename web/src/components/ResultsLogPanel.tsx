@@ -84,9 +84,10 @@ export function ResultsLogPanel() {
   const queryClient = useQueryClient();
   const { data: board } = useQuery({
     queryKey: matbeastKeys.board(tournamentId),
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const res = await matbeastFetch("/api/board", {
         cache: "no-store",
+        signal,
         headers: { [MATBEAST_TOURNAMENT_HEADER]: tournamentId! },
       });
       if (!res.ok) {

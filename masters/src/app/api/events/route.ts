@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { requireUserId } from "@/lib/auth";
+import { trainingModeFromMatbBytes } from "@/lib/matb-envelope-meta";
 
 export const dynamic = "force-dynamic";
 
@@ -11,8 +13,12 @@ export const dynamic = "force-dynamic";
  * With our 5-user/shared-workspace model, every signed-in user sees
  * every event; tighten later if we add per-event ACLs.
  *
- * Only metadata is returned here — never blobs. The desktop then
- * calls GET /api/events/:id/blob on demand.
+ * `trainingMode` in each row prefers the latest stored `.matb` blob
+ * (authoritative) over the metadata column so catalog badges stay
+ * correct even if the column lagged behind pushes.
+ *
+ * Only metadata is returned here — never full blob bodies in JSON.
+ * The desktop calls GET /api/events/:id/blob on demand for downloads.
  */
 export async function GET() {
   const a = await requireUserId();
@@ -36,7 +42,32 @@ export async function GET() {
       updatedByUserId: true,
     },
   });
-  return NextResponse.json({ events });
+
+  const eventIds = events.map((e) => e.id);
+  const trainingFromLatestBlob = new Map<string, boolean>();
+  if (eventIds.length > 0) {
+    const rows = await prisma.$queryRaw<Array<{ eventId: string; blob: Buffer }>>(
+      Prisma.sql`
+        SELECT DISTINCT ON ("eventId") "eventId", blob
+        FROM "CloudEventBlob"
+        WHERE "eventId" IN (${Prisma.join(eventIds)})
+        ORDER BY "eventId", version DESC
+      `,
+    );
+    for (const r of rows) {
+      const fromFile = trainingModeFromMatbBytes(Buffer.from(r.blob));
+      if (fromFile !== undefined) {
+        trainingFromLatestBlob.set(r.eventId, fromFile);
+      }
+    }
+  }
+
+  const merged = events.map((e) => ({
+    ...e,
+    trainingMode: trainingFromLatestBlob.get(e.id) ?? e.trainingMode,
+  }));
+
+  return NextResponse.json({ events: merged });
 }
 
 /**

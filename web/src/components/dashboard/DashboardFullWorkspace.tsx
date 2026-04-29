@@ -8,6 +8,7 @@ import BracketPanel from "@/components/BracketPanel";
 import ControlPanel from "@/components/ControlPanel";
 import { RosterClient } from "@/app/roster/RosterClient";
 import { DashboardTeamsPanel } from "@/components/dashboard/DashboardTeamsPanel";
+import { NdiStatusPill } from "@/components/dashboard/NdiStatusPill";
 import { useEventWorkspace } from "@/components/EventWorkspaceProvider";
 import { normalizeEventFileKey } from "@/lib/event-file-key";
 import { formatControlCardFinalHeader } from "@/lib/control-final-header";
@@ -19,6 +20,7 @@ import { matbeastKeys } from "@/lib/matbeast-query-keys";
 import { matbeastJson } from "@/lib/matbeast-query";
 import { postScoreboardMode } from "@/lib/overlay-output-broadcast";
 import type { BoardPayload } from "@/types/board";
+import type { BracketMusicState } from "@/lib/bracket-music-state";
 import { ResultsLogPanel } from "@/components/ResultsLogPanel";
 import { useQuery } from "@tanstack/react-query";
 
@@ -86,9 +88,10 @@ function ControlCardHeaderActions({ tournamentId }: { tournamentId: string }) {
   const { ready } = useEventWorkspace();
   const { data: board } = useQuery({
     queryKey: matbeastKeys.board(tournamentId),
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const res = await matbeastFetch("/api/board", {
         cache: "no-store",
+        signal,
         headers: { [MATBEAST_TOURNAMENT_HEADER]: tournamentId },
       });
       if (!res.ok) {
@@ -372,6 +375,135 @@ function OverlayStrip() {
   const [previewScale, setPreviewScale] = useState(0.4);
   const [previewScene, setPreviewScene] = useState<"scoreboard" | "bracket">("scoreboard");
   const [previewSceneSwitching, setPreviewSceneSwitching] = useState(false);
+  /**
+   * Bracket overlay music state — synced from main via IPC. The UI always
+   * renders the control row when the preview is on the bracket scene; until
+   * the first IPC payload arrives we fall back to this in-memory default so
+   * the operator can still see (and click) the controls. A previous version
+   * gated the entire row behind `musicState !== null`, which silently hid
+   * the controls forever if the IPC handshake didn't resolve (e.g. an older
+   * installed build on the operator's machine without the music handlers).
+   */
+  const FALLBACK_MUSIC_STATE: BracketMusicState = useMemo(
+    () => ({
+      filePath: null,
+      fileName: null,
+      revision: 0,
+      playing: true,
+      monitor: false,
+    }),
+    [],
+  );
+  const [musicState, setMusicState] = useState<BracketMusicState | null>(null);
+  const effectiveMusicState = musicState ?? FALLBACK_MUSIC_STATE;
+  /**
+   * Diagnostic for the bracket-music IPC chain. Surfaces in the header next
+   * to the controls so operators can immediately see why a click did
+   * nothing instead of guessing. Populated by Browse / None / Play / Monitor
+   * click handlers and the initial state-load effect.
+   */
+  const [musicDiag, setMusicDiag] = useState<string | null>(null);
+  /** Inline disclosure for the CHOOSE MUSIC button (Browse… / NONE). */
+  const [chooseMusicOpen, setChooseMusicOpen] = useState(false);
+  const chooseMusicWrapRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const desk = window.matBeastDesktop as
+      | (Record<string, unknown> & { getRuntimeInfo?: () => Promise<{ version?: string }> })
+      | undefined;
+    /**
+     * `__matBeastPreloadStatus` is a sentinel exposed by the preload BEFORE
+     * the main bridge — it tells us whether the preload script even ran and
+     * which step (if any) failed. Read it here so the diagnostic can
+     * distinguish "preload didn't run at all" (security policy / wrong
+     * webPreferences / wrong install path) from "preload ran but
+     * exposeInMainWorld failed" from "everything's fine but the dashboard
+     * is loading from a context without our preload" (iframes etc).
+     */
+    type PreloadStatus = {
+      ran?: boolean;
+      hasContextBridge?: boolean;
+      hasIpcRenderer?: boolean;
+      preloadError?: string | null;
+      preloadVersion?: string;
+    };
+    const status = (window as Window & {
+      __matBeastPreloadStatus?: PreloadStatus;
+    }).__matBeastPreloadStatus;
+    if (!desk) {
+      if (!status) {
+        setMusicDiag(
+          "Preload sentinel ABSENT — preload script did not run in this renderer. Likely a stale install path or a webPreferences-without-preload window.",
+        );
+      } else {
+        setMusicDiag(
+          `Preload ran (${status.preloadVersion ?? "unknown-version"}) but matBeastDesktop is missing. preloadError=${status.preloadError ?? "none"} hasContextBridge=${String(status.hasContextBridge)} hasIpcRenderer=${String(status.hasIpcRenderer)}`,
+        );
+      }
+      return;
+    }
+    /**
+     * Dump every key actually exposed on the bridge so the diagnostic
+     * shows the running app's true bridge surface, not what the
+     * type declarations claim. This is how we tell whether we're
+     * looking at a stale preload (e.g. wrong installed copy
+     * launched via an old shortcut) vs. a code-path issue.
+     */
+    const keys = Object.keys(desk).sort();
+    const hasChoose = typeof desk.chooseBracketMusicFile === "function";
+    /** Read the running app version asynchronously so the diagnostic includes it. */
+    const versionPromise =
+      typeof desk.getRuntimeInfo === "function"
+        ? desk.getRuntimeInfo().then((info) => info?.version ?? "unknown").catch(() => "n/a")
+        : Promise.resolve("no-getRuntimeInfo");
+    void versionPromise.then((version) => {
+      if (!hasChoose) {
+        setMusicDiag(
+          `bridge keys (v${version}): ${keys.join(", ") || "(empty)"}`,
+        );
+      }
+    });
+    let cancelled = false;
+    const getState = desk.getBracketMusicState as
+      | (() => Promise<BracketMusicState>)
+      | undefined;
+    if (typeof getState === "function") {
+      void getState()
+        .then((state) => {
+          if (!cancelled && state) setMusicState(state);
+        })
+        .catch((err: unknown) => {
+          setMusicDiag(`getBracketMusicState rejected: ${String((err as Error)?.message || err)}`);
+        });
+    }
+    let off: (() => void) | undefined;
+    const onChange = desk.onBracketMusicStateChange as
+      | ((cb: (state: BracketMusicState) => void) => () => void)
+      | undefined;
+    if (typeof onChange === "function") {
+      off = onChange((state) => {
+        setMusicState(state);
+      });
+    }
+    return () => {
+      cancelled = true;
+      off?.();
+    };
+  }, []);
+
+  /** Close the CHOOSE MUSIC popover when the operator clicks outside it. */
+  useEffect(() => {
+    if (!chooseMusicOpen) return;
+    const onDocPointerDown = (e: MouseEvent) => {
+      const root = chooseMusicWrapRef.current;
+      if (!root) return;
+      if (root.contains(e.target as Node)) return;
+      setChooseMusicOpen(false);
+    };
+    document.addEventListener("mousedown", onDocPointerDown);
+    return () => document.removeEventListener("mousedown", onDocPointerDown);
+  }, [chooseMusicOpen]);
   /**
    * Iframe-based preview (re-adopted 2026-04-17). Replaced the 0.5.1
    * capture-based mirror so the preview can reflect scene / scoreboard-mode
@@ -688,13 +820,177 @@ function OverlayStrip() {
             ) : null}
           </>
         ) : null}
+        {/**
+          Bracket-scene controls: looping music paired with the bracket
+          overlay window for NDI capture. Always renders when the preview
+          is on the bracket scene. If the desktop IPC API isn't available
+          (browser dev build, or operator on an older installed build)
+          everything stays disabled and a small hint badge explains why,
+          rather than the entire row silently disappearing.
+         */}
+        {previewScene === "bracket" ? (
+          <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[10px]">
+            <button
+              type="button"
+              disabled={!effectiveMusicState.filePath}
+              onClick={() => {
+                const next = !effectiveMusicState.playing;
+                void window.matBeastDesktop?.setBracketMusicPlaying?.(next);
+              }}
+              className={
+                effectiveMusicState.filePath && effectiveMusicState.playing
+                  ? "rounded border border-teal-500/70 bg-teal-900/40 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-teal-200 hover:bg-teal-800/50"
+                  : "rounded border border-zinc-600/60 bg-zinc-800/40 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-300 hover:bg-zinc-700/50 disabled:cursor-not-allowed disabled:opacity-50"
+              }
+              title={
+                effectiveMusicState.filePath
+                  ? effectiveMusicState.playing
+                    ? "Stop the looping music on the bracket overlay window."
+                    : "Resume looping the chosen music on the bracket overlay window."
+                  : "Choose a music file first via CHOOSE MUSIC."
+              }
+            >
+              {effectiveMusicState.playing ? "STOP MUSIC" : "PLAY MUSIC"}
+            </button>
+            <div ref={chooseMusicWrapRef} className="relative">
+              <button
+                type="button"
+                onClick={() => setChooseMusicOpen((v) => !v)}
+                className="rounded border border-zinc-600/60 bg-zinc-800/40 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-300 hover:bg-zinc-700/50"
+                title="Pick a host audio file for the bracket overlay loop, or set NONE."
+              >
+                CHOOSE MUSIC: {effectiveMusicState.fileName ?? "NONE"}
+              </button>
+              {chooseMusicOpen ? (
+                <div className="absolute left-0 top-full z-30 mt-1 flex min-w-[8rem] flex-col gap-0.5 rounded-md border border-zinc-700/80 bg-[#181818] p-1 shadow-lg">
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setChooseMusicOpen(false);
+                      const fn = window.matBeastDesktop?.useBracketMusicDefault;
+                      if (typeof fn !== "function") {
+                        setMusicDiag("useBracketMusicDefault is not a function on the bridge");
+                        return;
+                      }
+                      try {
+                        const result = await fn();
+                        if (!result) {
+                          setMusicDiag("IPC returned no result");
+                        } else if (result.ok) {
+                          setMusicDiag(null);
+                        } else {
+                          setMusicDiag(`IPC error: ${result.error ?? "unknown"}`);
+                        }
+                      } catch (err) {
+                        setMusicDiag(`IPC threw: ${String((err as Error)?.message || err)}`);
+                      }
+                    }}
+                    className="rounded px-2 py-1 text-left text-[10px] font-semibold uppercase tracking-wide text-teal-200 hover:bg-zinc-800"
+                  >
+                    Default
+                  </button>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setChooseMusicOpen(false);
+                      setMusicDiag("Browse clicked — invoking IPC...");
+                      const fn = window.matBeastDesktop?.chooseBracketMusicFile;
+                      if (typeof fn !== "function") {
+                        setMusicDiag("chooseBracketMusicFile is not a function on the bridge");
+                        return;
+                      }
+                      try {
+                        const result = await fn();
+                        if (!result) {
+                          setMusicDiag("IPC returned no result");
+                        } else if (result.ok) {
+                          setMusicDiag(null);
+                        } else if (result.canceled) {
+                          setMusicDiag(null);
+                        } else {
+                          setMusicDiag(`IPC error: ${result.error ?? "unknown"}`);
+                        }
+                      } catch (err) {
+                        setMusicDiag(`IPC threw: ${String((err as Error)?.message || err)}`);
+                      }
+                    }}
+                    className="rounded px-2 py-1 text-left text-[10px] font-semibold uppercase tracking-wide text-zinc-200 hover:bg-zinc-800"
+                  >
+                    Browse...
+                  </button>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setChooseMusicOpen(false);
+                      const fn = window.matBeastDesktop?.clearBracketMusicFile;
+                      if (typeof fn !== "function") {
+                        setMusicDiag("clearBracketMusicFile is not a function on the bridge");
+                        return;
+                      }
+                      try {
+                        await fn();
+                        setMusicDiag(null);
+                      } catch (err) {
+                        setMusicDiag(`IPC threw: ${String((err as Error)?.message || err)}`);
+                      }
+                    }}
+                    className="rounded px-2 py-1 text-left text-[10px] font-semibold uppercase tracking-wide text-zinc-300 hover:bg-zinc-800"
+                  >
+                    None
+                  </button>
+                </div>
+              ) : null}
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                const next = !effectiveMusicState.monitor;
+                void window.matBeastDesktop?.setBracketMusicMonitor?.(next);
+              }}
+              className={
+                effectiveMusicState.monitor
+                  ? "rounded border border-teal-500/70 bg-teal-900/40 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-teal-200 hover:bg-teal-800/50"
+                  : "rounded border border-zinc-600/60 bg-zinc-800/40 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-300 hover:bg-zinc-700/50"
+              }
+              title={
+                effectiveMusicState.monitor
+                  ? "Stop hearing the bracket music locally. The audio still flows to the bracket NDI / capture target."
+                  : "Hear the bracket music on this PC for sound-check. Does not change what the bracket NDI source / capture target receives."
+              }
+            >
+              MONITOR {effectiveMusicState.monitor ? "ON" : "OFF"}
+            </button>
+            {musicDiag ? (
+              <span
+                className="text-[10px] italic text-amber-400/90"
+                title="Bracket music IPC diagnostic — click a control to refresh."
+              >
+                {musicDiag}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
+        {/**
+         * NDI status pill — v0.9.33+. Pushed right with `ml-auto` so it
+         * sits in the trailing cluster alongside the preview-scale
+         * slider regardless of how many scoreboard / bracket controls
+         * are currently rendered to the left. The pill is the
+         * authoritative on-screen indicator of which NIC NDI is bound
+         * to (Wi-Fi / Ethernet / APIPA / virtual / not bound) so the
+         * operator never has to interpret dotted-quad IPs. Click =
+         * adapter picker; selecting an entry persists the choice and
+         * prompts the operator to restart the app.
+         */}
+        <div className="ml-auto flex shrink-0 items-center">
+          <NdiStatusPill />
+        </div>
         {/* Preview-scale slider shrunk to ~half its previous footprint so
             the header has more breathing room for the SHOW TEAMS / APPLY
             / hint cluster. `min-w` guarantees the track is still wide
             enough to drag at low zoom; `basis` + `max-w` cap total width
             so this control never pushes the scoreboard cluster off the
             visible header on narrow window widths. */}
-        <label className="ml-auto flex min-w-[min(100%,6rem)] flex-1 basis-[5rem] items-center gap-2 sm:max-w-[10rem]">
+        <label className="flex min-w-[min(100%,6rem)] flex-1 basis-[5rem] items-center gap-2 sm:max-w-[10rem]">
           <span className="shrink-0 text-[10px] text-zinc-500">Preview scale</span>
           <input
             type="range"
@@ -779,8 +1075,9 @@ export function DashboardFullWorkspace() {
   const { tournamentId, ready } = useEventWorkspace();
   const { data: board, isPending: boardPending } = useQuery({
     queryKey: matbeastKeys.board(tournamentId),
-    queryFn: () =>
+    queryFn: ({ signal }) =>
       matbeastJson<BoardPayload>("/api/board", {
+        signal,
         headers: { [MATBEAST_TOURNAMENT_HEADER]: tournamentId! },
       }),
     enabled: ready && !!tournamentId,

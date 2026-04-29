@@ -4,7 +4,6 @@ import { useCallback, useEffect, useState } from "react";
 
 type TokenRow = {
   id: string;
-  userId: string;
   label: string;
   tokenPreview: string;
   createdAt: string;
@@ -16,7 +15,6 @@ type TokenRow = {
 type MintResponse = {
   token: {
     id: string;
-    userId: string;
     label: string;
     tokenPreview: string;
     createdAt: string;
@@ -49,11 +47,7 @@ function fmtDate(iso: string | null): string {
   return d.toLocaleString();
 }
 
-export default function DesktopTokensClient({
-  currentUserId,
-}: {
-  currentUserId: string;
-}) {
+export default function DesktopTokensClient() {
   const [tokens, setTokens] = useState<TokenRow[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [label, setLabel] = useState("");
@@ -258,7 +252,7 @@ export default function DesktopTokensClient({
       </section>
 
       <section style={cardStyle}>
-        <h2 style={{ marginTop: 0, fontSize: 20 }}>All tokens</h2>
+        <h2 style={{ marginTop: 0, fontSize: 20 }}>Your tokens</h2>
         {loadError && (
           <p style={{ color: "#fca5a5", fontSize: 14 }}>
             Failed to load: {loadError}
@@ -285,7 +279,6 @@ export default function DesktopTokensClient({
                   }}
                 >
                   <th style={{ padding: "8px 6px" }}>Label</th>
-                  <th style={{ padding: "8px 6px" }}>Owner</th>
                   <th style={{ padding: "8px 6px" }}>Preview</th>
                   <th style={{ padding: "8px 6px" }}>Created</th>
                   <th style={{ padding: "8px 6px" }}>Last used</th>
@@ -295,7 +288,6 @@ export default function DesktopTokensClient({
               </thead>
               <tbody>
                 {(tokens ?? []).map((t) => {
-                  const isMine = t.userId === currentUserId;
                   const isRevoked = t.revokedAt !== null;
                   return (
                     <tr
@@ -307,13 +299,6 @@ export default function DesktopTokensClient({
                     >
                       <td style={{ padding: "10px 6px" }}>
                         <strong>{t.label}</strong>
-                      </td>
-                      <td style={{ padding: "10px 6px", fontSize: 12 }}>
-                        {isMine ? (
-                          <span style={{ color: "#86efac" }}>you</span>
-                        ) : (
-                          <span style={{ opacity: 0.7 }}>{t.userId}</span>
-                        )}
                       </td>
                       <td
                         style={{

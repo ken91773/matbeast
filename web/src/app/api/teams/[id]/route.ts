@@ -8,7 +8,10 @@ import { ensureMasterTeamNameTable } from "@/lib/master-team-name-table";
 import {
   forbiddenUserChosenTeamNameMessage,
   isForbiddenCustomTeamName,
+  isForbiddenUserChosenTeamName,
 } from "@/lib/reserved-team-names";
+import { drainOutbox, queueOutboxOp } from "@/lib/cloud-sync";
+import { resolveUseTrainingMastersForProfileRequest } from "@/lib/masters-training-mode";
 
 type Params = { params: Promise<{ id: string }> };
 
@@ -33,6 +36,9 @@ export async function PATCH(req: Request, { params }: Params) {
     overlayColor?: string | null;
     /** When clearing a slot (name → TBD), remove this team’s prior name from the global master list instead of keeping it. */
     removeFromMasterTeamNames?: boolean;
+    /** Same resolver as master-team-names / player profiles (tab + client header override DB). */
+    useTrainingMasters?: unknown;
+    tournamentId?: string;
   };
 
   try {
@@ -43,7 +49,13 @@ export async function PATCH(req: Request, { params }: Params) {
     if (!existing) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
-    const trainingMasters = existing.event.tournament.trainingMode;
+    const trainingMasters = await resolveUseTrainingMastersForProfileRequest(req, {
+      tournamentId:
+        typeof body.tournamentId === "string" && body.tournamentId.trim()
+          ? body.tournamentId.trim()
+          : existing.event.tournament.id,
+      useTrainingMasters: body.useTrainingMasters,
+    });
 
     if (
       body.seedOrder !== undefined &&
@@ -160,9 +172,56 @@ export async function PATCH(req: Request, { params }: Params) {
   }
 }
 
-export async function DELETE(_req: Request, { params }: Params) {
+export async function DELETE(req: Request, { params }: Params) {
   const { id } = await params;
   try {
+    const existing = await prisma.team.findUnique({
+      where: { id },
+      include: { event: { include: { tournament: true } } },
+    });
+    if (!existing) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
+
+    let body: { useTrainingMasters?: unknown; tournamentId?: string } = {};
+    try {
+      body = (await req.json()) as typeof body;
+    } catch {
+      body = {};
+    }
+    const trainingMasters = await resolveUseTrainingMastersForProfileRequest(req, {
+      tournamentId:
+        typeof body.tournamentId === "string" && body.tournamentId.trim()
+          ? body.tournamentId.trim()
+          : existing.event.tournament.id,
+      useTrainingMasters: body.useTrainingMasters,
+    });
+    const rawName = existing.name.trim();
+    const nameUpper = rawName.toUpperCase();
+    if (
+      nameUpper &&
+      nameUpper !== "TBD" &&
+      !isForbiddenUserChosenTeamName(rawName)
+    ) {
+      if (trainingMasters) {
+        await prisma.trainingMasterTeamName.deleteMany({
+          where: { name: nameUpper },
+        });
+      } else {
+        await ensureMasterTeamNameTable();
+        const row = await prisma.masterTeamName.findUnique({
+          where: { name: nameUpper },
+          select: { cloudId: true },
+        });
+        await prisma.masterTeamName.deleteMany({ where: { name: nameUpper } });
+        await queueOutboxOp("team-name.delete", {
+          name: nameUpper,
+          cloudId: row?.cloudId ?? null,
+        }).catch(() => {});
+        await drainOutbox().catch(() => {});
+      }
+    }
+
     await prisma.team.delete({ where: { id } });
     return NextResponse.json({ ok: true });
   } catch {

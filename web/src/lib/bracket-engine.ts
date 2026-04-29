@@ -125,6 +125,45 @@ function isByeName(name: string) {
   return t === "" || t === "TBD" || t === "BYE";
 }
 
+/** Non-bye side wins immediately when the opponent is a bye/TBD placeholder. */
+async function byeWalkoverWinnerId(
+  tx: Prisma.TransactionClient,
+  homeTeamId: string,
+  awayTeamId: string,
+): Promise<string | null> {
+  const teams = await tx.team.findMany({
+    where: { id: { in: [homeTeamId, awayTeamId] } },
+    select: { id: true, name: true },
+  });
+  const home = teams.find((t) => t.id === homeTeamId);
+  const away = teams.find((t) => t.id === awayTeamId);
+  if (!home || !away) return null;
+  const hBye = isByeName(home.name);
+  const aBye = isByeName(away.name);
+  if (hBye && !aBye) return away.id;
+  if (aBye && !hBye) return home.id;
+  return null;
+}
+
+/** Fill `winnerTeamId` for matches where one side is a bye and no winner yet. */
+async function applyByeWalkoversToRound(
+  tx: Prisma.TransactionClient,
+  eventId: string,
+  round: "QUARTER_FINAL" | "SEMI_FINAL" | "GRAND_FINAL",
+) {
+  const matches = await tx.bracketMatch.findMany({ where: { eventId, round } });
+  for (const m of matches) {
+    if (m.winnerTeamId) continue;
+    const win = await byeWalkoverWinnerId(tx, m.homeTeamId, m.awayTeamId);
+    if (win) {
+      await tx.bracketMatch.update({
+        where: { id: m.id },
+        data: { winnerTeamId: win },
+      });
+    }
+  }
+}
+
 const matchInclude = {
   homeTeam: true,
   awayTeam: true,
@@ -205,6 +244,7 @@ export async function generateBracketFromSeeds(tournamentId: string) {
           },
         });
       }
+      await syncDownstreamRounds(tx, eventId);
       return;
     }
     for (let i = 0; i < 4; i++) {
@@ -228,13 +268,14 @@ export async function generateBracketFromSeeds(tournamentId: string) {
         },
       });
     }
+    await applyByeWalkoversToRound(tx, eventId, "QUARTER_FINAL");
     await syncDownstreamRounds(tx, eventId);
   });
 
   return loadBracketForTournament(tournamentId);
 }
 
-async function syncDownstreamRounds(
+export async function syncDownstreamRounds(
   tx: Prisma.TransactionClient,
   eventId: string,
 ) {
@@ -269,6 +310,7 @@ async function syncDownstreamRounds(
     }
     const home = w[i]!;
     const away = w[j]!;
+    const byeWinner = await byeWalkoverWinnerId(tx, home, away);
     const existing = await tx.bracketMatch.findFirst({
       where: { eventId, round: "SEMI_FINAL", bracketIndex },
     });
@@ -280,6 +322,7 @@ async function syncDownstreamRounds(
           bracketIndex,
           homeTeamId: home,
           awayTeamId: away,
+          winnerTeamId: byeWinner,
         },
       });
     } else if (existing.homeTeamId !== home || existing.awayTeamId !== away) {
@@ -288,8 +331,13 @@ async function syncDownstreamRounds(
         data: {
           homeTeamId: home,
           awayTeamId: away,
-          winnerTeamId: null,
+          winnerTeamId: byeWinner,
         },
+      });
+    } else if (byeWinner && !existing.winnerTeamId) {
+      await tx.bracketMatch.update({
+        where: { id: existing.id },
+        data: { winnerTeamId: byeWinner },
       });
     }
   }
@@ -298,6 +346,7 @@ async function syncDownstreamRounds(
     await ensureSemi(0, 0, 1);
     await ensureSemi(1, 2, 3);
   }
+  await applyByeWalkoversToRound(tx, eventId, "SEMI_FINAL");
 
   const sf = await tx.bracketMatch.findMany({
     where: { eventId, round: "SEMI_FINAL" },
@@ -311,6 +360,7 @@ async function syncDownstreamRounds(
   }
   const gHome = sf[0].winnerTeamId;
   const gAway = sf[1].winnerTeamId;
+  const gByeWinner = await byeWalkoverWinnerId(tx, gHome, gAway);
   const gf = await tx.bracketMatch.findFirst({
     where: { eventId, round: "GRAND_FINAL", bracketIndex: 0 },
   });
@@ -322,6 +372,7 @@ async function syncDownstreamRounds(
         bracketIndex: 0,
         homeTeamId: gHome,
         awayTeamId: gAway,
+        winnerTeamId: gByeWinner,
       },
     });
   } else if (gf.homeTeamId !== gHome || gf.awayTeamId !== gAway) {
@@ -330,10 +381,16 @@ async function syncDownstreamRounds(
       data: {
         homeTeamId: gHome,
         awayTeamId: gAway,
-        winnerTeamId: null,
+        winnerTeamId: gByeWinner,
       },
     });
+  } else if (gByeWinner && !gf.winnerTeamId) {
+    await tx.bracketMatch.update({
+      where: { id: gf.id },
+      data: { winnerTeamId: gByeWinner },
+    });
   }
+  await applyByeWalkoversToRound(tx, eventId, "GRAND_FINAL");
 }
 
 export async function setBracketMatchWinner(

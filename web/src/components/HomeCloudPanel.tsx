@@ -1,7 +1,10 @@
 "use client";
 
 import { useEventWorkspace } from "@/components/EventWorkspaceProvider";
-import { matbeastImportOpenedEventFile } from "@/lib/matbeast-dashboard-file-actions";
+import {
+  matbeastImportOpenedEventFile,
+  tryFocusExistingTabForCloudEvent,
+} from "@/lib/matbeast-dashboard-file-actions";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -153,6 +156,14 @@ export default function HomeCloudPanel() {
     async (meta: CloudEventMeta) => {
       setBusyId(meta.id);
       try {
+        const focused = await tryFocusExistingTabForCloudEvent({
+          cloudEventId: meta.id,
+          openTabs,
+          selectTab,
+          setShowHome,
+        });
+        if (focused) return;
+
         const r = await fetch("/api/cloud/events/pull", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -174,6 +185,19 @@ export default function HomeCloudPanel() {
           openTabs,
           selectTab,
           setShowHome,
+          cloudEventId: meta.id,
+          /**
+           * v0.9.36: heal the "event name occasionally becomes the
+           * filename" bug for events whose cloud blob was written by
+           * an older build. The catalog row's `eventName` column is
+           * patched on every rename (see /api/cloud/events/rename)
+           * and is set from `prisma.tournament.name` on every upload,
+           * so it is always at least as fresh as the in-blob
+           * `eventName` and never carries the legacy filename
+           * fallback. Empty / null catalog rows (older cloud rows)
+           * fall through to the parser's normal logic.
+           */
+          displayNameOverride: meta.eventName ?? null,
         });
         // Bind link via second pull with tournamentId.
         await new Promise<void>((res) => requestAnimationFrame(() => res()));
@@ -401,7 +425,7 @@ export default function HomeCloudPanel() {
             <p className="m-0 font-semibold">Cloud not configured</p>
             <p className="m-0 mt-1 text-amber-100/80">
               {!cfg.tokenSet
-                ? "No desktop token saved on this install. Paste one from the Mat Beast Masters admin page to see your cloud event list here."
+                ? "No desktop token saved on this install. Sign in at Mat Beast Masters → Desktop tokens, generate a token, and paste it here to see your cloud event list."
                 : !cfg.syncEnabled
                   ? "Cloud sync is paused. Re-enable it to see your cloud event list here."
                   : "Cloud is unavailable."}

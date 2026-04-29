@@ -33,6 +33,43 @@ export const EVENT_FILE_EXTENSION = ".matb" as const;
 const EVENT_FILENAME_EXT_RE = /\.(json|mat|matb)$/i;
 
 export type EventTab = { id: string; name: string };
+
+/**
+ * If this cloud catalog id is already linked to a tournament that is open in
+ * a tab, focus that tab and return true. No alerts — used before pull/import.
+ */
+export async function tryFocusExistingTabForCloudEvent(opts: {
+  cloudEventId: string;
+  openTabs: Array<{ id: string }>;
+  selectTab: (id: string) => void;
+  setShowHome?: (show: boolean) => void;
+}): Promise<boolean> {
+  const { cloudEventId, openTabs, selectTab, setShowHome } = opts;
+  const trimmed = cloudEventId.trim();
+  if (!trimmed || openTabs.length === 0) return false;
+  try {
+    const r = await fetch(
+      `/api/cloud/events/linked-local?cloudEventId=${encodeURIComponent(trimmed)}`,
+      { cache: "no-store" },
+    );
+    if (!r.ok) return false;
+    const j = (await r.json()) as { tournamentId?: string | null };
+    const tid = j.tournamentId?.trim();
+    if (!tid || !openTabs.some((t) => t.id === tid)) return false;
+    selectTab(tid);
+    setShowHome?.(false);
+    matbeastDebugLog(
+      "file:import",
+      "reuse open tab (cloud link)",
+      tid,
+      trimmed,
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 type SaveStatusKind = "start" | "success" | "error";
 type BracketApiForExport = {
   quarterFinals: Array<{
@@ -859,7 +896,33 @@ type CreateCloudUntitledResult =
 async function createCloudUntitledForNewTab(
   tournamentId: string,
   preferredName?: string,
-  opts?: { trainingMode?: boolean },
+  opts?: {
+    trainingMode?: boolean;
+    /**
+     * Display title (tab label) for the freshly-created tournament.
+     *
+     * v0.9.36 bug fix: this used to be omitted, and the cloud blob's
+     * envelope was built with `cloudName` (the FILENAME, e.g.
+     * `0428-1`) standing in for the display title — so
+     * `wrapMatBeastEventFile` wrote the FILENAME into the envelope's
+     * `eventName` field. On a later close + reopen-from-cloud, the
+     * parser saw `eventName: "0428-1"` and created a new local
+     * tournament whose display name was the filename instead of
+     * whatever the user typed in the New Event dialog. Symptom: the
+     * event name "occasionally" mutates into the filename across
+     * app restarts, but only for events that were never autosaved
+     * after creation (any subsequent autosave rebuilds the envelope
+     * using `tabMeta?.name` and silently heals the cloud blob).
+     *
+     * Optional so older callers that don't have a display title
+     * handy fall back to the filename — same as the old behaviour,
+     * which is still wrong for those callers but was wrong before
+     * v0.9.36 too. There are currently no such callers; the only
+     * caller is `matbeastCreateNewEventTab`, and it always knows
+     * the title.
+     */
+    displayName?: string;
+  },
 ): Promise<CreateCloudUntitledResult> {
   try {
     const cfgRes = await fetch("/api/cloud/config", { cache: "no-store" });
@@ -901,7 +964,16 @@ async function createCloudUntitledForNewTab(
       );
     }
 
-    const envelope = await buildEnvelopeTextForActiveTab(cloudName);
+    /**
+     * Use the display title for the envelope's `eventName` field, NOT
+     * the cloud filename. When the caller doesn't pass a display title
+     * we fall back to the filename to preserve the legacy shape — but
+     * the only caller is `matbeastCreateNewEventTab`, which always
+     * passes one (the same string the New Event dialog typed into the
+     * `name` column of the SQLite tournament row).
+     */
+    const envelopeDisplayName = opts?.displayName?.trim() || cloudName;
+    const envelope = await buildEnvelopeTextForActiveTab(envelopeDisplayName);
     const upRes = await fetch("/api/cloud/events/upload", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1081,7 +1153,19 @@ export async function matbeastCreateNewEventTab(opts: {
   const cloudResult = await createCloudUntitledForNewTab(
     j.id,
     requestedFilename?.trim() || undefined,
-    { trainingMode: Boolean(j.trainingMode ?? requestedTrainingMode) },
+    {
+      trainingMode: Boolean(j.trainingMode ?? requestedTrainingMode),
+      /**
+       * Pass the just-created tournament's display title so the cloud
+       * blob's envelope gets the correct `eventName`. `j.name` comes
+       * straight from `prisma.tournament.create({ data: { name: ... }})`
+       * via the `/api/tournaments` POST response and is the same
+       * string the user typed into the dialog (or "Untitled event"
+       * when blank). Falling back to `requestedName` covers the
+       * theoretical case where the API response omitted `name`.
+       */
+      displayName: (j.name ?? requestedName).trim() || requestedName,
+    },
   );
   if (cloudResult.status === "ok") {
     matbeastDebugLog(
@@ -1146,9 +1230,9 @@ export async function matbeastImportOpenedEventFile(opts: {
   openEventInTab: (id: string, name: string, trainingMode?: boolean) => void;
   refreshTournaments: () => Promise<void>;
   /**
-   * When set (e.g. opening from cloud catalog), overrides `trainingMode`
-   * parsed from the file so metadata matches events saved before the
-   * envelope included `trainingMode`.
+   * When the envelope has no boolean `trainingMode`, catalog metadata can
+   * supply the flag (e.g. opening from cloud home for older files). When the
+   * file includes `trainingMode: true|false`, the envelope always wins.
    */
   trainingModeOverride?: boolean;
   /**
@@ -1158,6 +1242,27 @@ export async function matbeastImportOpenedEventFile(opts: {
   openTabs?: EventTab[];
   selectTab?: (id: string) => void;
   setShowHome?: (show: boolean) => void;
+  /**
+   * When set (cloud home / open-from-cloud), focuses the tab already linked
+   * to this catalog id via CloudEventLink — works across reloads; no duplicate
+   * tournament or link conflict.
+   */
+  cloudEventId?: string;
+  /**
+   * v0.9.36 defensive override for the envelope's `eventName`. When the
+   * caller has access to a more authoritative display title than what
+   * is in the envelope itself — e.g. the cloud catalog row's
+   * `eventName` column when opening from cloud — pass it here. Used
+   * to heal events whose blob was uploaded with the v0.9.35 (and
+   * earlier) bug where `createCloudUntitledForNewTab` wrote the
+   * cloud filename into `eventName`. The catalog's `eventName` is
+   * patched on every rename in `cloud/events/rename`, so it stays
+   * correct even when the blob lags behind.
+   *
+   * Empty / null values are ignored — the parser's normal eventName
+   * resolution still runs, including its filename-stem fallback.
+   */
+  displayNameOverride?: string | null;
 }) {
   const {
     filePath,
@@ -1169,7 +1274,19 @@ export async function matbeastImportOpenedEventFile(opts: {
     openTabs,
     selectTab,
     setShowHome,
+    cloudEventId,
+    displayNameOverride,
   } = opts;
+
+  if (cloudEventId?.trim() && openTabs?.length && selectTab) {
+    const focused = await tryFocusExistingTabForCloudEvent({
+      cloudEventId: cloudEventId.trim(),
+      openTabs,
+      selectTab,
+      setShowHome,
+    });
+    if (focused) return;
+  }
 
   const existingTid = findTournamentIdForFilePath(filePath);
   if (existingTid && openTabs?.some((t) => t.id === existingTid)) {
@@ -1188,15 +1305,44 @@ export async function matbeastImportOpenedEventFile(opts: {
   }
   const fallbackName =
     filePath.split(/[/\\]/).pop()?.replace(EVENT_FILENAME_EXT_RE, "") ?? "Imported event";
+  const parsedRecord = parsed as Record<string, unknown> | null;
+  const rootTraining = parsedRecord?.trainingMode;
+  const envelopeHasTrainingModeBoolean =
+    parsedRecord?.kind === "matbeast-event" && typeof rootTraining === "boolean";
   const {
-    eventName,
+    eventName: parsedEventName,
     document,
     bracket,
     audioVolumePercent,
     trainingMode: fileTrainingMode,
   } = parseMatBeastEventFileJson(parsed, fallbackName);
-  const effectiveTrainingMode =
-    trainingModeOverride !== undefined ? trainingModeOverride : fileTrainingMode;
+  /**
+   * v0.9.36 defensive: when the caller passes `displayNameOverride`
+   * (e.g. cloud-catalog `eventName` from `HomeCloudPanel.openCloudEvent`)
+   * and it is non-empty, prefer it over whatever the envelope's parser
+   * resolved. This heals events whose cloud blob was uploaded by an
+   * older build with the filename mistakenly written into the
+   * envelope's `eventName` field — the catalog row's `eventName` is
+   * always rewritten on rename and on the upload route's
+   * `prisma.tournament.findUnique` lookup, so it is the more
+   * authoritative source for cloud-origin imports. For disk imports
+   * the caller does not pass this field, so behaviour is unchanged.
+   */
+  const overrideTrim =
+    typeof displayNameOverride === "string" ? displayNameOverride.trim() : "";
+  const eventName = overrideTrim ? overrideTrim : parsedEventName;
+  /**
+   * Prefer the envelope's `trainingMode` whenever it is a boolean so the
+   * opened tournament matches the file bytes (fixes stale cloud catalog
+   * rows on other installs). Fall back to `trainingModeOverride` (cloud
+   * home list) only when the key is absent — legacy saves before the field
+   * existed.
+   */
+  const effectiveTrainingMode = envelopeHasTrainingModeBoolean
+    ? (rootTraining as boolean)
+    : trainingModeOverride !== undefined
+      ? trainingModeOverride
+      : Boolean(fileTrainingMode);
   const res = await fetch("/api/tournaments", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

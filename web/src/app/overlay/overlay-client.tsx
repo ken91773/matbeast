@@ -21,6 +21,15 @@ import {
 } from "@/lib/matbeast-fetch";
 import type { BoardPayload } from "@/types/board";
 import {
+  SCOREBOARD_OT_MAIN_HEX,
+  SCOREBOARD_OT_SUBLINE_HEX,
+} from "@/lib/scoreboard-ot-colors";
+import {
+  scoreboardOtRedTimerStyle,
+  scoreboardSubclockRoundLabelFromBoard,
+  scoreboardTimerLineFromBoard,
+} from "@/lib/scoreboard-timer-display";
+import {
   CENTER_OT_STRIP,
   CENTER_TIMER,
   LEFT_SILHOUETTE_ICONS,
@@ -41,11 +50,13 @@ import {
 } from "@/lib/bracket-display";
 import { buildBracketOverlaySlots } from "@/lib/bracket-overlay-model";
 import { OverlayCanvasTextLayer } from "@/app/overlay/overlay-canvas-text-layer";
+import { useBracketOverlayMusic } from "@/app/overlay/use-bracket-overlay-music";
+import { useTimerAlertSounds } from "@/hooks/useTimerAlertSounds";
 import { matbeastKeys } from "@/lib/matbeast-query-keys";
 import { matbeastJson } from "@/lib/matbeast-query";
 import { useQuery } from "@tanstack/react-query";
 import { createPortal } from "react-dom";
-import { useEffect, useMemo, useState } from "react";
+import { type CSSProperties, useEffect, useMemo, useState } from "react";
 
 const W = 1920;
 const H = 1080;
@@ -83,17 +94,23 @@ const TEAM_LIST_STARTER_COUNT = 5;
 /** Output window chrome: transparent so OBS sees alpha (matches Electron `transparent: true`). */
 const OVERLAY_OUTPUT_CHROME_BG = "transparent";
 
-function fmt(sec: number) {
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
+/**
+ * Visible inset frame on Electron output windows (`/overlay?outputScene=…` without `preview=1`).
+ * Native title bar alone is easy to miss on transparent clients; this stays inside the capture area.
+ */
+const OVERLAY_OUTPUT_FRAME_STYLE: CSSProperties = {
+  boxShadow:
+    "inset 0 0 0 2px rgba(45, 212, 191, 0.95), inset 0 0 0 5px rgba(0, 0, 0, 0.45)",
+};
 
 function overlayFullName(p: BoardPayload["left"] | BoardPayload["right"] | null | undefined) {
   if (!p) return "";
+  /** `displayName` from the board API is already "first last" for roster picks; do not prefer `lastName` alone. */
+  const dn = (p.displayName ?? "").trim();
+  if (dn) return dn.toUpperCase();
   const ln = (p.lastName ?? "").trim();
   if (ln) return ln.toUpperCase();
-  return (p.displayName ?? "").trim().toUpperCase();
+  return "";
 }
 
 function SilhouetteCrosses({
@@ -155,6 +172,18 @@ export default function OverlayClient() {
   const searchParams = useMemo(() => new URLSearchParams(urlSearch), [urlSearch]);
   const forcedTournamentIdFromQuery = searchParams.get("tournamentId")?.trim() || "";
   const isPreview = searchParams.get("preview") === "1";
+  /**
+   * NDI offscreen render flag. Set by `electron/ndi-smoke.js` (v0.9.21) and
+   * future `electron/ndi-sender.js` (v0.9.22+) when loading the overlay
+   * inside an offscreen `BrowserWindow` for broadcast capture. We piggyback
+   * on the existing `outputScene` lock so scene routing stays identical to
+   * the visible operator-monitor windows; `isNdi` only changes
+   * presentation-layer concerns the broadcast viewer should not see (the
+   * operator-confidence inset frame) and routes audio through the dedicated
+   * NDI graph instead of the visible bracket window's audio engine
+   * (introduced in v0.9.23).
+   */
+  const isNdi = searchParams.get("ndi") === "1";
   const previewSceneParam = searchParams.get("previewScene");
   const forcePreviewLive = searchParams.get("forcePreviewLive") === "1";
   const disableBarnDoor = searchParams.get("disableBarnDoor") === "1";
@@ -165,6 +194,34 @@ export default function OverlayClient() {
     if (o === "bracket" || o === "scoreboard") return o;
     return null;
   }, [isPreview, searchParams]);
+
+  /**
+   * Bracket overlay window: drive the looping music engine. Gated to the
+   * actual bracket output `BrowserWindow` only — preview iframes and the
+   * scoreboard overlay never instantiate the engine, so the operator's PC
+   * never doubles cues with the bracket music.
+   *
+   * NDI offscreen render: v0.9.21 disables music in the offscreen renderer
+   * because the visible bracket window still owns the audio graph. v0.9.23
+   * will move the music graph into the offscreen renderer and add an
+   * AudioWorklet PCM tap that ships float32 samples to `grandiose.audio()`.
+   */
+  /**
+   * Bracket music engine.
+   *   - Visible bracket overlay window (not preview, not NDI): runs the
+   *     standard engine so the operator can MONITOR the music via their
+   *     selected audio device.
+   *   - Offscreen NDI bracket renderer (`isNdi`): runs the engine in
+   *     PCM-tap mode so the music's audio graph is captured at full
+   *     amplitude and forwarded to grandiose's `sender.audio()`.
+   *     Local sink is forced silent so the operator doesn't hear two
+   *     copies (visible window + offscreen window).
+   *   - Preview iframe: no music engine. The dashboard preview is
+   *     visual-only — operator monitors via the actual bracket window.
+   */
+  useBracketOverlayMusic(!isPreview && lockedOutputScene === "bracket", {
+    tapPcmForNdi: isNdi,
+  });
 
   const fallbackTournamentId =
     (typeof window !== "undefined" ? getMatBeastTournamentId()?.trim() : "") || "";
@@ -199,6 +256,34 @@ export default function OverlayClient() {
     window.addEventListener("matbeast-overlay-tournament-id", onTournamentId);
     return () => window.removeEventListener("matbeast-overlay-tournament-id", onTournamentId);
   }, []);
+
+  /**
+   * Electron creates overlay BrowserWindows at app startup before the dashboard
+   * has set `matbeast-active-tournament-id` or dispatched IPC — the injected
+   * `matbeast-overlay-tournament-id` event can fire before this listener mounts.
+   * Sync from localStorage on mount and when another window updates the key so
+   * bracket/scoreboard output fetches the same tournament as the dashboard preview
+   * (which always has `?tournamentId=` in the iframe URL).
+   */
+  useEffect(() => {
+    if (isPreview) return;
+    const STORAGE_KEY = "matbeast-active-tournament-id";
+    const syncFromStorage = () => {
+      const tid = getMatBeastTournamentId()?.trim() || "";
+      setRuntimeTournamentId((prev) => {
+        if (tid) return tid;
+        return prev;
+      });
+    };
+    syncFromStorage();
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== STORAGE_KEY) return;
+      const next = (e.newValue ?? "").trim();
+      setRuntimeTournamentId(next || null);
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [isPreview]);
 
   /**
    * Output window bootstraps tabs from localStorage async; use server list
@@ -245,20 +330,80 @@ export default function OverlayClient() {
    */
   const { data: board } = useQuery({
     queryKey: matbeastKeys.board(overlayTournamentId),
-    queryFn: () =>
+    queryFn: ({ signal }) =>
       matbeastJson<BoardPayload>("/api/board", {
+        signal,
         headers: overlayTournamentId
           ? { [MATBEAST_TOURNAMENT_HEADER]: overlayTournamentId }
           : undefined,
       }),
-    /** Output windows can mount before workspace tab hydration; still poll board immediately. */
-    enabled: true,
+    /** Avoid resolving the wrong tournament before `overlayTournamentId` is synced (startup race). */
+    enabled: !!overlayTournamentId,
     staleTime: 0,
     gcTime: 0,
     refetchInterval: 1000,
     refetchOnMount: "always",
     refetchOnWindowFocus: true,
   });
+
+  /**
+   * Same reset-key shape as the dashboard's `ControlPanel` mount of
+   * `useTimerAlertSounds` (see ControlPanel.tsx). The two mounts run
+   * independent edge detectors; sharing the key shape ensures both
+   * fire on identical board transitions.
+   *
+   * Excludes `board.updatedAt` and `timerRunning` for the same reason
+   * as ControlPanel: those toggle every poll/pause and would clear
+   * `prevSecondsRef` mid-crossing, swallowing the 10s/0 cues.
+   */
+  const ndiTimerAudioResetKey = useMemo(() => {
+    if (!board) return overlayTournamentId ?? undefined;
+    return [
+      overlayTournamentId ?? "",
+      `oi:${board.overtimeIndex}`,
+      `ph:${board.timerPhase}`,
+      `r:${board.timerRestMode ? 1 : 0}`,
+      `u:${board.timerOtCountUpMode ? 1 : 0}`,
+      `a:${board.timerOtArmedMode ? 1 : 0}`,
+      `d:${board.timerOtCountdownMode ? 1 : 0}`,
+      `dir:${board.otPlayDirection}`,
+      `otr:${board.timerOtRoundMode ? 1 : 0}`,
+      `cue:${board.timerCuesResetNonce ?? 0}`,
+    ].join("|");
+  }, [
+    overlayTournamentId,
+    board,
+  ]);
+
+  /**
+   * NDI scoreboard audio cues (v0.9.35).
+   *
+   * Mounts the timer-alert hook in NDI tap mode for the offscreen
+   * scoreboard `BrowserWindow` only. The dashboard's ControlPanel
+   * already mounts the standard (audible) variant for the operator,
+   * and the visible scoreboard output window is intentionally silent
+   * — the operator monitors via the dashboard, and the NDI receiver
+   * monitors via this offscreen renderer.
+   *
+   *   isPreview      → no cues (dashboard preview iframe is visual only)
+   *   visible scoreboard window (no NDI, no preview)
+   *                  → no cues (dashboard already plays them audibly)
+   *   offscreen NDI scoreboard renderer (`isNdi`)
+   *                  → cues fire silently and stream PCM via NDI
+   *   bracket scenes → no cues (timer cues belong to scoreboard scene)
+   */
+  useTimerAlertSounds(
+    board?.secondsRemaining,
+    ndiTimerAudioResetKey,
+    board?.sound10Enabled,
+    board?.sound0Enabled,
+    board?.timerRestMode,
+    board?.sound10PlayNonce,
+    board?.sound0PlayNonce,
+    !isPreview && isNdi && lockedOutputScene === "scoreboard",
+    board?.timerOtCountdownMode ?? false,
+    { tapPcmForNdi: true, ndiScene: "scoreboard" },
+  );
 
   const [stableBracketTitlesById, setStableBracketTitlesById] = useState<
     Record<string, string>
@@ -835,10 +980,8 @@ export default function OverlayClient() {
     };
   }, [isPreview, activeScene]);
 
-  const scoreboardTimerLine = board ? fmt(board.secondsRemaining) : "—:—";
-  const scoreboardRoundLine = board?.timerRestMode
-    ? "REST PERIOD"
-    : (board?.roundLabel ?? "");
+  const scoreboardTimerLine = scoreboardTimerLineFromBoard(board ?? undefined);
+  const scoreboardRoundLine = scoreboardSubclockRoundLabelFromBoard(board ?? undefined);
   /**
    * Scoreboard DOM text: previously gated on `currentRosterFileName !== "UNTITLED"`
    * as a first-launch convenience. That gate was too aggressive — it also
@@ -863,6 +1006,13 @@ export default function OverlayClient() {
         alignItems: "center",
         justifyContent: "center",
         backgroundColor: isPreview ? "#52525b" : OVERLAY_OUTPUT_CHROME_BG,
+        /**
+         * Inset teal frame is operator-confidence-only — broadcast viewers
+         * via NDI must never see it. `isNdi` suppresses it on the offscreen
+         * renderer; the visible scoreboard / bracket windows keep it so the
+         * operator can verify capture extents at a glance.
+         */
+        ...(isPreview || isNdi ? {} : OVERLAY_OUTPUT_FRAME_STYLE),
       }}
     >
       <div
@@ -1047,26 +1197,42 @@ export default function OverlayClient() {
             >
               <span
                 className={`shrink-0 px-1 text-center font-black leading-none tabular-nums drop-shadow-[0_4px_12px_rgba(0,0,0,0.9)] ${
-                  board?.timerRestMode ? "text-amber-300" : ""
+                  board?.timerRestMode
+                    ? "text-amber-300"
+                    : scoreboardOtRedTimerStyle(board ?? undefined)
+                      ? "text-red-800"
+                      : ""
                 }`}
                 style={{
                   /** Fixed px sizing on 1920 stage keeps preview/output identical. */
                   fontSize: "141px",
                   lineHeight: 1,
-                  color: board?.timerRestMode ? "#fcd34d" : "#e5e7eb",
+                  color: board?.timerRestMode
+                    ? "#fcd34d"
+                    : scoreboardOtRedTimerStyle(board ?? undefined)
+                      ? SCOREBOARD_OT_MAIN_HEX
+                      : "#e5e7eb",
                 }}
               >
                 {scoreboardTimerLine}
               </span>
               <span
                 className={`w-full min-w-0 max-w-full text-center font-semibold uppercase leading-none drop-shadow-[0_2px_8px_black] ${
-                  board?.timerRestMode ? "text-amber-300" : "text-zinc-200"
+                  board?.timerRestMode
+                    ? "text-amber-300"
+                    : scoreboardOtRedTimerStyle(board ?? undefined)
+                      ? "text-red-800"
+                      : "text-zinc-200"
                 }`}
                 style={{
                   fontSize: "42px",
                   lineHeight: 1,
                   marginTop: "-0.18em",
-                  color: board?.timerRestMode ? "#fcd34d" : "#d9d9d9",
+                  color: board?.timerRestMode
+                    ? "#fcd34d"
+                    : scoreboardOtRedTimerStyle(board ?? undefined)
+                      ? SCOREBOARD_OT_SUBLINE_HEX
+                      : "#d9d9d9",
                 }}
               >
                 {scoreboardRoundLine}
@@ -1109,7 +1275,9 @@ export default function OverlayClient() {
             >
               <div
                 className={`max-w-full truncate font-bold leading-none drop-shadow-[0_2px_8px_black] ${
-                  board?.finalSaved && finalWinnerIsLeft(board.finalResultType)
+                  board?.finalSaved &&
+                    (board.showFinalWinnerHighlight ?? true) &&
+                    finalWinnerIsLeft(board.finalResultType)
                     ? "text-emerald-400"
                     : "text-zinc-200"
                 }`}
@@ -1118,7 +1286,9 @@ export default function OverlayClient() {
                   letterSpacing: "0.05em",
                   transform: "translateY(4px)",
                   color:
-                    board?.finalSaved && finalWinnerIsLeft(board.finalResultType)
+                    board?.finalSaved &&
+                    (board.showFinalWinnerHighlight ?? true) &&
+                    finalWinnerIsLeft(board.finalResultType)
                       ? "#34d399"
                       : "#d9d9d9",
                 }}
@@ -1166,7 +1336,9 @@ export default function OverlayClient() {
             >
               <div
                 className={`max-w-full truncate font-bold leading-none drop-shadow-[0_2px_8px_black] ${
-                  board?.finalSaved && finalWinnerIsRight(board.finalResultType)
+                  board?.finalSaved &&
+                    (board.showFinalWinnerHighlight ?? true) &&
+                    finalWinnerIsRight(board.finalResultType)
                     ? "text-emerald-400"
                     : "text-zinc-200"
                 }`}
@@ -1175,7 +1347,9 @@ export default function OverlayClient() {
                   letterSpacing: "0.05em",
                   transform: "translateY(4px)",
                   color:
-                    board?.finalSaved && finalWinnerIsRight(board.finalResultType)
+                    board?.finalSaved &&
+                    (board.showFinalWinnerHighlight ?? true) &&
+                    finalWinnerIsRight(board.finalResultType)
                       ? "#34d399"
                       : "#d9d9d9",
                 }}

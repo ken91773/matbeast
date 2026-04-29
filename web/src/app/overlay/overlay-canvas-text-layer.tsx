@@ -1,6 +1,10 @@
 "use client";
 
 import {
+  SCOREBOARD_OT_MAIN_HEX,
+  SCOREBOARD_OT_SUBLINE_HEX,
+} from "@/lib/scoreboard-ot-colors";
+import {
   CENTER_OT_STRIP,
   CENTER_TIMER,
   LEFT_PLAYER_STRIP,
@@ -12,6 +16,11 @@ import {
 } from "@/lib/scoreboard-layout";
 import type { BracketOverlaySlot } from "@/lib/bracket-overlay-model";
 import type { BoardPayload } from "@/types/board";
+import {
+  scoreboardOtRedTimerStyle,
+  scoreboardSubclockRoundLabelFromBoard,
+  scoreboardTimerLineFromBoard,
+} from "@/lib/scoreboard-timer-display";
 import { finalWinnerIsLeft, finalWinnerIsRight } from "@/lib/board-final-display";
 import { useEffect, useRef } from "react";
 
@@ -200,19 +209,28 @@ export function OverlayCanvasTextLayer({
         /** Scoreboard */
         const timerR = vbToPx(CENTER_TIMER);
         const rest = Boolean(board?.timerRestMode);
-        const timerColor = rest ? "#fcd34d" : "#e5e7eb";
-        const roundColor = rest ? "#fcd34d" : "#d9d9d9";
+        const otRed = scoreboardOtRedTimerStyle(board ?? undefined);
+        const timerColor = rest ? "#fcd34d" : otRed ? SCOREBOARD_OT_MAIN_HEX : "#e5e7eb";
+        const roundColor = rest ? "#fcd34d" : otRed ? SCOREBOARD_OT_SUBLINE_HEX : "#d9d9d9";
+        const line =
+          timerLine.trim().length > 0
+            ? timerLine
+            : scoreboardTimerLineFromBoard(board ?? undefined);
 
     ctx.save();
     ctx.font = `bold 132px ${OVERLAY_FONT_STACK}`;
     ctx.fillStyle = timerColor;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(timerLine, timerR.x + timerR.w / 2, timerR.y + timerR.h * 0.42, timerR.w - 16);
+    ctx.fillText(line, timerR.x + timerR.w / 2, timerR.y + timerR.h * 0.42, timerR.w - 16);
 
     ctx.font = `600 38px ${OVERLAY_FONT_STACK}`;
     ctx.fillStyle = roundColor;
-    ctx.fillText(roundLine, timerR.x + timerR.w / 2, timerR.y + timerR.h * 0.78, timerR.w - 16);
+    const roundText =
+      roundLine.trim().length > 0
+        ? roundLine
+        : scoreboardSubclockRoundLabelFromBoard(board ?? undefined);
+    ctx.fillText(roundText, timerR.x + timerR.w / 2, timerR.y + timerR.h * 0.78, timerR.w - 16);
     ctx.restore();
 
     if (board && board.timerPhase === "OVERTIME") {
@@ -227,14 +245,17 @@ export function OverlayCanvasTextLayer({
 
     const stripPlayerName = (side: "left" | "right") => {
       const p = side === "left" ? board?.left : board?.right;
-      const raw = (p?.lastName?.trim() ? p.lastName : p?.displayName ?? "").trim();
+      const dn = (p?.displayName ?? "").trim();
+      const raw = (dn || (p?.lastName ?? "").trim()).trim();
       return raw.toUpperCase() || "—";
     };
 
     const leftPlayer = vbToPx(LEFT_PLAYER_STRIP);
     const leftName = stripPlayerName("left");
     const leftWin =
-      board?.finalSaved && finalWinnerIsLeft(board.finalResultType ?? null);
+      board?.finalSaved &&
+      (board.showFinalWinnerHighlight ?? true) &&
+      finalWinnerIsLeft(board.finalResultType ?? null);
     drawCellText(ctx, leftName, leftPlayer, {
       align: "right",
       font: `bold 57.6px ${OVERLAY_FONT_STACK}`,
@@ -255,7 +276,9 @@ export function OverlayCanvasTextLayer({
     const rightPlayer = vbToPx(RIGHT_PLAYER_STRIP);
     const rightName = stripPlayerName("right");
     const rightWin =
-      board?.finalSaved && finalWinnerIsRight(board.finalResultType ?? null);
+      board?.finalSaved &&
+      (board.showFinalWinnerHighlight ?? true) &&
+      finalWinnerIsRight(board.finalResultType ?? null);
     drawCellText(ctx, rightName, rightPlayer, {
       align: "left",
       font: `bold 57.6px ${OVERLAY_FONT_STACK}`,

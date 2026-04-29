@@ -9,9 +9,8 @@ type Ctx = { params: Promise<{ id: string }> };
 /**
  * DELETE /api/desktop-tokens/:id
  *
- * Soft-revokes a token. We keep the row (with `revokedAt` set) instead
- * of deleting so that the admin UI can show "revoked by X on Y" history.
- * The auth middleware rejects any token whose row has `revokedAt != null`.
+ * Soft-revokes a token owned by the signed-in user. Other users' tokens
+ * return 404 so ids are not enumerable across accounts.
  */
 export async function DELETE(_req: NextRequest, ctx: Ctx) {
   const a = await requireUserId();
@@ -20,9 +19,20 @@ export async function DELETE(_req: NextRequest, ctx: Ctx) {
   const { id } = await ctx.params;
   if (!id) return NextResponse.json({ error: "id required" }, { status: 400 });
 
+  const existing = await prisma.desktopToken.findFirst({
+    where: { id, userId: a.userId },
+    select: { id: true, revokedAt: true },
+  });
+  if (!existing) {
+    return NextResponse.json({ error: "not found" }, { status: 404 });
+  }
+  if (existing.revokedAt !== null) {
+    return NextResponse.json({ error: "already revoked" }, { status: 400 });
+  }
+
   try {
     const row = await prisma.desktopToken.update({
-      where: { id },
+      where: { id: existing.id },
       data: {
         revokedAt: new Date(),
         revokedByUserId: a.userId,
@@ -37,9 +47,6 @@ export async function DELETE(_req: NextRequest, ctx: Ctx) {
     return NextResponse.json({ token: row });
   } catch (e) {
     const msg = e instanceof Error ? e.message : "unknown";
-    if (msg.includes("Record to update not found")) {
-      return NextResponse.json({ error: "not found" }, { status: 404 });
-    }
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }

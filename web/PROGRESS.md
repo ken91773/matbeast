@@ -1,8 +1,832 @@
 # Progress Log
 
 ## Current Build Status
-- Desktop app rebuilt successfully multiple times.
+- Desktop app rebuilt successfully multiple times. v0.9.13 → v0.9.19
+  in a single session diagnosed and shipped a hardened preload-bridge
+  pipeline along with the new bracket-music feature; full breakdown
+  under **2026-04-28 Session Updates**. v0.9.21 (2026-04-29) lays the
+  first NDI scaffolding — offscreen-render smoke test, no NDI library
+  yet; v0.9.22 fixes a v0.9.21-shipped exclusivity-lock race that made
+  every smoke-test invocation immediately return "already running".
+  v0.9.29 (2026-04-29) lights up the actual NDI sender — `grandiose`
+  (Streampunk's NewTek NDI® N-API binding, master @ `c350e0fb`) is
+  bundled with the installer, the offscreen scoreboard `BrowserWindow`
+  is wired into a real `NDIlib_send` instance named "Mat Beast
+  Scoreboard", and the Options ▸ NDI submenu has a Start / Stop
+  toggle. NDI Studio Monitor / OBS / vMix on the same network see
+  the source within ~3 s of the toggle. v0.9.30 (2026-04-29)
+  diagnoses + fixes the "source visible but no video" bug
+  v0.9.29 shipped on the operator's 150 %-DPI laptop, adds the
+  bracket NDI source alongside the scoreboard, and introduces a
+  receiver-format-stability warmup so receivers don't latch onto a
+  partially-hydrated React tree. Receiving NDI clients now show the
+  actual scoreboard within ~1 s of subscription.
 - Latest installer artifact:
+  - `dist/Mat Beast Scoreboard Setup 1.0.0.exe` (2026-04-29 — First
+    stable release. v1.0.0 is a milestone marker, not a feature
+    release: it captures the cumulative state of the desktop app
+    after the long v0.9.x stabilisation cycle (v0.9.12 → v0.9.36)
+    and is the first build the operator is comfortable shipping for
+    real tournament use. No code changes from v0.9.36 — the version
+    bump exists so the GitHub release surface, the installer
+    filename, and the auto-update channel all start fresh at a
+    semver major. Headline features that are now first-class in
+    this build, in case anyone reads this entry as their first
+    introduction: end-to-end NDI video output for both the
+    scoreboard and bracket scenes (1920×1080 @ 30 fps, BGRA with
+    alpha for the scoreboard, opaque for the bracket); end-to-end
+    NDI audio for both scenes (planar Float32 @ 48 kHz captured
+    via AudioWorklet in the offscreen renderer, fed to grandiose's
+    `sender.audio()` after a postinstall patch enabled it);
+    operator-friendly NDI network adapter binding via a private
+    `ndi-config.v1.json` and an `Options ▸ NDI ▸ Network adapter`
+    submenu, with a status pill on the Overlay-card header that
+    shows whether NDI is currently advertising on Wi-Fi / Ethernet
+    / a routable adapter at all; cloud-first event lifecycle with
+    automatic catalog rows on create + best-effort silent autosave
+    on every edit; cross-PC display-title healing that recovers
+    events whose cloud blob was uploaded with the v0.9.35-and-
+    earlier bug that wrote the FILENAME into the envelope's
+    `eventName` field. v1.0.0 also locks in the 10s-warning + air
+    horn cues over NDI for the scoreboard (v0.9.35) and the bracket
+    music looping over NDI (v0.9.34), so receiving PCs hear
+    everything the operator hears. Known limitations carried into
+    v1.0.0: NDI runtime currently re-reads its config only on
+    process start (rebinding requires an app relaunch — the menu
+    surfaces this with a native restart-now / restart-later
+    dialog); cloud catalog rows from before v0.8.4 may have a null
+    `eventName` column, so the v0.9.36 healing code falls back to
+    the parser's filename-stem behaviour for those (the cure is a
+    one-time rename through the dialog, which patches both
+    columns). File trail: `package.json`, `PROGRESS.md` only — no
+    other files changed between v0.9.36 and v1.0.0.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.36.exe` (2026-04-29 —
+    Event-name-becomes-filename bug fix. Operator report: "My event
+    files have an event name but the app is occasionally changing
+    the event name to the filename. I believe it is doing this upon
+    closing the app and reopening it again." Tracked it down to the
+    cloud-first new-event flow in
+    `src/lib/matbeast-dashboard-file-actions.ts`. When the New Event
+    dialog submitted, `matbeastCreateNewEventTab` immediately
+    uploaded the freshly-created tournament's envelope to the cloud
+    via `createCloudUntitledForNewTab` so the cloud catalog and the
+    local SQLite row stayed paired from the very first save. That
+    helper had `const cloudName = preferredName ?? pickNextDated…`
+    holding the cloud FILENAME (e.g. `0428-1`), then called
+    `buildEnvelopeTextForActiveTab(cloudName)` to produce the JSON
+    that gets uploaded. `buildEnvelopeTextForActiveTab(tabName)`
+    expects a DISPLAY title — it forwards `tabName` straight into
+    `wrapMatBeastEventFile(eventName, …)`, which writes it as the
+    envelope's `eventName` field. Net effect: the cloud blob's
+    envelope had `eventName: "0428-1"` (the filename) instead of
+    `eventName: "Spring Quintet 2026"` (whatever the user typed in
+    the dialog). The cloud catalog ROW got the right `eventName`
+    (the upload route reads `prisma.tournament.name` for that
+    column), and the local SQLite tournament row also kept the
+    correct name, so the tab label and homepage catalog all looked
+    fine — the bug was invisible until close + reopen-from-cloud.
+    On reopen, `matbeastImportOpenedEventFile` parsed the cloud
+    blob, found `eventName: "0428-1"` in the envelope, and POSTed
+    `/api/tournaments` with `name: "0428-1"`, creating a new local
+    tournament whose display name was the filename. The bug was
+    "occasional" because any subsequent autosave (literally one
+    edit) ran `matbeastSaveTabById`, which builds the envelope
+    using `tabMeta?.name` (the correct display title) and pushes a
+    healed blob to the cloud — so events the operator touched
+    before closing self-healed silently, while events created and
+    closed without an edit kept the broken blob and surfaced the
+    rename on next reopen. Fix is two-pronged. (1) Primary fix:
+    `createCloudUntitledForNewTab` gains a `displayName` option;
+    `matbeastCreateNewEventTab` passes `(j.name ?? requestedName)`
+    (the tournament's display title from the
+    `/api/tournaments` POST response). The function uses
+    `displayName` for `buildEnvelopeTextForActiveTab` and keeps
+    using `cloudName` for the upload route's `name` column, which
+    is exactly what each call site needs. Falls back to `cloudName`
+    when `displayName` is empty so older callers still compile and
+    behave like before; the only caller is
+    `matbeastCreateNewEventTab`, which now always supplies it.
+    (2) Defensive fix: `matbeastImportOpenedEventFile` gains a
+    `displayNameOverride?: string | null` option that, when
+    non-empty, replaces the parser's resolved `eventName` before
+    `POST /api/tournaments`. Both cloud open paths
+    (`HomeCloudPanel.openCloudEvent` and
+    `CloudEventDialogs.handleCloudOpen`) wire `meta.eventName ?? null`
+    into this — the cloud catalog row's `eventName` column is
+    rewritten on every rename and on every upload (from
+    `prisma.tournament.name`), so it's always at least as fresh as
+    the in-blob `eventName` and never carries the old filename
+    fallback. This heals existing buggy events on disk for any user
+    who was already affected: the next time they open one of those
+    events from the cloud home, the catalog's display title wins
+    over the broken blob, the new local tournament gets the right
+    name, and the next autosave rewrites the cloud blob's envelope
+    with the correct `eventName` (no extra migration needed). Disk
+    imports (`File ▸ Open`, Open Recent, double-click the
+    `.matb`/`.mat`/`.json` file) don't pass the override and keep
+    the existing parser-with-filename-stem-fallback behaviour, so
+    legitimately-named disk files are unaffected. The local
+    `CloudEventMeta` type in `CloudEventDialogs.tsx` was outdated
+    (missing `eventName` since v0.8.4); aligned it with the
+    canonical type in `lib/cloud-events.ts` so both call sites can
+    read the field. File trail:
+    `src/lib/matbeast-dashboard-file-actions.ts`,
+    `src/components/HomeCloudPanel.tsx`,
+    `src/components/CloudEventDialogs.tsx`, `package.json`. No
+    server / Prisma changes — the cloud catalog already had
+    everything we needed; it was just being ignored on the way in.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.35.exe` (2026-04-29 —
+    NDI scoreboard cue audio. v0.9.34 wired end-to-end NDI audio for
+    the bracket scene only; the operator immediately hit the obvious
+    next gap: "The Bracket overlay works correctly with the music
+    file but the 10s warning sound and air horn sound does not get
+    sent to the scoreboard overlay." Root cause: the timer-cue
+    playback (`useTimerAlertSounds`) was only mounted in
+    `src/components/ControlPanel.tsx` (operator dashboard, audible
+    on the operator's selected device) — the offscreen NDI scoreboard
+    `BrowserWindow` never instantiated it, so the receiving PC's NDI
+    track silently received nothing on the 10-second / zero
+    boundaries. Fix is the same shape as v0.9.34's bracket-music
+    plumbing, but applied to the scoreboard scene's transient cues
+    (`b10` = 10s warning, `b0` = air horn) instead of a long-running
+    looping music graph, and with a different audio-graph topology
+    because cue playback uses `BufferSource` nodes that are created
+    and destroyed per cue. (1) Refactored
+    `src/hooks/useTimerAlertSounds.ts` to accept an
+    `options?: { tapPcmForNdi?: boolean; ndiScene?: "scoreboard" |
+    "bracket" }` parameter. The standard branch (no options) is
+    untouched, so the dashboard's existing `ControlPanel.tsx` mount
+    keeps the operator-device routing,
+    `applySelectedAudioOutputToContext`, volume slider listener, and
+    cross-window dedup gates exactly as before. The new NDI-tap
+    branch reorders the audio chain from
+    `BufferSource → gain → destination` to
+    `BufferSource → tapNode → gain → destination(silent)` so the
+    `AudioWorkletNode` sees full pre-gain amplitude regardless of
+    the operator's local volume slider. The `AudioKit` type gained
+    an `input: AudioNode` field (gain in normal mode, tapNode in
+    NDI mode) so `playBuffer` connects each per-cue `BufferSource`
+    to the correct upstream node without branching on
+    `tapPcmForNdi` at the play site. Local audio is silenced via
+    `setSinkId({type:"none"})` first; the gain-mute fallback still
+    leaves the NDI tap untouched because it sits upstream of gain.
+    (2) The in-process coordinator (`shouldPlayEvent`) and the
+    `localStorage` cross-window claim (`crossWindowClaim`) are
+    BYPASSED in NDI tap mode. Both gates exist solely to deduplicate
+    AUDIBLE playback across windows of the same origin (e.g. the
+    dashboard and a visible scoreboard window competing for the
+    operator's speakers); the silent NDI renderer is a separate
+    playback path that must fire in parallel with whatever the
+    audible mount did. Without the bypass, the dashboard mount
+    would always claim the localStorage key first (it mounts
+    earlier) and the NDI tap would never play, leaving the
+    receiver with the same silence v0.9.34 had. The bypass is
+    encapsulated in a hoisted `gateAndPlayCue(tapPcmForNdi, ...)`
+    helper so each effect's `react-hooks/exhaustive-deps`
+    dependency array stays stable. (3) Operator-device + volume
+    listeners are also skipped in NDI mode: `onAudioOutputChanged`
+    and `onAudioVolumeChanged` only matter for the audible
+    dashboard mount, and rebuilding the kit on every output-device
+    swap would tear down the worklet for no reason. The NDI kit's
+    gain is fixed at 1.0 pre-tap; level control is the receiver's
+    job. (4) `src/app/overlay/overlay-client.tsx` now mounts
+    `useTimerAlertSounds` for the offscreen NDI scoreboard
+    renderer. Mount predicate is
+    `!isPreview && isNdi && lockedOutputScene === "scoreboard"`,
+    which excludes (a) the dashboard preview iframe (visual only),
+    (b) the visible scoreboard output window (silent by design —
+    operator monitors via dashboard), and (c) the bracket scene
+    (timer cues belong to scoreboard only). Reset key is built
+    with the same shape as `ControlPanel.tsx`'s
+    `timerAudioResetKey` — excluding `board.updatedAt` and
+    `timerRunning` so per-poll mutations and pause toggles don't
+    clear `prevSecondsRef` mid-crossing and swallow the cue. The
+    two mounts (dashboard audible, NDI silent-tap) run independent
+    edge detectors with `useRef` state, so each fires on identical
+    board transitions without contention. (5) Reuses every existing
+    piece of the v0.9.34 NDI audio pipeline: same
+    `public/matbeast-ndi-pcm-tap.worklet.js` worklet (1024-sample
+    planar Float32 frames, ~21 ms at 48 kHz, zero-copy
+    `ArrayBuffer` transfer), same
+    `window.matBeastDesktop.pushNdiAudio(scene, payload)` IPC
+    bridge, same `electron/ndi-feed.js` `pushAudioForScene` fan-in,
+    same patched `grandiose.sender.audio()` send path. Only
+    difference is the `scene` argument — `"scoreboard"` instead of
+    `"bracket"` — which routes to the matching active feed in the
+    main process. Throughput at 48 kHz / 2 ch / 1024-sample frames
+    is identical (~47 IPC msgs/sec, ~376 KB/sec), but in practice
+    the scoreboard tap is mostly silent except for the brief 10s
+    warning (~0.35 s) and air horn (~1.1 s) bursts; the worklet
+    still posts continuously because the audio graph is always
+    running, but those frames are near-zero amplitude. File trail:
+    `src/hooks/useTimerAlertSounds.ts`,
+    `src/app/overlay/overlay-client.tsx`, `package.json`. Nothing
+    in the main process or preload changed — the v0.9.34 IPC
+    plumbing was already scene-agnostic. Pending for v0.9.36:
+    surface NDI audio counters (per-scene
+    `audioFramesSent` / RMS / peak) on the Overlay-card status
+    pill so the operator can verify "scoreboard NDI: audio
+    streaming" without tailing `updater.log`; treat boundary
+    crossings while board polling is paused as missed cues that
+    fire on resume.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.34.exe` (2026-04-29 —
+    NDI audio. Through v0.9.33 the bracket NDI source had video only;
+    receivers showed `Mat Beast Bracket` but with no audio meter /
+    audio track at all. Operator's reported symptom: "I am not hearing
+    the audio on the receiving PC." Three pieces had to land in one
+    release for end-to-end audio over NDI to work: (1) grandiose
+    audio support, (2) renderer-side PCM capture, (3) main-process
+    fan-in. (1) The pinned grandiose master commit ships with
+    `sender.audio()` commented out — `napi_value audioFn; ...` is
+    dead in `sendComplete()` and there's no `audioSend` C++ entry
+    point at all. Extended `scripts/patch-grandiose.mjs` (which
+    already patches MSVC string-literal conformance) to also enable
+    the audio path: it replaces the commented-out function-
+    registration block with active code (CRLF-tolerant regex match;
+    upstream master ships LF, but Windows checkout normalisation
+    flips it to CRLF and silently broke the first attempt at a plain
+    `String.replaceAll` swap), adds a `napi_value audioSend(...)`
+    forward declaration, and appends a full `audioSendExecute` /
+    `audioSendComplete` / `audioSend` implementation at the end of
+    `grandiose_send.cc`. The new `audioSend` reads
+    `{ sampleRate, numChannels, numSamples, channelStrideInBytes,
+    data: Buffer }` from a JS object, populates the existing
+    `sendDataCarrier::audioFrame` slot (already declared in
+    `grandiose_send.h`, so no header change), and invokes
+    `NDIlib_send_send_audio_v2` on the async work queue with
+    `timecode = NDIlib_send_timecode_synthesize`. Sentinel comment
+    `MATBEAST_AUDIO_SEND_PATCH_V1` makes the script idempotent on
+    re-runs. (2) Renderer-side capture: new
+    `public/matbeast-ndi-pcm-tap.worklet.js` AudioWorklet processor
+    sits between `source` and `gain` in the bracket music graph,
+    accumulates 1024-sample channel-major Float32 frames (~21 ms at
+    48 kHz), and posts them to the main thread via
+    `port.postMessage({...}, [planar.buffer])` with the planar
+    `ArrayBuffer` transferred (zero-copy across the worklet/main
+    boundary). The processor is also a pass-through so connecting it
+    inline doesn't break the visible bracket window's MONITOR=on
+    audibility. `src/app/overlay/use-bracket-overlay-music.ts`
+    refactored to accept `{ tapPcmForNdi: boolean }`: when true, it
+    `await ctx.audioWorklet.addModule(...)`, instantiates the worklet
+    node, splices it into the chain, attaches a port message
+    handler that forwards each frame via
+    `window.matBeastDesktop.pushNdiAudio("bracket", payload)`, and
+    forces the local sink silent regardless of the operator's
+    MONITOR toggle (so the offscreen NDI bracket renderer never
+    plays a second audible copy on top of the visible bracket
+    window). `overlay-client.tsx` mounts the music engine in BOTH
+    the visible bracket window (operator monitor) and the offscreen
+    NDI bracket renderer (PCM tap), so both paths are independent —
+    the operator's MONITOR-on local playback isn't affected by NDI
+    state, and conversely an unplugged operator audio device doesn't
+    break NDI audio. (3) Main-process fan-in: new
+    `electron/preload.js` exposes
+    `matBeastDesktop.pushNdiAudio(scene, payload)` as a fire-and-
+    forget `ipcRenderer.send("ndi-audio:push", ...)` (no
+    acknowledgement so back-pressure can't stall the audio thread).
+    `electron/ndi-sender.js` gains `sendNdiAudioFrame(sender,
+    payload, onLog)`: validates the buffer length matches
+    `numChannels * numSamples * 4` (planar Float32 is the only
+    layout NDI accepts via FLTP), wraps `ArrayBuffer` / `Uint8Array`
+    inputs as Buffer without copying, calls `sender.audio({...})`,
+    and rate-limits a diagnostic that logs sample rate + channel
+    count + per-channel RMS / peak amplitude for the first 3 audio
+    frames per sender so we can verify the tap is producing real
+    music (not silence) before grandiose accepts the frame.
+    `electron/ndi-feed.js` gains audio counters
+    (`audioFramesSent`, `audioSendFailures`, `audioFramesDropped`,
+    `audioFirstFrameAt`, `lastAudioSendError`) and a
+    `pushAudioForScene(scene, payload, onLog)` entry point that
+    routes incoming frames to the matching active feed; if no feed
+    is running for that scene, the frame is dropped silently
+    (audio path comes up before video on mount; this is normal).
+    `electron/main.js` adds an `ipcMain.on("ndi-audio:push", ...)`
+    handler that forwards into `pushAudioForScene`. Throughput at
+    48 kHz / 2 ch / 1024-sample frames: ~47 IPC messages/sec at
+    ~8 KB each = ~376 KB/sec, well within Electron's IPC budget.
+    File trail: `scripts/patch-grandiose.mjs`,
+    `node_modules/grandiose/src/grandiose_send.cc` (regenerated by
+    postinstall), `public/matbeast-ndi-pcm-tap.worklet.js`,
+    `src/app/overlay/use-bracket-overlay-music.ts`,
+    `src/app/overlay/overlay-client.tsx`, `electron/preload.js`,
+    `electron/ndi-sender.js`, `electron/ndi-feed.js`,
+    `electron/main.js`, `src/types/matbeast-desktop.d.ts`,
+    `package.json`. Pending for v0.9.35: scoreboard timer-cue audio
+    routing (same plumbing, just a different scene), audio
+    counters surfaced in the Overlay-card NDI status pill so the
+    operator can see "audio: 1234 frames, RMS 0.12" without
+    tailing `updater.log`.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.33.exe` (2026-04-29 —
+    NDI network-adapter binding + Overlay-card status pill. v0.9.32
+    confirmed every layer of our content pipeline produced valid
+    BGRA frames, but cross-PC NDI delivery was still failing
+    intermittently. Combined with Newtek's own Test Pattern Generator
+    failing the same way on the same PC, evidence pointed unambiguously
+    at the multi-NIC binding problem: Windows announces NDI on every
+    interface (including APIPA `169.254.*` addresses on idle Ethernet
+    adapters and Wi-Fi Direct virtual adapters), and remote receivers
+    latch onto a non-routable IP from the announce. Operator-side fix:
+    let the user pick which NIC NDI binds to via a private
+    `ndi-config.v1.json` under `<userData>/ndi-config/`, with the
+    `NDI_CONFIG_DIR` env var set BEFORE `grandiose` is required so
+    `NDIlib_initialize()` reads it. Three new electron-side modules:
+    `electron/ndi-adapters.js` (walks `os.networkInterfaces()`,
+    classifies each IPv4 address as ethernet/wifi/bluetooth/virtual/
+    APIPA/loopback with friendly labels, runs the auto-binding
+    selector that prefers Ethernet > Wi-Fi > any routable);
+    `electron/ndi-config.js` (writes/removes the config JSON,
+    points `NDI_CONFIG_DIR` at our private dir); the bootstrap call
+    in `app.whenReady()` runs `applySavedNdiBinding()` immediately
+    after `loadDesktopPreferences()` so the env var is set before
+    any feed start triggers grandiose's lazy load. New
+    `desktopPreferences.ndiBindAdapter` (default `{ kind: "auto" }`)
+    persists the operator's choice across sessions. New
+    `Options ▸ NDI ▸ Network adapter` submenu lists every detected
+    adapter with friendly name + IP + `(APIPA)` / `(virtual)` /
+    `(loopback)` decorations so the operator sees at a glance which
+    entries are useless for cross-PC delivery; clicking an entry
+    persists the choice, rewrites `ndi-config.v1.json`, and triggers
+    a native "Restart now / Restart later" dialog (NDI runtime only
+    re-reads `NDI_CONFIG_DIR` at `NDIlib_initialize()`, so live
+    rebinding requires a relaunch). Three new IPC channels —
+    `ndi:get-state` (initial sync read), `ndi:set-binding` (persist +
+    write config + push state), `ndi:relaunch-for-binding` (clean
+    `app.relaunch()` from the dashboard). State is broadcast on
+    `matbeast:ndi:state` whenever a feed toggles, the operator
+    rebinds, or every 5 s on a refresh timer that catches OS-level
+    NIC changes (cable unplugged, Wi-Fi reconnected, DHCP changed
+    the IP). Renderer side: new
+    `src/components/dashboard/NdiStatusPill.tsx` renders a compact
+    status pill in the Overlay-card header with a colored dot
+    (green = bound to routable adapter + feed running, gray = bound
+    but idle, yellow = bound to APIPA / virtual NIC, red = no
+    binding at all) and a plain-English label
+    ("NDI: Wi-Fi", "NDI: Ethernet", "NDI: APIPA"). Clicking the pill
+    opens an inline picker mirroring the menu submenu — auto-select
+    plus per-IP entries decorated with the same APIPA / loopback /
+    virtual hints. The pill is fed by
+    `matBeastDesktop.getNdiState()` on mount and
+    `matBeastDesktop.onNdiStateChange()` for live pushes; in browser
+    dev builds where the bridge is missing it degrades to a static
+    "NDI: web" badge. New TypeScript types
+    `NdiBindingPreference`/`NdiAdapterEntry`/`NdiStateSnapshot` in
+    `src/types/matbeast-desktop.d.ts`. File trail:
+    `electron/ndi-adapters.js`, `electron/ndi-config.js`,
+    `electron/main.js`, `electron/preload.js`,
+    `src/types/matbeast-desktop.d.ts`,
+    `src/components/dashboard/NdiStatusPill.tsx`,
+    `src/components/dashboard/DashboardFullWorkspace.tsx`,
+    `package.json`. Pending for v0.9.34: replace the menu's "restart
+    required" prompt with a tear-down + re-init path that doesn't
+    need an app relaunch (requires patching grandiose to expose
+    `NDIlib_destroy` / `NDIlib_initialize`), and surface
+    `NDIlib_send_get_no_connections()` as a per-source receiver
+    count next to the pill so the operator can see "1 receiver
+    connected" without alt-tabbing to NDI Studio Monitor.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.30.exe` (2026-04-29 — Two
+    bug fixes and one feature add on top of v0.9.29's NDI debut. (1)
+    Root-cause for v0.9.29's "Studio Monitor sees \"Mat Beast
+    Scoreboard\" but the preview is blank": Electron's
+    `NativeImage.getSize()` returns dimensions in DIPs while
+    `toBitmap()` returns physical pixels, and on the operator's
+    1.5×-scale display the resized image reported `1920×1080` from
+    `getSize()` but yielded an `8 294 400 × 2.25 = 18 662 400`-byte
+    BGRA buffer. v0.9.29 advertised `xres=1920`, `yres=1080`,
+    `lineStrideBytes=7680` to NDI, then handed it 18 MB of pixel
+    data laid out at stride 11 520 — receivers saw a coherent
+    NDI source announcement (mDNS worked, hence the entry in the
+    source list) but couldn't decode any frame because every row
+    after row 0 was misaligned. Fix in `electron/ndi-sender.js`:
+    derive the true pixel dimensions from `data.length` /
+    (4 × `reportedSize.height`). When the buffer agrees with
+    `getSize()` (scale factor 1.0 hosts) we keep `1920×1080`; when
+    it doesn't, we recompute to whatever square scale the buffer is
+    actually at (`2880×1620` on the 1.5× display, which is still
+    16:9 so `pictureAspectRatio` stays consistent). NDI receivers
+    accept this as a coherent format and decode frames. We also
+    log the first 3 frames' `reportedSize`, `bufferLength`,
+    inferred dimensions and first 16 bytes of the BGRA buffer to
+    `updater.log` for forensic confirmation; the diagnostic uses
+    a `WeakMap<sender, count>` so a sender restart resets the
+    counter automatically. The dynamic `pictureAspectRatio = xres /
+    yres` falls back to `16/9` if the inference fails. (2)
+    Receiver-format-stability warmup in `electron/ndi-feed.js`:
+    drop the first 30 frames (1 s @ 30 fps) before submitting any
+    to NDI. Two motivations — the very first frames after `did-
+    finish-load` come from a mid-hydration React tree (fonts not
+    loaded, scale-to-fit hasn't run, no scoreboard data fetched),
+    and some NDI receivers latch onto the format of the very first
+    frame they observe and drop subsequent frames whose format
+    disagrees. We log the warmup completion (`warmup complete
+    (skipped first 30 frames); now broadcasting to receivers.`)
+    and added `framesSkipped` to `getStatus()`/the stop log so the
+    operator can confirm from `updater.log`. (3) Bracket NDI feed
+    is now a peer of the scoreboard: a second `Options ▸ NDI`
+    menu item toggles `Start "Mat Beast Bracket"` /
+    `Stop "Mat Beast Bracket"` exactly like the scoreboard one,
+    reusing every line of `ndi-feed.js` / `ndi-source.js` / `ndi-
+    sender.js`. The bracket source loads `/overlay?ndi=1&output
+    Scene=bracket`, runs through the same 1920×1080-or-inferred-
+    dimensions BGRA pipeline, and registers as an independent
+    `NDIlib_send` instance — receivers see two distinct sources,
+    each toggleable independently from the menu. File trail:
+    `electron/ndi-sender.js`, `electron/ndi-feed.js`,
+    `electron/main.js`, `package.json`. Open questions deferred
+    to v0.9.31: AudioWorklet PCM tap on the bracket-music graph
+    (so the bracket NDI source carries audio, not just video),
+    persistent `desktopPreferences.ndiAutoStart` so feeds resume
+    on app launch, source-name editor + frame-rate selector,
+    "always 1920×1080 regardless of host DPI" via PNG round-trip
+    or canvas-based downsample (v0.9.30 currently emits whatever
+    physical resolution the host display dictates after offscreen
+    capture; receivers handle the resize at their end, but the
+    operator originally asked for a guaranteed 1920×1080 output —
+    we'll bring that back once we have a low-cost downsample
+    path that doesn't pay 10 ms/frame in PNG encode + decode).)
+  - `dist/Mat Beast Scoreboard Setup 0.9.29.exe` (2026-04-29 —
+    grandiose master is added under `dependencies` and pinned to
+    commit `c350e0fb6e74bbf2e4b10144fee456aa1af93f47` (the published
+    npm `0.0.4` was a hardcoded sine-wave audio demo, not a real
+    `send` API; master is `0.1.0` with the real Sender object). The
+    package ships the NewTek NDI Runtime DLL (`Processing.NDI.Lib.x64
+    .dll`, 28 MB, NDI SDK v5.5.2.0 from October 2022) inside its
+    `lib/win_x64/` folder and the License Agreement under `lib/`,
+    so no separate redistribution gate. New
+    `scripts/patch-grandiose.mjs` (postinstall) makes the binding
+    compile against modern MSVC by changing two `char* file` /
+    `char* methodName` parameters in `grandiose_util.h`/`.cc` to
+    `const char*` (modern MSVC rejects `__FILE__` → `char*` implicit
+    conversion under C++17 conformance) and adds `/permissive` +
+    `/Zc:strictStrings-` AdditionalOptions to grandiose's own
+    `binding.gyp`. The post-install rebuild runs once for system
+    Node, then `electron-builder`'s default `installAppDeps` step
+    rebuilds against Electron 37's ABI before packaging — `ndi
+    :rebuild-electron` script is also exposed for manual reruns
+    during dev. Three new electron-side modules: `electron/ndi-
+    sender.js` (lazy-loads grandiose, returns "NDI unavailable"
+    instead of crashing if the binding fails to load — exposes
+    `createNdiSender`/`sendNdiVideoFrame`/`destroyNdiSender` and a
+    `getStatus()` diagnostic that surfaces the SDK version + DLL
+    path for menus); `electron/ndi-source.js` (lifts the offscreen
+    `BrowserWindow` + `capturePage` loop out of `ndi-smoke.js`,
+    scene-parameterised so the bracket source in v0.9.30 reuses
+    every line); and `electron/ndi-feed.js` (combines source +
+    sender, owns the lifecycle, fire-and-forget per-frame send so
+    `setInterval(33ms)` keeps ticking even if a single
+    `sender.video()` is mid-flight). `BGRA` FourCC = 1095911234,
+    progressive frame format, 30000/1000 frame rate, 16:9 aspect
+    ratio, with `clockVideo: false` so we pace ourselves rather
+    than letting NDI sleep our event loop. The `NDI` submenu
+    toggle is dynamic — its label flips between "Start \"Mat Beast
+    Scoreboard\" NDI source" and "Stop \"Mat Beast Scoreboard\"" via
+    `refreshApplicationMenu()` after each toggle. `app.before-
+    quit` calls `ndiFeed.stopAllNdiFeeds()` before closing the
+    overlay windows so we don't see "send to destroyed
+    webContents" warnings during shutdown — receivers detect the
+    dropout within ~3 s on JS GC anyway. `package.json` build
+    `files` array now excludes grandiose's debug artifacts
+    (`*.pdb`, `*.iobj`, `*.ipdb`, `*.exp`, `*.lib`, `obj/` — saves
+    ~6 MB), the cross-platform NDI runtimes we don't ship
+    (`linux_arm64/`, `linux_x64/`, `mac_universal/`, `win_x86/` —
+    saves ~60 MB), and grandiose's C++ source / SDK headers (`src
+    /`, `include/` — saves ~200 KB). Net installer overhead from
+    NDI: ~28 MB DLL + ~200 KB native binding = ~28.2 MB. Open
+    questions deferred to v0.9.30: bracket source feed, AudioWorklet
+    PCM tap on the bracket-music graph, persistent `desktopPreferences
+    .ndiAutoStart` so feeds resume on app launch, source-name
+    editor, frame-rate selector. File trail: `electron/ndi-sender
+    .js`, `electron/ndi-source.js`, `electron/ndi-feed.js`,
+    `electron/main.js`, `scripts/patch-grandiose.mjs`, `package
+    .json`.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.28.exe` (2026-04-29 — Lock
+    NDI capture output to a deterministic 1920×1080 BGRA frame
+    regardless of operator hardware. v0.9.27's smoke-test summary
+    showed `captureSize: "2562x1529"` on the operator's
+    2560×1600/150%-DPI display because the offscreen renderer's
+    `devicePixelRatio` was inheriting from the host display, then
+    Chromium captured at the resulting effective pixel resolution
+    (1920 × 1.5 ≈ 2880, with extra adjustments). NDI receivers
+    require a fixed advertised frame size — any frame that disagrees
+    with the sender's announced format is treated as a format change
+    and re-negotiated, causing downstream stutter. **Three layers
+    of defense to pin output at 1920×1080**: (1) `BrowserWindow`
+    constructor adds `useContentSize: true` and
+    `webPreferences.zoomFactor: 1.0` so CSS layout matches the
+    buffer dimensions exactly with no zoom drift. (2) The capture
+    loop now passes an explicit `rect: {x:0,y:0,width:1920,
+    height:1080}` to `webContents.capturePage(rect)` so the
+    requested region is constrained to the broadcast extent. (3)
+    Bulletproof safety net: every captured `NativeImage` is checked
+    against 1920×1080 and `image.resize({width:1920,height:1080,
+    quality:"best"})` if it doesn't match — guarantees the frame
+    handed to grandiose / written as PNG is exactly the broadcast
+    canonical size, irrespective of what Chromium did internally.
+    Also adds a post-load `setZoomFactor(1.0)` (belt-and-suspenders
+    with the constructor flag) and an `executeJavaScript` diagnostic
+    that logs the renderer's `devicePixelRatio`, `innerWidth`,
+    `innerHeight` so we can confirm layers 1+2 actually work or
+    detect when layer 3 saved us. Summary JSON now includes
+    `resizesPerformed` — when this is 0 the renderer produced
+    canonical frames natively; when > 0 the resize fallback rescued
+    them. File: `electron/ndi-smoke.js`.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.27.exe` (2026-04-29 — Drop
+    paint-event capture entirely; drive offscreen frames via
+    `webContents.capturePage()`. v0.9.26 confirmed the JS-injection
+    paint pump fires reliably (`paintPumpTicks=208` in 7 s), but
+    `document.body.dataset.matbeastNdiTick` mutations produced **0**
+    additional paint events past the initial-hydration window —
+    Chromium correctly elides paint for `data-*` attribute changes
+    that don't affect rendering, and `show: false` offscreen windows
+    may throttle the renderer's JS execution itself. After five
+    versions trying to coax paint events out of an offscreen
+    webContents, the right answer is to stop relying on the natural
+    paint cycle and force frame production from main with
+    `capturePage()`. capturePage forces Chromium to commit a fresh
+    frame to a `NativeImage` regardless of compositor-invalidation
+    state or renderer throttling — same code path DevTools' "Capture
+    screenshot" uses. The smoke test now runs a 33 ms `setInterval`
+    that calls `capturePage()`, drops the result if a previous
+    capture is still in flight (no IPC pile-up on a slow tick),
+    counts captures separately for warmup vs recording, and writes
+    every Nth recorded capture to disk as PNG. Paint events are
+    still listened to for diagnostics so we can see exactly where
+    Chromium's natural cycle stalls. `summary.json` now distinguishes
+    `paintEventsDuringWarmup` / `paintEventsDuringRecording` from
+    `capturesDuringWarmup` / `capturesDuringRecording`. Architecture
+    note for v0.9.28+: grandiose's `ndiSender.video()` takes a
+    buffer; the capturePage result feeds it directly with no
+    intermediate paint-event ceremony. Trade-off: capturePage
+    involves an extra raster pass per call vs the paint event's
+    zero-copy delivery — within budget for 30 fps × 1920×1080 on
+    any operator machine that runs the dashboard, and reliability
+    matters more than per-frame efficiency for live broadcast.
+    File: `electron/ndi-smoke.js`.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.26.exe` (2026-04-29 — Drive
+    offscreen renderer paints from main via DOM mutation. v0.9.25's
+    diagnostic counters revealed the underlying Chromium offscreen-
+    rendering reality: the renderer painted **29 frames at ~31 fps**
+    (exactly the configured rate) over a ~935 ms window during initial
+    load + hydration (t=395ms → t=1330ms), then **stopped completely**
+    — zero paints across the full 5.4 s recording window after that.
+    Cause: `setFrameRate(N)` is a *cap*, not a clock. Offscreen
+    webContents only emit `paint` events when the compositor is
+    invalidated by DOM/style changes; visible windows are paced by the
+    OS compositor's vsync, but offscreen renderers have no such
+    external clock and a quiescent React tree produces no
+    invalidations. `webContents.invalidate()` is documented as
+    "schedules a full repaint of the **window**" — no-op for
+    offscreen webContents (no window). v0.9.23's 33 ms invalidate
+    timer produced 1 frame total: same "initial-load-only" pattern
+    we now understand. **Fix:** drive paints from main via
+    `webContents.executeJavaScript(\`document.body.dataset.matbeastNdiTick=…\`)`
+    on a 33 ms `setInterval`. Each dataset mutation invalidates the
+    compositor → a paint is queued → the listener receives it. The
+    interval runs in main, so it's not subject to Chromium's
+    renderer-side timer throttling that would otherwise stall an
+    offscreen `setInterval` on a `show: false` window. Pump starts
+    inside the `did-finish-load` handler (after the paint listener is
+    attached and `setFrameRate(30)` is applied) and stops when
+    recording ends. Summary now includes `paintPumpTicks` so we can
+    confirm the pump fired the expected ~165 times during a 5.4 s
+    recording window. Comment block in `ndi-smoke.js` explains why we
+    don't use `webContents.invalidate()` for offscreen rendering and
+    references the v0.9.23 mistake. File: `electron/ndi-smoke.js`.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.25.exe` (2026-04-29 — Two
+    bugs revealed by the v0.9.24 smoke-test run: (1) **`durationMs is
+    not defined` thrown after summary write** — leftover reference in
+    the function's return statement after I'd renamed the variable to
+    `recordingDurationMs` / `totalDurationMs`. The wrapper saw the
+    throw and returned `{ok:false}`, so no completion dialog appeared
+    even though `summary.json` had been written. Fixed; the return
+    now includes `framesCaptured`, `framesDuringWarmup`, `pngsWritten`,
+    `recordingDurationMs`, `totalDurationMs`, `observedFps`, and the
+    Electron dialog reader in `main.js` was updated to match. (2)
+    **Zero frames produced during the entire 7 s test** — far worse
+    than v0.9.22's 6 fps. v0.9.24 registered `beginFrameSubscription`
+    *before* `loadURL` to avoid attaching too late; in practice
+    Chromium severs the subscription when the new origin loads, so
+    the listener bound to the placeholder webContents never received
+    a single paint from the post-navigation renderer. Two changes
+    fix it: (a) Switched from `beginFrameSubscription(false, cb)` to
+    `webContents.on("paint", (event, dirty, image) => …)` — per
+    Electron's offscreen-rendering docs `paint` is the canonical API
+    for offscreen webContents; `beginFrameSubscription` is meant for
+    visible windows and degrades poorly on offscreen. (b) Re-registered
+    the listener AFTER `did-finish-load` so it binds to the correct
+    post-navigation renderer, matching the v0.9.22 timing that did
+    produce frames. The `setFrameRate(30)` call stays in the
+    `did-finish-load` handler. Files: `electron/ndi-smoke.js`,
+    `electron/main.js`.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.24.exe` (2026-04-29 — Revert
+    the v0.9.23 `webContents.invalidate()` "force-paint" timer; it was
+    actively destroying frames. Smoke-test runs on v0.9.23 produced
+    **1 frame in 5 s** (0.2 fps) — vs v0.9.22's already-poor 6 fps —
+    because calling `invalidate()` every 33 ms cancelled each in-flight
+    paint before Chromium could commit it. Lesson: for offscreen
+    rendering, `setFrameRate(N)` is the only paint-cadence control
+    needed; pacing is Chromium's job. **Do not reintroduce
+    `invalidate()` on a fast timer for offscreen rendering.** Other
+    refinements: (1) Register `beginFrameSubscription` *before*
+    `loadURL` and split frame counts into `framesDuringWarmup` (which
+    are observed but not written) and `framesCaptured` (post-warmup,
+    written every Nth as PNG). The pre-warmup count is a diagnostic
+    so we can tell "renderer never paints" from "renderer paints but
+    we missed the window." (2) Bumped total wall-clock to 7 s (warmup
+    + recording) so the recording window is ~5.5 s after the 1500 ms
+    warmup. (3) Summary JSON now includes `framesDuringWarmup`,
+    `firstFrameRelMs`, `lastFrameRelMs`, `recordingDurationMs`,
+    `totalDurationMs`, `observedFps` — enough to characterize the
+    renderer behavior without re-running. (4) Comment block in
+    `ndi-smoke.js` now flags the v0.9.23 invalidate mistake so a
+    future change doesn't put it back. File: `electron/ndi-smoke.js`.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.23.exe` (2026-04-29 — Three
+    offscreen-renderer fixes uncovered by the v0.9.22 smoke-test
+    output: (1) **Pace frame production**. v0.9.22 produced ~6 fps
+    against a 30-fps target because Chromium's offscreen renderer
+    only paints when the DOM requests a frame; a static scoreboard
+    between clock ticks generated almost nothing. Added a
+    `setInterval(() => webContents.invalidate(), 33)` during the
+    capture window so the BGRA buffer stream is paced by the main
+    process, not by the renderer's intrinsic motion (matches what
+    the future grandiose `ndiSender.video()` cadence will need —
+    receivers drop sources that miss frames). (2) **Move
+    `setFrameRate(30)` to after `did-finish-load`**. Calling it on
+    the brand-new offscreen webContents was getting reset by
+    Chromium's renderer init pass. Applied post-load, it sticks.
+    (3) **Add a 1500 ms warmup window after `did-finish-load`
+    before counting frames**. v0.9.22 frame-001 was a 20 KB
+    incomplete-render PNG (the "cut off on the sides" symptom);
+    frames 2 and 3 (94 KB / 128 KB) were correct. The warmup gives
+    Next.js client hydration, React Query fetches, `@fontsource`
+    web font loading, and the `transform: scale(s)` fit pass time
+    to settle before the subscription stream is recorded. Summary
+    JSON now includes `observedFps`, `warmupMs`,
+    `invalidateIntervalMs` so the smoke-test artifact is
+    self-describing. File: `electron/ndi-smoke.js`.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.22.exe` (2026-04-29 — Fix
+    duplicate-guard race in `electron/ndi-smoke.js`. v0.9.21 shipped
+    with two `if (activeSmokeTestRun) return` checks: one in the
+    public wrapper `runOffscreenSmokeTestExclusive` (correct) and one
+    in the inner `runOffscreenSmokeTest` (left over from a refactor).
+    The wrapper sets `activeSmokeTestRun = { startedAt }` *before*
+    calling the inner; the inner saw the freshly-set lock and
+    returned `{ok:false, error:"A smoke test is already running."}`
+    1 ms after every first invocation. Captured by the operator
+    running **Options ▸ NDI ▸ Run offscreen smoke test (5s)** twice
+    on v0.9.21 with no dialog appearing; the
+    `<userData>/updater.log` showed two paired
+    `ndi-smoke: starting … / ndi-smoke: finished {"ok":false,"error":
+    "A smoke test is already running."}` log lines 1 ms apart.
+    Removed the inner guard and the redundant
+    `activeSmokeTestRun = null` reset at the bottom of the inner
+    function (the wrapper's `finally` already clears it). Comment
+    block in the inner function now flags that exclusivity is owned
+    by the wrapper. Operator path note: Electron resolves
+    `app.getPath("userData")` against `package.json` `"name"`
+    (`matbeastscore`), not `productName`, so the smoke-test output
+    folder is `%APPDATA%\matbeastscore\ndi-test\<timestamp>\` and
+    diagnostic logs are at `%APPDATA%\matbeastscore\updater.log` —
+    not `…\Mat Beast Scoreboard\…` as my chat scaffolding messages
+    incorrectly stated. File: `electron/ndi-smoke.js`.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.21.exe` (2026-04-29 — NDI
+    integration, step 1 of N. Adds the offscreen-rendering smoke-test
+    scaffold the rest of the NDI work depends on. New
+    `electron/ndi-smoke.js` builds an offscreen `BrowserWindow`
+    (`webPreferences.offscreen: true, transparent: true, width: 1920,
+    height: 1080`), loads
+    `${appUrl}/overlay?ndi=1&outputScene=scoreboard`, locks the paint
+    rate at 30 fps via `webContents.setFrameRate(30)`, subscribes to
+    full frames via `beginFrameSubscription(false /* onlyDirty */, …)`,
+    and writes every 10th `image.toPNG()` to
+    `<userData>/ndi-test/<timestamp>/frame-NN.png` for ~5 seconds
+    before destroying the offscreen window and revealing the output
+    folder in Explorer. Fired from a new `Options ▸ NDI ▸ Run
+    offscreen smoke test (5s)` menu entry; all activity is logged to
+    `<userData>/updater.log` with `[ndi-smoke]` prefix so a tester can
+    capture run details after the fact. Renderer
+    (`src/app/overlay/overlay-client.tsx`) reads a new `ndi=1` query
+    param parallel to `preview=1`: when set, it suppresses the
+    operator-confidence inset teal frame
+    (`OVERLAY_OUTPUT_FRAME_STYLE`) so the broadcast viewer never sees
+    it, and disables `useBracketOverlayMusic` so the offscreen
+    bracket renderer does not double up audio with the visible
+    bracket window's existing engine (the dedicated NDI audio graph
+    + AudioWorklet PCM tap arrives in v0.9.23). The visible
+    scoreboard / bracket windows are unchanged. No NDI library yet —
+    that lands in v0.9.22 once the offscreen rendering path is
+    operator-verified end-to-end. Files: `electron/ndi-smoke.js`
+    (new), `electron/main.js` (Options ▸ NDI submenu, smoke-test
+    runner with dialog + log surface),
+    `src/app/overlay/overlay-client.tsx` (`isNdi` flag),
+    `package.json` (0.9.21).)
+  - `dist/Mat Beast Scoreboard Setup 0.9.19.exe` (2026-04-28 — Hardened
+    preload script. Wraps `require("electron")`, `require("./matbeast-variant.js")`,
+    and `contextBridge.exposeInMainWorld("matBeastDesktop", …)` in
+    independent try/catch blocks and **always** publishes a separate
+    sentinel object `__matBeastPreloadStatus` (with `ran`, `hasContextBridge`,
+    `hasIpcRenderer`, `preloadError`, `preloadVersion`) before doing
+    anything else. Renderer-side bracket-music diagnostic now reads
+    that sentinel and reports one of three actionable states: "preload
+    sentinel ABSENT" (preload script never ran in this renderer →
+    install / antivirus / wrong-process issue), "preload ran but
+    matBeastDesktop is missing" (with the actual `preloadError` text),
+    or "bridge keys (vX.Y.Z): …" (lists every method actually exposed).
+    Also published as a real GitHub release with `latest.yml`,
+    `Mat-Beast-Scoreboard-Setup-0.9.19.exe`, and the blockmap so
+    `electron-updater` stops 404'ing on `latest.yml` from v0.9.12.
+    File: `electron/preload.js`, `src/components/dashboard/DashboardFullWorkspace.tsx`.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.18.exe` (2026-04-28 — Bridge
+    capability dump. Renderer effect now lists every key actually
+    present on `window.matBeastDesktop` plus the running app version
+    (via `getRuntimeInfo`) when `chooseBracketMusicFile` is missing,
+    instead of guessing why. Diagnostic line on the Overlay header
+    reads `bridge keys (v0.9.X): addRecentDocument, captureOverlayPreview,
+    chooseBracketMusicFile, clearBracketMusicFile, …`. Surfaced a stale
+    install path / running-process problem on the user's machine.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.17.exe` (2026-04-28 — Bracket-
+    music IPC diagnostics. Browse / None / state-fetch paths now log
+    every step to a visible amber-italic `musicDiag` line in the
+    Overlay-card header (e.g. `Browse clicked — invoking IPC...`,
+    `IPC threw: …`, `IPC returned no result`, `chooseBracketMusicFile
+    is not a function on the bridge`). Main-side `bracket-music:choose-file`
+    handler hardened: explicit `mainWindow` parent (instead of
+    `BrowserWindow.getFocusedWindow()` which can return `null` when a
+    transient popover-button click stole focus on Windows), defensive
+    `app.getPath("music")` fallback, full try/catch returning structured
+    `{ ok: false, error }` on any failure. Files: `electron/main.js`,
+    `src/components/dashboard/DashboardFullWorkspace.tsx`.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.16.exe` (2026-04-28 — Removed
+    the `desktopBridgePresent` render-time gate altogether. Earlier
+    builds disabled the entire music control row when
+    `typeof window.matBeastDesktop === "object"` evaluated false at
+    SSR-then-hydrate time, then never re-flipped to enabled because
+    no state change re-evaluated the predicate. The buttons now use
+    optional-chaining (`window.matBeastDesktop?.foo?.()`) directly so
+    they're always clickable; missing methods silently no-op. Avoids
+    the SSR-vs-client predicate-mismatch class of bug entirely.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.15.exe` (2026-04-28 — Replaced
+    the narrow `onBracketMusicStateChange`-only readiness check with a
+    bridge-presence check. The action methods (`chooseBracketMusicFile`,
+    `setBracketMusicPlaying`, `setBracketMusicMonitor`) work
+    independently of the listener subscription, so a one-method-missing
+    case shouldn't disable the entire row. Still gated on
+    `typeof window.matBeastDesktop === "object"` — superseded in 0.9.16.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.14.exe` (2026-04-28 — Defensive
+    music-row rendering plus DPI-aware overlay sizing. (1) Music control
+    row in `DashboardFullWorkspace.tsx` now renders any time
+    `previewScene === "bracket"`, falling back to an in-memory default
+    (`{filePath:null, fileName:null, playing:true, monitor:false}`)
+    until the real IPC payload arrives. Earlier builds gated the row
+    behind `musicState !== null`, which silently hid all controls when
+    the state IPC didn't resolve. (2) `getScoreboardAndBracketBounds`
+    in `electron/main.js` now divides 1920×1080 by `display.scaleFactor`
+    before passing to `BrowserWindow`, so the *physical* backing surface
+    lands on broadcast-canonical 1920 × 1080 regardless of operator
+    display DPI. Previously, on a 2560×1600 main display at 150% Windows
+    scaling, the windows rendered at 2880 × 1620 *physical* pixels and
+    overflowed the screen. The renderer's existing `transform: scale(s)`
+    fits the 1920×1080 design canvas inside the smaller CSS viewport;
+    Chromium re-rasterizes vector content at devicePixelRatio so visual
+    quality is preserved. Files: `electron/main.js`,
+    `src/components/dashboard/DashboardFullWorkspace.tsx`.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.13.exe` (2026-04-28 — Bracket
+    overlay music feature. Operator picks a host audio file via
+    Overlay-card header controls when `SHOW BRACKET` is active; file
+    plays as a silent loop on the bracket overlay window so it can be
+    paired with the bracket video as a single NDI source. Three new
+    header buttons: PLAY/STOP MUSIC, CHOOSE MUSIC (Browse… / None
+    popover), MONITOR ON/OFF. State (filePath, playing, monitor)
+    persisted in `desktop-preferences.json` and pushed via
+    `bracket-music:state` IPC channel. Audio engine in
+    `src/app/overlay/use-bracket-overlay-music.ts` uses
+    `HTMLAudioElement` + `AudioContext` with `setSinkId({ type: "none" })`
+    for silent-local playback (operator doesn't hear it but PCM still
+    flows for future NDI tap), `applySelectedAudioOutputToContext` when
+    MONITOR is ON. Custom Electron protocol `mat-beast-asset://music/track`
+    streams the configured file via `electronNet.fetch(file://…)` so
+    the renderer never sees the absolute host path. `autoplayPolicy:
+    'no-user-gesture-required'` on the bracket overlay BrowserWindow
+    so the loop autoplays at launch when a track is configured. Files:
+    `electron/main.js`, `electron/preload.js`,
+    `src/lib/bracket-music-state.ts` (new),
+    `src/app/overlay/use-bracket-overlay-music.ts` (new),
+    `src/app/overlay/overlay-client.tsx`,
+    `src/components/dashboard/DashboardFullWorkspace.tsx`,
+    `src/types/matbeast-desktop.d.ts`.)
+  - `dist/Mat Beast Scoreboard Setup 0.9.12.exe` (2026-04-23 — OT round
+    transitions preserve secondary ELAPSED. Switching between
+    overtime rounds (e.g. `OT ROUND1` → `OT ROUND 2` → `OT ROUND 3`)
+    via APPLY no longer zeroes the secondary ELAPSED clock. The reset
+    now only happens when entering OT from a non-OT round, or leaving
+    OT entirely. `reconcileBoardStateForRoundLabelChange` in
+    `src/lib/ot-round-label.ts` only resets
+    `otRoundElapsedBaseSeconds` and `otRoundElapsedRunStartedAt` when
+    `wasOt === false` (i.e. transitioning *into* OT mode). Transfer-
+    related fields (`otRoundTransferConsumed`,
+    `otRoundTransferUndo*`) still clear on every label change.
+    Selecting an OT round from the Round Label dropdown still engages
+    OT mode and shows the secondary timer on the next APPLY, as
+    before.)
   - `dist/Mat Beast Scoreboard Setup 0.9.11.exe` (2026-04-17 —
     Silenced the one-time "Reconnected to an existing cloud
     event" info dialog. 0.9.10's orphan-link sweep is working
@@ -280,6 +1104,269 @@
     `matbeast-masters` cloud service.)
   - `dist/Mat Beast Scoreboard Setup 0.6.0.exe` (2026-04-17 2:34 PM — DB
     schema-drift auto-heal + bundled-server.log rotation)
+
+## 2026-04-28 Session Updates (OT round transitions, overlay sizing, bracket music, preload hardening)
+
+### OT round transitions preserve secondary ELAPSED (v0.9.12)
+- **Bug:** Tapping APPLY while in `OT ROUND1` correctly left the
+  secondary ELAPSED counter alone (per the 2026-04-22 fix), but
+  switching to `OT ROUND 2` and tapping APPLY zeroed it again. The
+  operator expected ELAPSED to persist across all OT-to-OT round
+  transitions and reset only when entering or leaving OT mode.
+- **Fix:** `reconcileBoardStateForRoundLabelChange` in
+  `src/lib/ot-round-label.ts` now resets
+  `otRoundElapsedBaseSeconds` / `otRoundElapsedRunStartedAt` only
+  when `wasOt === false` (entering OT from a non-OT round). The
+  transfer-undo fields (`otRoundTransferConsumed`,
+  `otRoundTransferUndoMainSeconds`, `otRoundTransferUndoElapsedTotal`)
+  still clear on every label change.
+- **Verification:** OT ROUND1 ←→ OT ROUND2 ←→ OT ROUND3 transitions
+  via APPLY all preserve the secondary clock. Entering OT from
+  ROUND 1 / ROUND 2 / ROUND 3 still resets to zero.
+
+### Overlay output windows: pixel-accurate 1920 × 1080 across all DPI (v0.9.14)
+- **Bug:** On a 2560 × 1600 main display at 150% Windows scaling, the
+  scoreboard / bracket overlay windows rendered at **2880 × 1620
+  physical pixels** and overflowed the screen. Operator could only
+  see ~75% of the overlay; OBS / NDI capture would also receive the
+  oversized frame.
+- **Cause:** `BrowserWindow` `width` / `height` are **DIPs (Device
+  Independent Pixels)**, not physical pixels. A naive `width: 1920` on
+  a 1.5x-scaled display is 1920 × 1.5 = 2880 *physical* pixels.
+- **Fix:** `getScoreboardAndBracketBounds(display)` in
+  `electron/main.js` now divides `OVERLAY_NATIVE_W` / `OVERLAY_NATIVE_H`
+  by `display.scaleFactor` before constructing bounds. The window's
+  *physical* backing surface always lands on broadcast-canonical
+  1920 × 1080 regardless of operator display DPI. Existing event
+  listeners (`screen.on("display-metrics-changed")`,
+  `display-added`, `display-removed`) re-run the bounds calculation
+  whenever the display config changes, so the windows resize live
+  if the operator changes scaling mid-session.
+- **Trade-off / interaction with content:** The renderer's CSS
+  viewport gets smaller (e.g. 1280 × 720 at 150%); the existing
+  `transform: scale(s)` in `overlay-client.tsx` fits the 1920 × 1080
+  design canvas inside it. Chromium re-rasterizes vector content
+  (text, SVG) at `devicePixelRatio = scaleFactor` so visual quality
+  is preserved at the physical 1920 × 1080 output.
+
+### Bracket overlay music feature (v0.9.13)
+- **Goal:** Operator pairs a looping audio file with the bracket
+  overlay window so the bracket video and music can be sent as a
+  single NDI source, **without** the operator hearing it locally
+  (unless they explicitly enable monitoring).
+- **Persistence (`electron/main.js`):** `desktopPreferences` schema
+  extended with `bracketMusicFilePath`, `bracketMusicPlaying`
+  (default `true`), `bracketMusicMonitor` (default `false`).
+  `loadDesktopPreferences()` validates that the persisted path
+  still exists on disk; otherwise treats the configured file as
+  cleared. `persistDesktopPreferences()` writes the JSON marker
+  whenever the operator changes any of these.
+- **File serving:** Custom protocol `mat-beast-asset://music/track`
+  registered in `app.whenReady` via `protocol.handle`. Streams the
+  configured `bracketMusicFilePath` through `electronNet.fetch(file://…)`
+  so Chromium's `<audio>` element seeks reliably for loop playback,
+  Range requests work, and the renderer never sees the absolute
+  host path. `protocol.registerSchemesAsPrivileged` declares
+  `corsEnabled: true`, `stream: true`, `secure: true`,
+  `bypassCSP: true`, `supportFetchAPI: true`.
+- **IPC handlers (`bracket-music:` channel family):**
+  `bracket-music:get-state`, `bracket-music:choose-file` (opens
+  native `dialog.showOpenDialog` with audio-format filters),
+  `bracket-music:clear-file`, `bracket-music:set-playing`,
+  `bracket-music:set-monitor`. Every state-mutating handler
+  persists, then broadcasts a snapshot via `webContents.send` to
+  every live `BrowserWindow` on `bracket-music:state` so the
+  dashboard UI and the bracket overlay's audio engine never drift.
+- **Audio engine (`src/app/overlay/use-bracket-overlay-music.ts`):**
+  React hook activated only when the bracket output window is on
+  the bracket scene (`!isPreview && lockedOutputScene === "bracket"`).
+  Builds a one-time `HTMLAudioElement` + `AudioContext` graph,
+  loads `mat-beast-asset://music/track?r=<revision>` (revision
+  bumped on every persisted change, cache-busts the underlying
+  file). When `monitor: false`, calls `audioContext.setSinkId({
+  type: "none" })` so PCM still flows through the graph (future
+  NDI worklet tap) but doesn't hit any physical device. When
+  `monitor: true`, applies the operator's persisted audio output
+  via `applySelectedAudioOutputToContext`. Falls back to a
+  gain-mute path if `setSinkId({ type: "none" })` is unsupported
+  on a given Chromium build.
+- **Autoplay:** Bracket overlay BrowserWindow `webPreferences` now
+  includes `autoplayPolicy: "no-user-gesture-required"` so a
+  configured loop starts on launch without operator interaction.
+- **Dashboard controls (`DashboardFullWorkspace.tsx`):** Three
+  buttons in the Overlay-card header when `previewScene === "bracket"`:
+  `PLAY MUSIC` / `STOP MUSIC` (disabled until a file is chosen),
+  `CHOOSE MUSIC: <filename | NONE>` with a popover containing
+  `Browse...` (opens native picker) and `None` (clears),
+  `MONITOR ON / OFF`.
+
+### Bracket-music feature: SSR / preload diagnostic chase (v0.9.14 → v0.9.19)
+- **Symptom:** After installing v0.9.13, the music controls did not
+  appear in the Overlay-card header even after tapping SHOW BRACKET.
+  v0.9.14 made them appear. v0.9.15 disabled all of them with a
+  hint "Update the desktop app to enable bracket music." v0.9.16
+  always-enabled them but Browse / None / Play / Monitor clicks did
+  nothing — no native file picker opened. v0.9.17's diagnostic
+  reported `chooseBracketMusicFile is not a function on the bridge`.
+  v0.9.18's diagnostic reported `matBeastDesktop bridge not present
+  at all`.
+- **Root cause:** Several layered render-time bridge-presence
+  predicates. The dashboard component runs under Next.js 15 App
+  Router with `"use client"`, which means **the component renders
+  on the server first** (where `typeof window === "undefined"` and
+  `window.matBeastDesktop` is `undefined`), generates HTML with the
+  predicate's negative branch baked in, ships that HTML to the
+  Electron renderer, and hydrates. Hydration matches the server
+  HTML, so the negative branch persists until a state change
+  re-evaluates the predicate — which doesn't happen for a pure
+  derived const inside the function body.
+- **Fix progression:**
+  - **v0.9.14:** Render music row whenever `previewScene === "bracket"`,
+    use a fallback in-memory state until the IPC payload arrives.
+  - **v0.9.15:** Replace the narrow `onBracketMusicStateChange`-only
+    gate with a generic bridge-presence gate.
+  - **v0.9.16:** Remove the gate entirely. Buttons always render
+    enabled; clicks call optional-chained IPC methods that no-op
+    when the bridge is absent.
+  - **v0.9.17:** Add visible amber-italic `musicDiag` line that
+    logs every IPC step on click; harden the main-side handler with
+    explicit `mainWindow` parent (instead of
+    `BrowserWindow.getFocusedWindow()` which can return `null` when
+    a transient popover-button click stole focus on Windows) and
+    full try/catch returning structured `{ ok: false, error }`.
+  - **v0.9.18:** Renderer effect dumps `Object.keys(window.matBeastDesktop).sort()`
+    plus running app version (via `getRuntimeInfo`) when the
+    expected method is missing — converts "the bridge is broken"
+    into "here's exactly what's actually exposed."
+  - **v0.9.19 (the actual fix):** Hardened preload script.
+    `electron/preload.js` now wraps `require("electron")`,
+    `require("./matbeast-variant.js")`, the main-bridge expose, and
+    even the sentinel-bridge expose in independent try/catch blocks.
+    Always publishes a separate global
+    `__matBeastPreloadStatus = { ran, hasContextBridge, hasIpcRenderer,
+    preloadError, preloadVersion }` BEFORE attempting the main
+    bridge. The dashboard reads that sentinel in its diagnostic
+    effect and reports one of three actionable states: "preload
+    sentinel ABSENT" (preload script never ran in this renderer →
+    install / antivirus / wrong-process problem), "preload ran but
+    matBeastDesktop is missing" (with the actual `preloadError`
+    text), or "bridge keys (vX.Y.Z): …".
+- **Operator workflow that resolved it:** Quit any running
+  `Mat Beast Scoreboard.exe` via Task Manager → install
+  `Mat Beast Scoreboard Setup 0.9.19.exe` → launch fresh. The
+  amber diagnostic disappeared and Browse opened the native file
+  picker as expected. Confirmed by the user: "it works now."
+
+### Auto-update infrastructure restored (v0.9.19 GitHub release)
+- **Bug:** After installing 0.9.19, the in-app update check displayed
+  `Update error: Cannot find latest.yml in the latest release artifacts
+  (https://github.com/ken91773/matbeast/releases/download/v0.9.12/latest.yml):
+  HttpError: 404`. The latest *published* GitHub release was v0.9.12,
+  uploaded earlier via a manual `gh release create` that included
+  only the `.exe`; `electron-updater` requires `latest.yml` in the
+  release artifacts to determine the current version.
+- **Fix:** Published a proper v0.9.19 GitHub release with all three
+  artifacts the auto-updater expects:
+  - `latest.yml`
+  - `Mat-Beast-Scoreboard-Setup-0.9.19.exe`
+  - `Mat-Beast-Scoreboard-Setup-0.9.19.exe.blockmap`
+  Filenames use hyphens (not spaces) to match the reference in
+  `latest.yml`'s `files[].url` field. Release URL:
+  `https://github.com/ken91773/matbeast/releases/tag/v0.9.19`. After
+  this, the auto-updater finds `latest.yml`, sees that the running
+  app is already on the same version, and stays quiet on launch.
+- **Process note:** Future releases should always include all three
+  artifacts. `npm run desktop:publish` does the build + upload as
+  one step via electron-builder's native publisher (which gets
+  this right automatically); manual `gh release create` requires
+  passing all three files explicitly.
+
+### Overlay window framing trade-offs (no code change, design clarification)
+- Operator asked why the bracket overlay shows a native window frame
+  / drag handle but the scoreboard overlay does not.
+- **Answer:** Windows + Electron limitation —
+  `BrowserWindow({ transparent: true, frame: true })` is unsupported
+  on Windows; the OS won't render a native title bar on a layered
+  (transparent) window. The scoreboard overlay needs `transparent: true`
+  to preserve the alpha channel for OBS / NDI alpha keying, so it
+  must be `frame: false` and therefore non-draggable. The bracket
+  overlay is opaque (`backgroundColor: "#000000"`), so it can carry
+  a normal native frame.
+- The auto-positioning code already snaps both overlays back to the
+  canonical 1920 × 1080 spot on every launch / display-config change,
+  so manual dragging shouldn't be necessary.
+
+### NDI capture vs minimized windows (no code change, architecture note)
+- Today's behavior: external OBS / NDI Scan Converter captures the
+  visible Electron windows. With `backgroundThrottling: false`
+  (already set), Chromium keeps painting to the window's backing
+  surface even when the operator alt-tabs away, but **minimizing**
+  to the taskbar can stop frame production depending on the capture
+  method (BitBlt / DXGI desktop duplication stop; Windows Graphics
+  Capture / WGC keeps going).
+- Long-term plan: in-app NDI senders use **offscreen webContents**
+  (`webPreferences.offscreen: true`) which render at a fixed 1920 × 1080
+  buffer at a configurable frame rate regardless of any operator-
+  visible window. Visible scoreboard / bracket windows become pure
+  confidence monitors — operator can minimize / close / move them
+  freely without affecting the broadcast feed.
+
+## 2026-04-22 Session Updates (masters migration, control card OT, Electron focus)
+
+### Master list migration (production profiles vanishing)
+- **Bug:** `migrateMastersSplitIfNeeded()` treated any non-empty
+  `MasterPlayerProfile` / `MasterTeamName` after the split marker was
+  recorded on an **empty** DB as legacy data: it copied rows into
+  `Training*` and `deleteMany()`'d live `Master*` again. First GET
+  with empty masters set the marker; the first saved profile then
+  disappeared from the production list on the next API call (copy
+  showed up under `TrainingMasterPlayerProfile` instead).
+- **Fix:** If `AppSchemaMigration` already has `masters_live_training_split_v1`,
+  return immediately — the one-time copy-and-wipe runs only before that
+  marker exists. File: `src/lib/migrate-masters-split.ts`.
+
+### Control card: amber APPLY vs OT ← (two different actions)
+- **Amber APPLY** (`applyFighters` in `ControlPanel.tsx`) PATCHes fighter
+  fields (and round label only when it **actually changes** the board).
+  It must **not** clear the OT-round **ELAPSED** counter when the
+  operator is only saving fighters.
+- **← beside the match clock** (OT round mode only) sends
+  `command: { type: "ot_round_transfer_elapsed_to_main" }` — moves
+  accumulated OT elapsed into the main match clock and **zeros**
+  `otRoundElapsedBaseSeconds` (secondary readout shows `0:00`). Undo
+  still restores from `otRoundTransferUndo*`.
+- **Client:** `roundLabel` is included on APPLY only when `roundDirty`
+  **and** `roundLabel.trim() !== board.roundLabel.trim()`.
+- **Server:** `/api/board` PATCH runs `reconcileBoardStateForRoundLabelChange`
+  only when the trimmed incoming `roundLabel` differs from the stored
+  value; whitespace-only normalization updates the string without
+  reconcile. Files: `ControlPanel.tsx`, `src/app/api/board/route.ts`.
+- **Transfer math:** `otRoundElapsedTotalFromAnchoredBase()` in
+  `src/lib/ot-round-label.ts` folds `otRoundElapsedRunStartedAt` when
+  computing the seconds moved to the main clock (handles a paused main
+  timer with a stale run anchor).
+
+### Electron: dead keyboard in focused window (Windows)
+- Removed capture-phase `pointerdown` → `focusMainWindow()` from
+  `AppChrome.tsx` (raced Chromium focus into inputs).
+- `installMatbeastPanelPointerRecovery()` now defers
+  `restoreWebKeyboardFocus()` (IPC → `webContents.focus()`) on editable
+  `pointerdown` / `mousedown` / `focusin`, plus `window` `focus` and
+  `visibilitychange` → `visible`, with one IPC coalesced per tick.
+- Optional diagnostics: with `localStorage matbeastFocusDebug = "1"`,
+  `matbeast-focus` console lines include **keyboard-nudge** scheduling
+  / settle / reject. Files: `matbeast-panel-pointer-recovery.ts`,
+  `matbeast-focus-debug.ts`, `MatBeastFocusAndInputBridge.tsx`.
+
+### Dashboard: add-team modal input focus
+- After choosing **ADD TEAM** from the native `<select>`, blur the
+  select and focus the new-team name field on the next animation frame
+  so Electron routes keys into the dialog. File:
+  `DashboardTeamsPanel.tsx`.
+
+### Build
+Desktop `npm run desktop:build` (NSIS + signed `dist/Mat Beast Scoreboard
+Setup 0.9.11.exe`) verified after these changes.
 
 ## v0.8.9 — Cloud-only save pipeline, auto-link LOCAL ONLY tabs, no more close prompt (2026-04-17)
 
@@ -1659,4 +2746,4 @@ Use `/overlay` for output and `/overlay?preview=1` for dashboard preview.
 
 ---
 
-*Last updated: 2026-04-16 — v0.6.0 desktop build; overlay text polish, preview barn-door, 8-team bracket wiring, team color palette + contrast + persistence, custom icon embedding via afterPack + rcedit, app version in window title, inline update-check status line, timer-less event-driven autosave with skip-undo exemptions for timer/sound commands, roster Team/Academy UX fixes, and open-flow filename race fix (import-roster POST now skip-undo so autosave doesn't stomp `currentRosterFileName` back to `UNTITLED`).*
+*Last updated: 2026-04-28 — v0.9.19 desktop build + GitHub release; OT round transitions preserve secondary ELAPSED across OT-to-OT switches (v0.9.12), overlay output windows now pixel-accurate 1920 × 1080 across all display scaling factors via `display.scaleFactor` division (v0.9.14), bracket overlay music feature with operator-PC silent playback / NDI-ready audio graph / native file picker / `mat-beast-asset://` custom protocol / autoplay (v0.9.13), hardened preload script with always-on `__matBeastPreloadStatus` sentinel for actionable bridge diagnostics (v0.9.19), and `latest.yml` artifact restored to GitHub releases so `electron-updater` no longer 404s on launch.*

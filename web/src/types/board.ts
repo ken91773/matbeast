@@ -65,7 +65,26 @@ export type BoardPayload = {
   sound0Enabled: boolean;
   sound10PlayNonce: number;
   sound0PlayNonce: number;
+  /** True when `overtimeIndex === -1` (1:00 rest). */
   timerRestMode: boolean;
+  /** True when `overtimeIndex === -2` (OT minute: count up 0:00→1:00 internally as 60→0 remaining). */
+  timerOtCountUpMode: boolean;
+  /** True when `overtimeIndex === -3` (OT armed: 1:00 paused, pick +/− then play). */
+  timerOtArmedMode: boolean;
+  /** True when `overtimeIndex === -4` (OT minute count-down from current time). */
+  timerOtCountdownMode: boolean;
+  /** True when round label is OT ROUND1 / OT ROUND 2 / OT ROUND 3 (dual timer on control). */
+  timerOtRoundMode: boolean;
+  /** Elapsed seconds for OT round secondary timer (control card only). */
+  otRoundElapsedSeconds: number;
+  /** Green winner highlight on overlays; cleared by Reset 1:00 after an OT-round final. */
+  showFinalWinnerHighlight: boolean;
+  /** Increments when the control clock is jumped by preset buttons so timer sounds do not false-trigger. */
+  timerCuesResetNonce: number;
+  /** OT round: elapsed→main transfer is active; press arrow again (paused) to undo. */
+  otRoundTransferConsumed: boolean;
+  /** Meaningful when OT armed (-3): 1 = count-up, -1 = count-down after play. */
+  otPlayDirection: number;
   leftCrossedSilhouettes: number[];
   rightCrossedSilhouettes: number[];
   updatedAt: string;

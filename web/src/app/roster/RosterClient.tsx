@@ -1,16 +1,24 @@
 "use client";
 
 import type { BeltRank } from "@prisma/client";
-import { getMatBeastTournamentId, matbeastFetch } from "@/lib/matbeast-fetch";
+import {
+  getMatBeastTournamentId,
+  matbeastFetch,
+  MATBEAST_CLIENT_USE_TRAINING_MASTERS_HEADER,
+  MATBEAST_TOURNAMENT_HEADER,
+  setMatBeastTournamentId,
+} from "@/lib/matbeast-fetch";
 import { matbeastKeys } from "@/lib/matbeast-query-keys";
 import { matbeastJson } from "@/lib/matbeast-query";
 import { openScoreboardOverlayWindow } from "@/lib/open-scoreboard-overlay";
+import { useEventWorkspace } from "@/components/EventWorkspaceProvider";
 import { SkullCrossbonesIcon } from "@/components/icons/SkullCrossbonesIcon";
 import {
   forbiddenUserChosenTeamNameMessage,
   isForbiddenCustomTeamName,
   isForbiddenUserChosenTeamName,
 } from "@/lib/reserved-team-names";
+import { normalizeRosterDocumentLineups } from "@/lib/roster-lineup-normalize";
 import Link from "next/link";
 import {
   keepPreviousData,
@@ -216,6 +224,34 @@ export function RosterClient({
   dashboardLiveTournamentId?: string | null;
 }) {
   const rosterEventKind: RosterEventKind = "BLUE_BELT";
+  const { tournamentId: wsTournamentId, tournamentTrainingMode } = useEventWorkspace();
+  /**
+   * JSON.stringify drops keys with value `undefined`. If `useTrainingMasters` is omitted,
+   * `/api/players` master sync falls back to team→tournament DB and can write Training*
+   * while the dashboard tab is production — always send an explicit boolean.
+   */
+  const useTrainingMastersBodyFlag = tournamentTrainingMode === true;
+  const rosterScopeTournamentId = useMemo(
+    () =>
+      (dashboardLiveTournamentId && dashboardLiveTournamentId.trim()) ||
+      (wsTournamentId && wsTournamentId.trim()) ||
+      getMatBeastTournamentId()?.trim() ||
+      null,
+    [dashboardLiveTournamentId, wsTournamentId],
+  );
+  const mergeRosterMasterScopeInInit = useCallback(
+    (init?: RequestInit): RequestInit => {
+      if (!rosterScopeTournamentId) return init ?? {};
+      const headers = new Headers(init?.headers);
+      headers.set(MATBEAST_TOURNAMENT_HEADER, rosterScopeTournamentId);
+      headers.set(
+        MATBEAST_CLIENT_USE_TRAINING_MASTERS_HEADER,
+        useTrainingMastersBodyFlag ? "1" : "0",
+      );
+      return { ...init, headers };
+    },
+    [rosterScopeTournamentId, useTrainingMastersBodyFlag],
+  );
   const [teams, setTeams] = useState<Team[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -472,7 +508,8 @@ export function RosterClient({
     };
   }
 
-  async function applyDocumentToCurrentRoster(doc: RosterFileDocument) {
+  async function applyDocumentToCurrentRoster(docIn: RosterFileDocument) {
+    const doc = normalizeRosterDocumentLineups(docIn);
     const seedMap = new Map<number, Team>();
     for (const team of sortedTeams) {
       seedMap.set(team.seedOrder, team);
@@ -481,24 +518,14 @@ export function RosterClient({
       if (team.seedOrder < 1 || team.seedOrder > 8) {
         throw new Error("Team seeds must be between 1 and 8");
       }
-      const seenSlots = new Set<number>();
-      for (const player of team.players) {
-        if (!player.firstName.trim() || !player.lastName.trim()) {
-          throw new Error(`Seed ${team.seedOrder} has player missing names`);
-        }
-        if (player.lineupOrder == null) continue;
-        if (seenSlots.has(player.lineupOrder)) {
-          throw new Error(`Seed ${team.seedOrder} has duplicate lineup slots`);
-        }
-        seenSlots.add(player.lineupOrder);
-      }
     }
 
     for (const team of sortedTeams) {
       for (const p of team.players) {
-        const del = await matbeastFetch(`/api/players/${p.id}`, {
-        method: "DELETE",
-      });
+        const del = await matbeastFetch(
+          `/api/players/${p.id}`,
+          mergeRosterMasterScopeInInit({ method: "DELETE" }),
+        );
         if (!del.ok) {
           throw new Error("Failed clearing existing roster players");
         }
@@ -508,38 +535,58 @@ export function RosterClient({
     for (const docTeam of doc.teams) {
       const team = seedMap.get(docTeam.seedOrder);
       if (!team) continue;
-      const patch = await matbeastFetch(`/api/teams/${team.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: docTeam.name }),
-      });
+      const rosterTidForTeams =
+        (dashboardLiveTournamentId && dashboardLiveTournamentId.trim()) ||
+        (wsTournamentId && wsTournamentId.trim()) ||
+        "";
+      const patch = await matbeastFetch(
+        `/api/teams/${team.id}`,
+        mergeRosterMasterScopeInInit({
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: docTeam.name,
+            ...(rosterTidForTeams ? { tournamentId: rosterTidForTeams } : {}),
+            useTrainingMasters: useTrainingMastersBodyFlag,
+          }),
+        }),
+      );
       if (!patch.ok) {
         throw new Error(`Failed updating team #${docTeam.seedOrder}`);
       }
 
       for (const p of docTeam.players) {
-        const create = await matbeastFetch("/api/players", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            teamId: team.id,
-            firstName: p.firstName,
-            lastName: p.lastName,
-            nickname: p.nickname,
-            academyName: p.academyName,
-            unofficialWeight: p.unofficialWeight,
-            officialWeight: p.officialWeight,
-            heightFeet: p.heightFeet,
-            heightInches: p.heightInches,
-            age: p.age,
-            beltRank: p.beltRank,
-            profilePhotoUrl: p.profilePhotoUrl,
-            headShotUrl: p.headShotUrl,
-            lineupOrder: p.lineupOrder,
-            lineupConfirmed: p.lineupConfirmed,
-            weighedConfirmed: p.weighedConfirmed,
+        const rosterTid =
+          (dashboardLiveTournamentId && dashboardLiveTournamentId.trim()) ||
+          (wsTournamentId && wsTournamentId.trim()) ||
+          "";
+        const create = await matbeastFetch(
+          "/api/players",
+          mergeRosterMasterScopeInInit({
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ...(rosterTid ? { tournamentId: rosterTid } : {}),
+              useTrainingMasters: useTrainingMastersBodyFlag,
+              teamId: team.id,
+              firstName: p.firstName,
+              lastName: p.lastName,
+              nickname: p.nickname,
+              academyName: p.academyName,
+              unofficialWeight: p.unofficialWeight,
+              officialWeight: p.officialWeight,
+              heightFeet: p.heightFeet,
+              heightInches: p.heightInches,
+              age: p.age,
+              beltRank: p.beltRank,
+              profilePhotoUrl: p.profilePhotoUrl,
+              headShotUrl: p.headShotUrl,
+              lineupOrder: p.lineupOrder,
+              lineupConfirmed: p.lineupConfirmed,
+              weighedConfirmed: p.weighedConfirmed,
+            }),
           }),
-        });
+        );
         if (!create.ok) {
           const j = (await create.json()) as { error?: string };
           throw new Error(
@@ -629,11 +676,22 @@ export function RosterClient({
     body: { name?: string; seedOrder?: number },
   ) {
     setErr(null);
-    const res = await matbeastFetch(`/api/teams/${teamId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    const rosterTid =
+      (dashboardLiveTournamentId && dashboardLiveTournamentId.trim()) ||
+      (wsTournamentId && wsTournamentId.trim()) ||
+      "";
+    const res = await matbeastFetch(
+      `/api/teams/${teamId}`,
+      mergeRosterMasterScopeInInit({
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...body,
+          ...(rosterTid ? { tournamentId: rosterTid } : {}),
+          useTrainingMasters: useTrainingMastersBodyFlag,
+        }),
+      }),
+    );
     if (!res.ok) {
       const j = (await res.json()) as { error?: string };
       setErr(j.error ?? "Team update failed");
@@ -668,11 +726,22 @@ export function RosterClient({
     flags: { lineupConfirmed?: boolean; weighedConfirmed?: boolean },
   ) {
     setErr(null);
-    const res = await matbeastFetch(`/api/players/${playerId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(flags),
-    });
+    const rosterTid =
+      (dashboardLiveTournamentId && dashboardLiveTournamentId.trim()) ||
+      (wsTournamentId && wsTournamentId.trim()) ||
+      "";
+    const res = await matbeastFetch(
+      `/api/players/${playerId}`,
+      mergeRosterMasterScopeInInit({
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...flags,
+          useTrainingMasters: useTrainingMastersBodyFlag,
+          ...(rosterTid ? { tournamentId: rosterTid } : {}),
+        }),
+      }),
+    );
     if (!res.ok) {
       const j = (await res.json()) as { error?: string };
       setErr(j.error ?? "Could not update checkboxes");
@@ -1196,7 +1265,32 @@ function PlayerEntryForm({
   liveTournamentId?: string | null;
 }) {
   const queryClient = useQueryClient();
-  const masterScopeId = liveTournamentId ?? getMatBeastTournamentId();
+  const { tournamentId: workspaceTournamentId, tournamentTrainingMode } =
+    useEventWorkspace();
+  const masterScopeId =
+    (liveTournamentId && liveTournamentId.trim()) ||
+    (workspaceTournamentId && workspaceTournamentId.trim()) ||
+    getMatBeastTournamentId()?.trim() ||
+    null;
+  /** Master list APIs use `x-matbeast-tournament-id` for live vs training tables — must match the scoped tab, not only localStorage. */
+  const mergeMasterScopeInInit = useCallback(
+    (init?: RequestInit): RequestInit => {
+      if (!masterScopeId) return init ?? {};
+      const headers = new Headers(init?.headers);
+      headers.set(MATBEAST_TOURNAMENT_HEADER, masterScopeId);
+      headers.set(
+        MATBEAST_CLIENT_USE_TRAINING_MASTERS_HEADER,
+        tournamentTrainingMode ? "1" : "0",
+      );
+      return { ...init, headers };
+    },
+    [masterScopeId, tournamentTrainingMode],
+  );
+  /** Authoritative live vs training master tables — matches dashboard tab, not team FK alone. */
+  const masterListBodyFields = useMemo(
+    () => ({ useTrainingMasters: tournamentTrainingMode === true }),
+    [tournamentTrainingMode],
+  );
   const [editingId, setEditingId] = useState<string | null>(null);
   const [masterPickId, setMasterPickId] = useState("");
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
@@ -1226,6 +1320,7 @@ function PlayerEntryForm({
     useState(false);
   const [lineupMasterRemoveTarget, setLineupMasterRemoveTarget] = useState<{
     playerId: string;
+    teamId: string;
     masterProfileId: string | null;
     displayName: string;
   } | null>(null);
@@ -1247,20 +1342,23 @@ function PlayerEntryForm({
   >(() => new Set<BeltRank>([...ALL_BELT_OPTIONS]));
 
   const { data: teamsLivePayload } = useQuery({
-    queryKey: matbeastKeys.teams(liveTournamentId),
-    queryFn: () => matbeastJson<{ teams: Team[] }>("/api/teams"),
-    enabled: Boolean(showMasterProfilePicker && liveTournamentId),
+    queryKey: matbeastKeys.teams(masterScopeId),
+    queryFn: () =>
+      matbeastJson<{ teams: Team[] }>("/api/teams", {
+        headers: { [MATBEAST_TOURNAMENT_HEADER]: masterScopeId! },
+      }),
+    enabled: Boolean(showMasterProfilePicker && masterScopeId),
     placeholderData: keepPreviousData,
   });
 
   const teamsEffective = useMemo(() => {
-    if (showMasterProfilePicker && liveTournamentId && teamsLivePayload?.teams) {
+    if (showMasterProfilePicker && masterScopeId && teamsLivePayload?.teams) {
       return [...teamsLivePayload.teams].sort((a, b) => a.seedOrder - b.seedOrder);
     }
     return teams;
   }, [
     showMasterProfilePicker,
-    liveTournamentId,
+    masterScopeId,
     teamsLivePayload?.teams,
     teams,
   ]);
@@ -1289,8 +1387,17 @@ function PlayerEntryForm({
   }, [teamsEffective]);
 
   const { data: masterTeamPayload, refetch: refetchMasterTeamNames } = useQuery({
-    queryKey: matbeastKeys.masterTeamNames(masterScopeId),
-    queryFn: () => matbeastJson<{ names: string[] }>("/api/master-team-names"),
+    queryKey: matbeastKeys.masterTeamNames(masterScopeId, tournamentTrainingMode),
+    queryFn: () => {
+      const p = new URLSearchParams();
+      if (masterScopeId) p.set("tournamentId", masterScopeId);
+      p.set("useTrainingMasters", tournamentTrainingMode ? "1" : "0");
+      const qs = p.toString();
+      return matbeastJson<{ names: string[] }>(
+        `/api/master-team-names${qs ? `?${qs}` : ""}`,
+        mergeMasterScopeInInit(),
+      );
+    },
     enabled: Boolean(masterScopeId),
   });
   const masterTeamNames = useMemo<string[]>(
@@ -1391,10 +1498,32 @@ function PlayerEntryForm({
     return eff === savedStr;
   }, [rowOfficialWeightDrafts]);
 
+  const playerProfilesHintTeamId = useMemo(
+    () => (form.teamId.trim() || teams[0]?.id || "").trim(),
+    [form.teamId, teams],
+  );
+
   const { data: masterPayload, refetch: refetchMasterProfiles } = useQuery({
-    queryKey: matbeastKeys.playerProfiles(masterScopeId),
-    queryFn: () =>
-      matbeastJson<{ profiles: MasterPlayerProfileRow[] }>("/api/player-profiles"),
+    queryKey: matbeastKeys.playerProfiles(
+      masterScopeId,
+      playerProfilesHintTeamId,
+      tournamentTrainingMode,
+    ),
+    queryFn: () => {
+      const params = new URLSearchParams();
+      if (playerProfilesHintTeamId) {
+        params.set("teamId", playerProfilesHintTeamId);
+      }
+      if (masterScopeId) {
+        params.set("tournamentId", masterScopeId);
+      }
+      params.set("useTrainingMasters", tournamentTrainingMode ? "1" : "0");
+      const qs = params.toString();
+      return matbeastJson<{ profiles: MasterPlayerProfileRow[] }>(
+        `/api/player-profiles${qs ? `?${qs}` : ""}`,
+        mergeMasterScopeInInit(),
+      );
+    },
     enabled: showMasterProfilePicker && Boolean(masterScopeId),
   });
   const masterProfiles = useMemo<MasterPlayerProfileRow[]>(
@@ -1457,14 +1586,21 @@ function PlayerEntryForm({
     const n = name.trim().toUpperCase();
     if (!n || isForbiddenUserChosenTeamName(n)) return;
     try {
-      const res = await matbeastFetch("/api/master-team-names", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: n }),
-      });
+      const res = await matbeastFetch(
+        "/api/master-team-names",
+        mergeMasterScopeInInit({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: n,
+            ...masterListBodyFields,
+            ...(masterScopeId ? { tournamentId: masterScopeId } : {}),
+          }),
+        }),
+      );
       if (!res.ok) return;
       await queryClient.invalidateQueries({
-        queryKey: matbeastKeys.masterTeamNames(masterScopeId),
+        queryKey: matbeastKeys.masterTeamNames(masterScopeId, tournamentTrainingMode),
       });
       await refetchMasterTeamNames();
     } catch {
@@ -1491,27 +1627,41 @@ function PlayerEntryForm({
     const sorted = [...teamsEffective].sort((a, b) => a.seedOrder - b.seedOrder);
     const emptySlot = sorted.find((t) => isTeamSlotEmpty(t.name));
     if (emptySlot) {
-      const res = await matbeastFetch(`/api/teams/${emptySlot.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: want }),
-      });
+      const res = await matbeastFetch(
+        `/api/teams/${emptySlot.id}`,
+        mergeMasterScopeInInit({
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: want,
+            ...masterListBodyFields,
+            ...(masterScopeId ? { tournamentId: masterScopeId } : {}),
+          }),
+        }),
+      );
       if (!res.ok) {
         const j = (await res.json()) as { error?: string };
         throw new Error(j.error ?? "Could not assign team name to a slot");
       }
-      if (liveTournamentId) {
-        await queryClient.invalidateQueries({ queryKey: matbeastKeys.teams(liveTournamentId) });
+      if (masterScopeId) {
+        await queryClient.invalidateQueries({ queryKey: matbeastKeys.teams(masterScopeId) });
       }
       await onSaved();
       return emptySlot.id;
     }
 
-    const res = await matbeastFetch("/api/teams", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: want }),
-    });
+    const res = await matbeastFetch(
+      "/api/teams",
+      mergeMasterScopeInInit({
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: want,
+          ...masterListBodyFields,
+          ...(masterScopeId ? { tournamentId: masterScopeId } : {}),
+        }),
+      }),
+    );
     if (!res.ok) {
       const j = (await res.json()) as { error?: string };
       const msg = j.error ?? "Could not add team to event";
@@ -1523,8 +1673,8 @@ function PlayerEntryForm({
       throw new Error(msg);
     }
     const created = (await res.json()) as { id: string };
-    if (liveTournamentId) {
-      await queryClient.invalidateQueries({ queryKey: matbeastKeys.teams(liveTournamentId) });
+    if (masterScopeId) {
+      await queryClient.invalidateQueries({ queryKey: matbeastKeys.teams(masterScopeId) });
     }
     await onSaved();
     return created.id;
@@ -1772,15 +1922,30 @@ function PlayerEntryForm({
     setMasterProfileDeleteBusy(true);
     setFormErr(null);
     try {
-      const res = await matbeastFetch(`/api/player-profiles/${masterPickId}`, {
-        method: "DELETE",
-      });
+      const delParams = new URLSearchParams();
+      if (playerProfilesHintTeamId) {
+        delParams.set("teamId", playerProfilesHintTeamId);
+      }
+      if (masterScopeId) {
+        delParams.set("tournamentId", masterScopeId);
+      }
+      delParams.set("useTrainingMasters", tournamentTrainingMode ? "1" : "0");
+      const delQs = delParams.toString();
+      const delUrl = `/api/player-profiles/${masterPickId}${delQs ? `?${delQs}` : ""}`;
+      const res = await matbeastFetch(
+        delUrl,
+        mergeMasterScopeInInit({ method: "DELETE" }),
+      );
       if (!res.ok) {
         const j = (await res.json()) as { error?: string };
         throw new Error(j.error ?? "Delete failed");
       }
       await queryClient.invalidateQueries({
-        queryKey: matbeastKeys.playerProfiles(masterScopeId),
+        queryKey: matbeastKeys.playerProfiles(
+          masterScopeId,
+          playerProfilesHintTeamId,
+          tournamentTrainingMode,
+        ),
       });
       await refetchMasterProfiles();
       setMasterProfileDeleteDialogOpen(false);
@@ -1800,9 +1965,10 @@ function PlayerEntryForm({
     setFormErr(null);
     const { playerId, masterProfileId } = lineupMasterRemoveTarget;
     try {
-      const playerRes = await matbeastFetch(`/api/players/${playerId}`, {
-        method: "DELETE",
-      });
+      const playerRes = await matbeastFetch(
+        `/api/players/${playerId}`,
+        mergeMasterScopeInInit({ method: "DELETE" }),
+      );
       if (!playerRes.ok) {
         const j = (await playerRes.json()) as { error?: string };
         throw new Error(j.error ?? "Remove from roster failed");
@@ -1811,9 +1977,16 @@ function PlayerEntryForm({
         clearForm();
       }
       if (masterProfileId) {
+        const tid = lineupMasterRemoveTarget.teamId.trim();
+        const delMParams = new URLSearchParams();
+        if (tid) delMParams.set("teamId", tid);
+        if (masterScopeId) delMParams.set("tournamentId", masterScopeId);
+        delMParams.set("useTrainingMasters", tournamentTrainingMode ? "1" : "0");
+        const delMQs = delMParams.toString();
+        const delMasterUrl = `/api/player-profiles/${masterProfileId}${delMQs ? `?${delMQs}` : ""}`;
         const masterRes = await matbeastFetch(
-          `/api/player-profiles/${masterProfileId}`,
-          { method: "DELETE" },
+          delMasterUrl,
+          mergeMasterScopeInInit({ method: "DELETE" }),
         );
         if (!masterRes.ok) {
           const j = (await masterRes.json()) as { error?: string };
@@ -1824,12 +1997,16 @@ function PlayerEntryForm({
         }
       }
       await queryClient.invalidateQueries({
-        queryKey: matbeastKeys.playerProfiles(masterScopeId),
+        queryKey: matbeastKeys.playerProfiles(
+          masterScopeId,
+          playerProfilesHintTeamId,
+          tournamentTrainingMode,
+        ),
       });
       await refetchMasterProfiles();
-      if (liveTournamentId) {
+      if (masterScopeId) {
         await queryClient.invalidateQueries({
-          queryKey: matbeastKeys.teams(liveTournamentId),
+          queryKey: matbeastKeys.teams(masterScopeId),
         });
       }
       await onSaved();
@@ -1968,7 +2145,15 @@ function PlayerEntryForm({
         ? playerRowForOfficial.officialWeight
         : null;
 
+    const teamIdForMaster =
+      (form.teamId && form.teamId.trim()) ||
+      playerProfilesHintTeamId ||
+      teams[0]?.id ||
+      "";
+
     const payload = {
+      ...masterListBodyFields,
+      ...(masterScopeId ? { tournamentId: masterScopeId } : {}),
       teamId: form.teamId,
       firstName: fn,
       lastName: ln,
@@ -1990,32 +2175,44 @@ function PlayerEntryForm({
     };
 
     try {
+      if (masterScopeId) {
+        setMatBeastTournamentId(masterScopeId);
+      }
       if (editingId) {
-        const res = await matbeastFetch(`/api/players/${editingId}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
+        const res = await matbeastFetch(
+          `/api/players/${editingId}`,
+          mergeMasterScopeInInit({
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          }),
+        );
         if (!res.ok) {
           const j = (await res.json()) as { error?: string };
           throw new Error(j.error ?? "Save failed");
         }
       } else if (dupOnRoster) {
-        const res = await matbeastFetch(`/api/players/${dupOnRoster.id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
+        const res = await matbeastFetch(
+          `/api/players/${dupOnRoster.id}`,
+          mergeMasterScopeInInit({
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          }),
+        );
         if (!res.ok) {
           const j = (await res.json()) as { error?: string };
           throw new Error(j.error ?? "Save failed");
         }
       } else {
-        const res = await matbeastFetch("/api/players", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
+        const res = await matbeastFetch(
+          "/api/players",
+          mergeMasterScopeInInit({
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          }),
+        );
         if (!res.ok) {
           const j = (await res.json()) as { error?: string };
           throw new Error(j.error ?? "Create failed");
@@ -2024,41 +2221,50 @@ function PlayerEntryForm({
 
       const masterUrl = masterPickId ? `/api/player-profiles/${masterPickId}` : "/api/player-profiles";
       const masterMethod = masterPickId ? "PATCH" : "POST";
-      const masterRes = await matbeastFetch(masterUrl, {
-        method: masterMethod,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          firstName: payload.firstName,
-          lastName: payload.lastName,
-          nickname: payload.nickname,
-          academyName: payload.academyName,
-          unofficialWeight: payload.unofficialWeight,
-          heightFeet: payload.heightFeet,
-          heightInches: payload.heightInches,
-          age: payload.age,
-          beltRank: payload.beltRank,
-          profilePhotoUrl: payload.profilePhotoUrl,
-          headShotUrl: payload.headShotUrl,
+      const masterRes = await matbeastFetch(
+        masterUrl,
+        mergeMasterScopeInInit({
+          method: masterMethod,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...masterListBodyFields,
+            ...(masterScopeId ? { tournamentId: masterScopeId } : {}),
+            teamId: teamIdForMaster,
+            firstName: payload.firstName,
+            lastName: payload.lastName,
+            nickname: payload.nickname,
+            academyName: payload.academyName,
+            unofficialWeight: payload.unofficialWeight,
+            heightFeet: payload.heightFeet,
+            heightInches: payload.heightInches,
+            age: payload.age,
+            beltRank: payload.beltRank,
+            profilePhotoUrl: payload.profilePhotoUrl,
+            headShotUrl: payload.headShotUrl,
+          }),
         }),
-      });
+      );
       if (!masterRes.ok) {
+        let msg = `Master profile list could not be updated (${masterRes.status}).`;
         try {
           const j = (await masterRes.json()) as { error?: string };
-          console.warn(
-            "[roster] Master profile upsert:",
-            j.error ?? `${masterRes.status}`,
-          );
+          if (j.error) msg = j.error;
         } catch {
-          console.warn("[roster] Master profile upsert failed", masterRes.status);
+          /* keep msg */
         }
+        throw new Error(msg);
       }
       await queryClient.invalidateQueries({
-        queryKey: matbeastKeys.playerProfiles(masterScopeId),
+        queryKey: matbeastKeys.playerProfiles(
+          masterScopeId,
+          playerProfilesHintTeamId,
+          tournamentTrainingMode,
+        ),
       });
       await refetchMasterProfiles();
-      if (liveTournamentId) {
+      if (masterScopeId) {
         await queryClient.invalidateQueries({
-          queryKey: matbeastKeys.teams(liveTournamentId),
+          queryKey: matbeastKeys.teams(masterScopeId),
         });
       }
 
@@ -2120,18 +2326,25 @@ function PlayerEntryForm({
     setFlagBusyId(playerId);
     setFormErr(null);
     try {
-      const res = await matbeastFetch(`/api/players/${playerId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ officialWeight: next }),
-      });
+      const res = await matbeastFetch(
+        `/api/players/${playerId}`,
+        mergeMasterScopeInInit({
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...masterListBodyFields,
+            ...(masterScopeId ? { tournamentId: masterScopeId } : {}),
+            officialWeight: next,
+          }),
+        }),
+      );
       if (!res.ok) {
         const j = (await res.json()) as { error?: string };
         throw new Error(j.error ?? "Weight update failed");
       }
-      if (liveTournamentId) {
+      if (masterScopeId) {
         await queryClient.invalidateQueries({
-          queryKey: matbeastKeys.teams(liveTournamentId),
+          queryKey: matbeastKeys.teams(masterScopeId),
         });
       }
       await onSaved();
@@ -2153,9 +2366,10 @@ function PlayerEntryForm({
     setFlagBusyId(playerId);
     setFormErr(null);
     try {
-      const res = await matbeastFetch(`/api/players/${playerId}`, {
-        method: "DELETE",
-      });
+      const res = await matbeastFetch(
+        `/api/players/${playerId}`,
+        mergeMasterScopeInInit({ method: "DELETE" }),
+      );
       if (!res.ok) {
         const j = (await res.json()) as { error?: string };
         throw new Error(j.error ?? "Delete failed");
@@ -2163,9 +2377,9 @@ function PlayerEntryForm({
       if (editingId === playerId) {
         clearForm();
       }
-      if (liveTournamentId) {
+      if (masterScopeId) {
         void queryClient.invalidateQueries({
-          queryKey: matbeastKeys.teams(liveTournamentId),
+          queryKey: matbeastKeys.teams(masterScopeId),
         });
       }
       await onSaved();
@@ -2188,11 +2402,18 @@ function PlayerEntryForm({
     setFlagBusyId(playerId);
     setFormErr(null);
     try {
-      const res = await matbeastFetch(`/api/players/${playerId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ lineupOrder: toLineupOrder }),
-      });
+      const res = await matbeastFetch(
+        `/api/players/${playerId}`,
+        mergeMasterScopeInInit({
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...masterListBodyFields,
+            ...(masterScopeId ? { tournamentId: masterScopeId } : {}),
+            lineupOrder: toLineupOrder,
+          }),
+        }),
+      );
       if (!res.ok) {
         const j = (await res.json()) as { error?: string };
         throw new Error(j.error ?? "Seed reorder failed");
@@ -2200,9 +2421,9 @@ function PlayerEntryForm({
       if (editingId === playerId) {
         // lineup order is managed by drag/drop roster list and auto sequencing
       }
-      if (liveTournamentId) {
+      if (masterScopeId) {
         void queryClient.invalidateQueries({
-          queryKey: matbeastKeys.teams(liveTournamentId),
+          queryKey: matbeastKeys.teams(masterScopeId),
         });
       }
       await onSaved();
@@ -2657,6 +2878,7 @@ function PlayerEntryForm({
                             onClick={() => {
                               setLineupMasterRemoveTarget({
                                 playerId: p.id,
+                                teamId: p.teamId,
                                 masterProfileId: lineupMasterMatch?.id ?? null,
                                 displayName: listLabel(p),
                               });
@@ -2792,7 +3014,11 @@ function PlayerEntryForm({
                 className="inline-flex shrink-0 items-center justify-center rounded border border-zinc-600 p-0.5 text-zinc-400 hover:border-teal-700/50 hover:text-teal-200 disabled:opacity-30"
                 onClick={() => {
                   void queryClient.invalidateQueries({
-                    queryKey: matbeastKeys.playerProfiles(masterScopeId),
+                    queryKey: matbeastKeys.playerProfiles(
+                      masterScopeId,
+                      playerProfilesHintTeamId,
+                      tournamentTrainingMode,
+                    ),
                   });
                   void refetchMasterProfiles();
                 }}
@@ -3160,9 +3386,10 @@ function PlayerEntryForm({
               }
               onClick={async () => {
                 if (!confirm("Remove this player from the roster?")) return;
-                await matbeastFetch(`/api/players/${editingId}`, {
-                  method: "DELETE",
-                });
+                await matbeastFetch(
+                  `/api/players/${editingId}`,
+                  mergeMasterScopeInInit({ method: "DELETE" }),
+                );
                 clearForm();
                 await onSaved();
               }}

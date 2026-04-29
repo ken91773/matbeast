@@ -12,7 +12,7 @@ import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
  *    (Clerk session required, returns 404 if absent). It exists to test
  *    Clerk specifically.
  *  - All other protected routes (master profiles, master team names,
- *    desktop-tokens admin) do their own auth check inside the handler via
+ *    desktop-tokens API) do their own auth check inside the handler via
  *    `requireUserId()` from src/lib/auth.ts. That helper accepts either
  *    a Clerk session OR an `Authorization: Bearer mbk_...` desktop token,
  *    and returns 401 (NOT 404) when nothing valid is presented. This is
@@ -23,9 +23,8 @@ import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
  *  - `/`                 (landing page)
  *  - `/sign-in/*`
  *  - `/sign-up/*`
- *  - `/desktop-tokens`   (the admin page itself; the API behind it is
- *                         protected, so unauthenticated visitors just see
- *                         "Please sign in" inside the page)
+ *  - `/desktop-tokens`   (sign-in to mint tokens; the API is protected so
+ *                         unauthenticated visitors see a short sign-in prompt)
  *  - `/api/health`       (uptime check must never require auth)
  */
 const isHardProtectedRoute = createRouteMatcher(["/api/me(.*)"]);

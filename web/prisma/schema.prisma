@@ -360,6 +360,22 @@ model LiveScoreboardState {
   sound0Enabled        Boolean @default(true)
   sound10PlayNonce     Int @default(0)
   sound0PlayNonce      Int @default(0)
+  /// When overtimeIndex is -3 (OT armed, 1:00 paused): 1 = count-up after play, -1 = count-down.
+  otPlayDirection Int @default(1)
+
+  /// Elapsed-time counter for OT ROUND1 / OT ROUND 2 / OT ROUND 3 (control card only); base when paused.
+  otRoundElapsedBaseSeconds Int @default(0)
+  otRoundElapsedRunStartedAt DateTime?
+  /// When false, scoreboard does not show the green winner highlight (e.g. after Reset 1:00 in OT round).
+  showFinalWinnerHighlight Boolean @default(true)
+  /// Bumped when the match clock is set by controls (not wall-clock run); resets timer cue edge detection.
+  timerCuesResetNonce Int @default(0)
+  /// OT round: elapsed→main transfer is applied; second arrow press undoes while paused.
+  otRoundTransferConsumed Boolean @default(false)
+  /// OT round: main `timerSeconds` before elapsed→main transfer (for second-press undo).
+  otRoundTransferUndoMainSeconds Int?
+  /// OT round: total elapsed seconds moved to main (restored to secondary base on undo).
+  otRoundTransferUndoElapsedTotal Int?
 
   updatedAt DateTime @updatedAt
 }

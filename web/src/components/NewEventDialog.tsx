@@ -1,6 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { createPortal } from "react-dom";
 import { pickNextDatedFilename } from "@/lib/matbeast-dashboard-file-actions";
 
 /**
@@ -25,10 +33,13 @@ import { pickNextDatedFilename } from "@/lib/matbeast-dashboard-file-actions";
  */
 export default function NewEventDialog({
   open,
+  submitting = false,
   onClose,
   onSubmit,
 }: {
   open: boolean;
+  /** Parent is creating the event — block double Enter / double Create. */
+  submitting?: boolean;
   onClose: () => void;
   onSubmit: (result: {
     eventName: string;
@@ -42,10 +53,23 @@ export default function NewEventDialog({
   const [loadingDefaults, setLoadingDefaults] = useState<boolean>(false);
   const [trainingMode, setTrainingMode] = useState(false);
   const eventNameInputRef = useRef<HTMLInputElement | null>(null);
+  /** Ensure we only auto-focus/select the title once per open — repeating after
+   * `loadingDefaults` flips fights the user's typing (delete works, new keys don't). */
+  const didInitialEventTitleFocusRef = useRef(false);
+  /** Render under document.body so flex children / overflow cannot stack above the modal. */
+  const [portalRoot, setPortalRoot] = useState<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    setPortalRoot(document.body);
+  }, []);
 
   const refreshCatalogNames = useCallback(async () => {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 15000);
     try {
-      const r = await fetch("/api/cloud/events", { cache: "no-store" });
+      const r = await fetch("/api/cloud/events", {
+        cache: "no-store",
+        signal: controller.signal,
+      });
       if (!r.ok) {
         setExistingNames([]);
         return [] as string[];
@@ -63,6 +87,8 @@ export default function NewEventDialog({
     } catch {
       setExistingNames([]);
       return [] as string[];
+    } finally {
+      window.clearTimeout(timeoutId);
     }
   }, []);
 
@@ -70,6 +96,7 @@ export default function NewEventDialog({
   // creating one event produces the next sequential `MMDD-N`.
   useEffect(() => {
     if (!open) {
+      didInitialEventTitleFocusRef.current = false;
       // Closing while the catalog fetch is in flight must not leave
       // `loadingDefaults` stuck true — the filename field stays disabled
       // and feels like "typing doesn't work" on the next open.
@@ -115,24 +142,32 @@ export default function NewEventDialog({
       );
   }, [open, refreshCatalogNames]);
 
-  // Autofocus + select the event title when the dialog opens so the
-  // user can immediately start typing. Matches the rename dialog's
-  // double-tick `autoFocus` + `setSelectionRange` pattern to survive
-  // Electron's window-focus race.
-  useEffect(() => {
+  // Autofocus + select-all once per dialog session, after the catalog load
+  // finishes (`loadingDefaults` false). Do not re-run on later re-renders or
+  // we keep resetting selection and block normal typing.
+  useLayoutEffect(() => {
     if (!open) return;
+    if (loadingDefaults) return;
+    if (didInitialEventTitleFocusRef.current) return;
     const el = eventNameInputRef.current;
     if (!el) return;
-    const t = window.setTimeout(() => {
-      try {
-        el.focus();
-        el.setSelectionRange(0, el.value.length);
-      } catch {
-        /* best-effort */
-      }
-    }, 40);
-    return () => window.clearTimeout(t);
-  }, [open]);
+    didInitialEventTitleFocusRef.current = true;
+    let id2 = 0;
+    const id1 = window.requestAnimationFrame(() => {
+      id2 = window.requestAnimationFrame(() => {
+        try {
+          el.focus();
+          el.setSelectionRange(0, el.value.length);
+        } catch {
+          /* best-effort */
+        }
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(id1);
+      window.cancelAnimationFrame(id2);
+    };
+  }, [open, loadingDefaults]);
 
   const trimmedFilename = filename.trim();
   const trimmedEventName = eventName.trim() || "UNTITLED EVENT";
@@ -154,32 +189,48 @@ export default function NewEventDialog({
     !loadingDefaults && trimmedFilename.length > 0 && !collides;
 
   const handleSubmit = useCallback(() => {
-    if (!canSubmit) return;
+    if (!canSubmit || submitting) return;
     onSubmit({
       eventName: trimmedEventName,
       filename: trimmedFilename,
       trainingMode,
     });
-  }, [canSubmit, onSubmit, trimmedEventName, trimmedFilename, trainingMode]);
+  }, [
+    canSubmit,
+    submitting,
+    onSubmit,
+    trimmedEventName,
+    trimmedFilename,
+    trainingMode,
+  ]);
 
   if (!open) return null;
-  return (
+  if (!portalRoot) return null;
+
+  return createPortal(
     <div
-      className="fixed inset-0 z-[700] flex items-center justify-center bg-black/60 p-4"
+      className="fixed inset-0 z-[2147483646] flex items-center justify-center bg-black/60 p-4"
       role="dialog"
       aria-modal="true"
       aria-label="Create new event"
       onKeyDown={(e) => {
         if (e.key === "Escape") {
           e.stopPropagation();
-          onClose();
+          if (!submitting) onClose();
         } else if (e.key === "Enter" && !e.shiftKey) {
           e.stopPropagation();
+          if (submitting) {
+            e.preventDefault();
+            return;
+          }
           handleSubmit();
         }
       }}
     >
-      <div className="w-full max-w-md overflow-hidden rounded-lg border border-zinc-600 bg-[#2d2d2d] shadow-2xl">
+      <div
+        className="w-full max-w-md overflow-hidden rounded-lg border border-zinc-600 bg-[#2d2d2d] shadow-2xl"
+        data-matbeast-new-event-dialog
+      >
         <div className="border-b border-zinc-600 px-4 py-2.5">
           <h2 className="text-sm font-semibold text-white">New event</h2>
         </div>
@@ -244,8 +295,9 @@ export default function NewEventDialog({
         <div className="flex items-center justify-end gap-2 border-t border-zinc-600 px-3 py-2">
           <button
             type="button"
-            className="rounded px-2 py-1 text-[11px] text-zinc-300 hover:bg-white/10"
+            className="rounded px-2 py-1 text-[11px] text-zinc-300 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
             onClick={onClose}
+            disabled={submitting}
           >
             Cancel
           </button>
@@ -253,12 +305,13 @@ export default function NewEventDialog({
             type="button"
             className="rounded bg-[#1473e6] px-3 py-1 text-[11px] font-medium text-white hover:bg-[#0d5fbd] disabled:cursor-not-allowed disabled:opacity-50"
             onClick={handleSubmit}
-            disabled={!canSubmit}
+            disabled={!canSubmit || submitting}
           >
             Create
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    portalRoot,
   );
 }

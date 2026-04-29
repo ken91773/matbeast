@@ -1,9 +1,49 @@
-const { app, BrowserWindow, Menu, shell, ipcMain, dialog, screen } = require("electron");
+const {
+  app,
+  BrowserWindow,
+  Menu,
+  shell,
+  ipcMain,
+  dialog,
+  screen,
+  session,
+  protocol,
+  net: electronNet,
+} = require("electron");
 const http = require("http");
 
 /** Let timers, rAF, and Web Audio run while windows are in the background (timer sounds, board poll). */
 app.commandLine.appendSwitch("disable-renderer-backgrounding");
 app.commandLine.appendSwitch("disable-background-timer-throttling");
+/** Cap Chromium HTTP disk cache under userData (otherwise Cache/ can grow to hundreds of MB). */
+app.commandLine.appendSwitch(
+  "disk-cache-size",
+  String(100 * 1024 * 1024),
+);
+
+/**
+ * `mat-beast-asset://` is the renderer's only window onto the host filesystem
+ * for media playback. It is registered as a privileged scheme so the
+ * `<audio>` element can stream the file the operator picked for the bracket
+ * overlay music loop. `stream: true` enables Range request handling for
+ * looping playback; `corsEnabled` lets the renderer fetch it cross-origin
+ * from the http://localhost:port page the bundled Next server serves.
+ *
+ * Must be called *before* `app.ready`; the protocol handler is wired in
+ * after `app.whenReady()` (see `registerBracketMusicProtocol`).
+ */
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: "mat-beast-asset",
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+    },
+  },
+]);
 const net = require("net");
 const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
@@ -11,6 +51,11 @@ const os = require("os");
 const path = require("path");
 const { autoUpdater } = require("electron-updater");
 const { isDemo } = require("./matbeast-variant.js");
+const { runOffscreenSmokeTest } = require("./ndi-smoke.js");
+const ndiFeed = require("./ndi-feed.js");
+const ndiTestPattern = require("./ndi-test-pattern.js");
+const ndiAdapters = require("./ndi-adapters.js");
+const ndiConfig = require("./ndi-config.js");
 
 const devAppUrl = process.env.MAT_BEAST_DESKTOP_URL || "http://localhost:3000";
 const appIconPath = app.isPackaged
@@ -50,6 +95,39 @@ let bundledServerProcess = null;
 const DESKTOP_PREFERENCES_FILE = "desktop-preferences.json";
 let desktopPreferences = {
   autoSaveEvery5Minutes: false,
+  /**
+   * Bracket overlay music: a path to an audio file on the host machine that
+   * loops on the bracket output window. `null` means no track selected.
+   * `bracketMusicPlaying` is the operator's PLAY/STOP toggle (defaults on so
+   * a configured track auto-loops on app launch). `bracketMusicMonitor` lets
+   * the operator hear the track locally for sound-check; off by default so
+   * the music goes only to the bracket NDI source / capture target.
+   */
+  bracketMusicFilePath: null,
+  bracketMusicPlaying: true,
+  bracketMusicMonitor: false,
+  /**
+   * NDI network-adapter binding (v0.9.33+). Determines which NIC NDI
+   * announces / streams on. Same payload shape `ndi-adapters.resolveBinding`
+   * understands:
+   *
+   *   - `{ kind: "auto" }` (default) → app picks Ethernet > Wi-Fi > any
+   *     routable adapter at startup. Reflects whatever DHCP gave us
+   *     this session — when the operator plugs in the tournament router
+   *     and Ethernet gets a real IP, "auto" picks Ethernet over Wi-Fi
+   *     automatically without operator action.
+   *   - `{ kind: "ip", ip: "10.0.0.20" }` → pin to a specific IP. Used
+   *     when the operator clicks a specific adapter in the menu.
+   *   - `{ kind: "adapter", adapterName: "Ethernet" }` → pin to a named
+   *     adapter regardless of its current IP. Useful when DHCP changes
+   *     the IP between sessions but the adapter name is stable.
+   *
+   * The resolved IP is written to a private `ndi-config.v1.json` under
+   * `<userData>/ndi-config/` and `NDI_CONFIG_DIR` is set so NDI's
+   * runtime reads our config instead of the system-wide one. See
+   * `electron/ndi-config.js` for the file-format details.
+   */
+  ndiBindAdapter: { kind: "auto" },
 };
 let updateState = {
   status: "idle",
@@ -68,14 +146,54 @@ function loadDesktopPreferences() {
     const raw = fs.readFileSync(filePath, "utf8");
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object") {
+      const rawMusicPath =
+        typeof parsed.bracketMusicFilePath === "string" &&
+        parsed.bracketMusicFilePath.trim()
+          ? parsed.bracketMusicFilePath
+          : null;
       desktopPreferences = {
         ...desktopPreferences,
         autoSaveEvery5Minutes: Boolean(parsed.autoSaveEvery5Minutes),
+        /**
+         * If the previously stored audio file no longer exists (moved /
+         * deleted between sessions) treat it as "no track" rather than
+         * silently failing on first play. The operator will see the
+         * dashboard report `NONE` and can pick a new track.
+         */
+        bracketMusicFilePath:
+          rawMusicPath && fs.existsSync(rawMusicPath) ? rawMusicPath : null,
+        bracketMusicPlaying:
+          typeof parsed.bracketMusicPlaying === "boolean"
+            ? parsed.bracketMusicPlaying
+            : true,
+        bracketMusicMonitor: Boolean(parsed.bracketMusicMonitor),
+        ndiBindAdapter: normalizeNdiBindAdapter(parsed.ndiBindAdapter),
       };
     }
   } catch {
     // ignore
   }
+}
+
+/**
+ * Validate / coerce a stored `ndiBindAdapter` payload. Anything we
+ * don't recognise collapses to `{ kind: "auto" }` so a corrupted JSON
+ * file can't brick the NDI feature.
+ */
+function normalizeNdiBindAdapter(value) {
+  if (!value || typeof value !== "object") return { kind: "auto" };
+  if (value.kind === "auto") return { kind: "auto" };
+  if (value.kind === "ip" && typeof value.ip === "string" && value.ip.length > 0) {
+    return { kind: "ip", ip: value.ip };
+  }
+  if (
+    value.kind === "adapter" &&
+    typeof value.adapterName === "string" &&
+    value.adapterName.length > 0
+  ) {
+    return { kind: "adapter", adapterName: value.adapterName };
+  }
+  return { kind: "auto" };
 }
 
 function persistDesktopPreferences() {
@@ -85,6 +203,276 @@ function persistDesktopPreferences() {
     fs.writeFileSync(filePath, JSON.stringify(desktopPreferences, null, 2), "utf8");
   } catch {
     // ignore
+  }
+}
+
+/**
+ * Bracket overlay music — host filesystem audio loop.
+ *
+ * The bracket overlay's renderer plays the file via a chrome-less <audio>
+ * element. The renderer never sees the absolute path; it requests
+ * `mat-beast-asset://music/track` and the protocol handler streams whatever
+ * file is currently configured. That keeps the renderer side stateless and
+ * avoids leaking arbitrary host paths through the renderer sandbox boundary.
+ *
+ * State changes are pushed to *every* live BrowserWindow via
+ * `webContents.send("bracket-music:state", …)` so both the dashboard
+ * (operator UI) and the bracket overlay (audio engine) stay in sync without
+ * either polling.
+ */
+const BRACKET_MUSIC_STATE_CHANNEL = "bracket-music:state";
+const BRACKET_MUSIC_AUDIO_FILTERS = [
+  {
+    name: "Audio files",
+    extensions: ["mp3", "m4a", "aac", "ogg", "oga", "wav", "flac", "webm", "opus"],
+  },
+  { name: "All files", extensions: ["*"] },
+];
+/** Display name for the bundled "DEFAULT" track in the dashboard popover. */
+const BRACKET_MUSIC_DEFAULT_DISPLAY_NAME = "DEFAULT";
+
+/**
+ * Resolve the absolute path to the bundled default bracket-music track.
+ *
+ * - **Packaged build:** the file lives under `<resources>/default-music/tale.mp3`
+ *   thanks to the `extraResources` entry in `package.json`'s `build` block.
+ * - **Dev (`desktop:dev`):** `process.resourcesPath` is Electron's bundle
+ *   directory, which doesn't have our default-music folder. Fall back to
+ *   the project source path so the feature still works during local
+ *   development. The `__dirname` is `electron/`, so the project root is
+ *   one level up.
+ *
+ * Returns `null` if no usable file is found in either location, so the
+ * IPC handler can degrade gracefully (treat "use default" as "no track")
+ * instead of putting a broken path into preferences.
+ */
+function getBundledDefaultBracketMusicPath() {
+  const candidates = [];
+  if (process.resourcesPath) {
+    candidates.push(path.join(process.resourcesPath, "default-music", "tale.mp3"));
+  }
+  candidates.push(path.join(__dirname, "..", "build", "default-music", "tale.mp3"));
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+/**
+ * Whether the currently-configured bracket-music path matches the bundled
+ * default. Used to render the dashboard's CHOOSE MUSIC label as
+ * "DEFAULT" instead of the raw `tale.mp3` filename so operators
+ * understand they're on the bundled track.
+ */
+function isCurrentBracketMusicTheDefault() {
+  const current = desktopPreferences.bracketMusicFilePath;
+  const def = getBundledDefaultBracketMusicPath();
+  if (!current || !def) return false;
+  return path.resolve(current) === path.resolve(def);
+}
+
+function bracketMusicSnapshot() {
+  const filePath = desktopPreferences.bracketMusicFilePath;
+  const isDefault = isCurrentBracketMusicTheDefault();
+  return {
+    filePath: typeof filePath === "string" && filePath ? filePath : null,
+    fileName:
+      typeof filePath === "string" && filePath
+        ? isDefault
+          ? BRACKET_MUSIC_DEFAULT_DISPLAY_NAME
+          : path.basename(filePath)
+        : null,
+    /** Bumped on every persisted change so the renderer can cache-bust the
+     * `<audio>` src and force a reload when the underlying file changes
+     * even though the URL (`mat-beast-asset://music/track`) stays stable. */
+    revision:
+      typeof bracketMusicSnapshot.revision === "number"
+        ? bracketMusicSnapshot.revision
+        : 0,
+    playing: Boolean(desktopPreferences.bracketMusicPlaying),
+    monitor: Boolean(desktopPreferences.bracketMusicMonitor),
+  };
+}
+bracketMusicSnapshot.revision = 0;
+
+function broadcastBracketMusicState() {
+  bracketMusicSnapshot.revision += 1;
+  const snapshot = bracketMusicSnapshot();
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win || win.isDestroyed()) continue;
+    try {
+      win.webContents.send(BRACKET_MUSIC_STATE_CHANNEL, snapshot);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * NDI status broadcast (v0.9.33+).
+ *
+ * Channel `matbeast:ndi:state` carries a single snapshot describing the
+ * NDI binding the operator should care about: which adapter is in use,
+ * its friendly name (Wi-Fi / Ethernet / etc.), and whether each scene's
+ * NDI source is currently broadcasting. The dashboard consumes this in
+ * the Overlay-card header (status pill) so the operator can see at a
+ * glance whether NDI is configured for cross-PC delivery.
+ *
+ * Push triggers (any of):
+ *   - Adapter binding changed via `Options ▸ NDI ▸ Network adapter`.
+ *   - A feed started or stopped (`toggleNdiFeed`).
+ *   - Periodic refresh (every NDI_STATE_REFRESH_MS) so the pill catches
+ *     OS-level NIC changes (cable unplugged, Wi-Fi reconnected, DHCP
+ *     gave us a new IP) without the operator having to interact with
+ *     a menu.
+ */
+const NDI_STATE_CHANNEL = "matbeast:ndi:state";
+const NDI_STATE_REFRESH_MS = 5000;
+let ndiStateRefreshTimer = null;
+
+/**
+ * Build the snapshot. Cheap (under 1 ms on dev hardware): just an
+ * `os.networkInterfaces()` walk plus a few feature checks. Safe to
+ * call from inside an IPC handler or on a 5 s timer without throttling.
+ */
+function buildNdiStateSnapshot() {
+  const adapters = ndiAdapters.enumerateAdapters();
+  const preference = desktopPreferences.ndiBindAdapter || { kind: "auto" };
+  const resolved = ndiAdapters.resolveBinding(adapters, preference);
+  /** Feed running state — read directly from `ndi-feed.js` so we never
+   *  drift from the actual sender lifecycle (e.g. if a feed crashed). */
+  const scoreboardRunning = ndiFeed.isFeedRunning("scoreboard");
+  const bracketRunning = ndiFeed.isFeedRunning("bracket");
+  return {
+    /** "auto" or operator's pinned choice — what's saved in prefs. */
+    preference,
+    /** The adapter / IP the binding currently resolves to, or null if
+     *  nothing routable is available (NDI will fall back to default
+     *  multi-NIC mDNS announce). */
+    resolved: resolved
+      ? {
+          adapterName: resolved.adapterName,
+          friendlyName: resolved.friendlyName,
+          ip: resolved.ip,
+          type: resolved.type,
+          isApipa: resolved.isApipa,
+          isLoopback: resolved.isLoopback,
+          isLikelyVirtual: resolved.isLikelyVirtual,
+          isRoutable: resolved.isRoutable,
+        }
+      : null,
+    /** All routable+APIPA adapters, sorted by preferenceRank. The menu
+     *  and the status dialog use this to draw the picker. */
+    adapters: adapters.map((a) => ({
+      adapterName: a.adapterName,
+      friendlyName: a.friendlyName,
+      ip: a.ip,
+      type: a.type,
+      isApipa: a.isApipa,
+      isLoopback: a.isLoopback,
+      isLikelyVirtual: a.isLikelyVirtual,
+      isRoutable: a.isRoutable,
+    })),
+    feeds: {
+      scoreboard: { running: scoreboardRunning },
+      bracket: { running: bracketRunning },
+    },
+    /** Echo of NDI_CONFIG_DIR so the operator can copy the path into
+     *  Explorer if they want to inspect the active config file. */
+    configDir: process.env.NDI_CONFIG_DIR || null,
+  };
+}
+
+function broadcastNdiState() {
+  const snapshot = buildNdiStateSnapshot();
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win || win.isDestroyed()) continue;
+    try {
+      win.webContents.send(NDI_STATE_CHANNEL, snapshot);
+    } catch {
+      /* ignore — renderer not ready yet */
+    }
+  }
+  return snapshot;
+}
+
+/**
+ * Apply the saved binding preference to the NDI runtime config file
+ * and the `NDI_CONFIG_DIR` env var. Idempotent — safe to call on every
+ * preference change. MUST run before `grandiose` is required for the
+ * first time so `NDIlib_initialize()` reads our `ndi-config.v1.json`.
+ */
+function applySavedNdiBinding() {
+  try {
+    const adapters = ndiAdapters.enumerateAdapters();
+    const resolved = ndiAdapters.resolveBinding(
+      adapters,
+      desktopPreferences.ndiBindAdapter || { kind: "auto" },
+    );
+    const result = ndiConfig.applyBinding({
+      userDataDir: app.getPath("userData"),
+      ip: resolved ? resolved.ip : null,
+    });
+    return { result, resolved };
+  } catch (err) {
+    return { error: String(err?.message || err) };
+  }
+}
+
+function startNdiStateRefreshTimer() {
+  if (ndiStateRefreshTimer) return;
+  ndiStateRefreshTimer = setInterval(() => {
+    broadcastNdiState();
+  }, NDI_STATE_REFRESH_MS);
+  if (typeof ndiStateRefreshTimer.unref === "function") {
+    ndiStateRefreshTimer.unref();
+  }
+}
+
+/**
+ * Wire `mat-beast-asset://music/track` to the currently configured audio
+ * file. Uses `electronNet.fetch(file:// …)` so Electron's net stack handles
+ * Range requests, MIME sniffing, and streaming — Chromium's `<audio>`
+ * element seeks reliably during loop playback without any custom buffering.
+ */
+function registerBracketMusicProtocol() {
+  if (typeof protocol.handle !== "function") return;
+  try {
+    protocol.handle("mat-beast-asset", async (request) => {
+      let url;
+      try {
+        url = new URL(request.url);
+      } catch {
+        return new Response("Bad URL", { status: 400 });
+      }
+      if (url.hostname !== "music" || url.pathname !== "/track") {
+        return new Response("Not found", { status: 404 });
+      }
+      const filePath = desktopPreferences.bracketMusicFilePath;
+      if (!filePath || !fs.existsSync(filePath)) {
+        return new Response("No track selected", { status: 404 });
+      }
+      const { pathToFileURL } = require("url");
+      const fileUrl = pathToFileURL(filePath).toString();
+      try {
+        return await electronNet.fetch(fileUrl, {
+          headers: request.headers,
+          /** Forward Range so seeking inside a long track works for the
+           * renderer's <audio> element. */
+          method: request.method || "GET",
+        });
+      } catch (err) {
+        return new Response(`Read failed: ${String(err?.message || err)}`, {
+          status: 500,
+        });
+      }
+    });
+  } catch (err) {
+    console.error("[matbeast] registerBracketMusicProtocol failed:", err);
   }
 }
 
@@ -645,6 +1033,93 @@ function resolveMatBeastDataRoot() {
   }
 }
 
+const RENDERER_CACHE_VERSION_MARKER = ".renderer-cache-version";
+const MAX_USERDATA_BACKUP_FOLDERS = 2;
+const MAX_BROKEN_DB_COPIES = 2;
+
+/**
+ * After each app update, drop stale HTTP + V8 code caches so Roaming profile
+ * does not retain hundreds of MB of obsolete compiled assets.
+ */
+async function maybeClearStaleRendererCachesOnUpgrade() {
+  if (!app.isPackaged) return;
+  try {
+    const markerPath = path.join(
+      app.getPath("userData"),
+      RENDERER_CACHE_VERSION_MARKER,
+    );
+    const ver = app.getVersion();
+    let prev = "";
+    if (fs.existsSync(markerPath)) {
+      prev = fs.readFileSync(markerPath, "utf8").trim();
+    }
+    if (prev && prev !== ver) {
+      await session.defaultSession.clearCache();
+      await session.defaultSession.clearCodeCaches({ urls: [] });
+    }
+    fs.writeFileSync(markerPath, ver, "utf8");
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Recovery folders from manual DB moves (`_backup-*`) can be huge; keep the
+ * newest few and remove older ones so AppData does not grow without bound.
+ */
+function pruneOldUserDataBackupFolders() {
+  try {
+    const root = app.getPath("userData");
+    if (!fs.existsSync(root)) return;
+    const entries = fs.readdirSync(root, { withFileTypes: true });
+    const dirs = entries
+      .filter((e) => e.isDirectory() && /^_backup-/.test(e.name))
+      .map((e) => {
+        const full = path.join(root, e.name);
+        return { full, mtime: fs.statSync(full).mtimeMs };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+    for (let i = MAX_USERDATA_BACKUP_FOLDERS; i < dirs.length; i += 1) {
+      fs.rmSync(dirs[i].full, { recursive: true, force: true });
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Structural-drift recovery leaves `matbeast.broken-*.db` (+ wal/shm); retain
+ * only the newest copies for forensics.
+ */
+function pruneOldBrokenDatabaseCopies() {
+  try {
+    const dir = resolveMatBeastDataRoot();
+    if (!fs.existsSync(dir)) return;
+    const entries = fs.readdirSync(dir);
+    const mains = entries.filter((n) => /^matbeast\.broken-.+\.db$/.test(n));
+    const withStat = mains
+      .map((n) => {
+        const p = path.join(dir, n);
+        return { p, mtime: fs.statSync(p).mtimeMs };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+    for (let i = MAX_BROKEN_DB_COPIES; i < withStat.length; i += 1) {
+      const base = withStat[i].p;
+      fs.rmSync(base, { force: true });
+      fs.rmSync(`${base}-wal`, { force: true });
+      fs.rmSync(`${base}-shm`, { force: true });
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function pruneStaleUserDataArtifacts() {
+  if (!app.isPackaged) return;
+  pruneOldUserDataBackupFolders();
+  pruneOldBrokenDatabaseCopies();
+}
+
 /**
  * Writable SQLite under LocalAppData/MatBeastScore (ASCII path, no spaces).
  * Avoids SQLITE_CANTOPEN (14) with Prisma when userData lives under "Mat Beast Scoreboard".
@@ -703,6 +1178,11 @@ const ADDITIVE_COLUMN_PATCHES = [
   { table: "LiveScoreboardState", column: "sound0Enabled", ddl: "INTEGER NOT NULL DEFAULT 1" },
   { table: "LiveScoreboardState", column: "sound10PlayNonce", ddl: "INTEGER NOT NULL DEFAULT 0" },
   { table: "LiveScoreboardState", column: "sound0PlayNonce", ddl: "INTEGER NOT NULL DEFAULT 0" },
+  {
+    table: "LiveScoreboardState",
+    column: "otPlayDirection",
+    ddl: "INTEGER NOT NULL DEFAULT 1",
+  },
   // v0.7.0 cloud sync — link local master rows to their Mat Beast Masters
   // cloud counterparts. Both nullable so the ALTER is safe on existing DBs.
   { table: "MasterTeamName", column: "cloudId", ddl: "TEXT" },
@@ -1117,6 +1597,11 @@ async function startBundledNextServer() {
   // Let any ephemeral port from getFreeIpv4Port() leave TIME_WAIT before the child binds.
   await new Promise((resolve) => setTimeout(resolve, 400));
 
+  /** Master-scope resolver logs (`masters-training-mode.ts`); default on for desktop, opt out with MATBEAST_DEBUG_MASTER_SCOPE=0. */
+  const masterScopeDebugRaw = String(process.env.MATBEAST_DEBUG_MASTER_SCOPE ?? "").trim().toLowerCase();
+  const matbeastDebugMasterScope =
+    masterScopeDebugRaw === "0" || masterScopeDebugRaw === "false" ? "0" : "1";
+
   bundledServerProcess = await new Promise((resolve, reject) => {
     const child = spawn(nodeCommand, [standaloneServerScript], {
       cwd: standaloneRoot,
@@ -1129,6 +1614,7 @@ async function startBundledNextServer() {
         TMP: tmpDir,
         TEMP: tmpDir,
         SQLITE_TMPDIR: tmpDir,
+        MATBEAST_DEBUG_MASTER_SCOPE: matbeastDebugMasterScope,
         // Avoid corporate proxies breaking localhost checks in child or deps.
         NO_PROXY: "127.0.0.1,localhost,::1",
         no_proxy: "127.0.0.1,localhost,::1",
@@ -1234,6 +1720,36 @@ function attachMainWindowCloseConfirm(win) {
   });
 }
 
+/**
+ * Windows: the HWND can be foreground while Chromium never receives keyboard
+ * routing — inputs look focused but keys are dead until Alt+Tab. Nudging
+ * `webContents.focus()` after the OS activation pass fixes title-bar clicks
+ * that otherwise never reach the renderer.
+ */
+function scheduleMainWebContentsKeyboardFocus() {
+  setImmediate(() => {
+    try {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      if (!mainWindow.isFocused()) return;
+      mainWindow.webContents.focus();
+    } catch {
+      /* ignore */
+    }
+  });
+}
+
+/** Like {@link scheduleMainWebContentsKeyboardFocus} but skips `isFocused()` so the renderer can recover keyboard routing while the window already appears active (Windows dead-keys bug). */
+function forceMainWebContentsKeyboardFocus() {
+  setImmediate(() => {
+    try {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      mainWindow.webContents.focus();
+    } catch {
+      /* ignore */
+    }
+  });
+}
+
 function createMainWindow() {
   const titleWithVersion = `Mat Beast Scoreboard v${app.getVersion()}`;
   mainWindow = new BrowserWindow({
@@ -1269,6 +1785,10 @@ function createMainWindow() {
     mainWindow.setTitle(finalTitle);
   });
 
+  mainWindow.on("focus", scheduleMainWebContentsKeyboardFocus);
+  mainWindow.on("move", scheduleRepositionOverlayOutputs);
+  mainWindow.on("resize", scheduleRepositionOverlayOutputs);
+
   mainWindow.loadURL(appUrl);
   attachMainWindowCloseConfirm(mainWindow);
   mainWindow.on("closed", () => {
@@ -1292,6 +1812,31 @@ function pickExternalDisplay() {
   } catch {
     return null;
   }
+}
+
+/**
+ * Place overlay output windows on the **primary** display at native broadcast
+ * resolution (1920×1080). Operators run the dashboard wherever they want; the
+ * scoreboard / bracket capture targets stay on the main screen so frame
+ * subscription / external capture always finds them at a known position and
+ * resolution. Operators Alt+Tab between scoreboard and bracket overlay since
+ * both windows occupy the same 1920×1080 region.
+ */
+function pickTargetDisplayForOverlays() {
+  try {
+    return screen.getPrimaryDisplay();
+  } catch {
+    return screen.getPrimaryDisplay();
+  }
+}
+
+let overlayRepositionTimer = null;
+function scheduleRepositionOverlayOutputs() {
+  if (overlayRepositionTimer) clearTimeout(overlayRepositionTimer);
+  overlayRepositionTimer = setTimeout(() => {
+    overlayRepositionTimer = null;
+    repositionAllOverlayWindows();
+  }, 200);
 }
 
 /** 16:9 window like the scoreboard graphic, capped to work area. */
@@ -1335,7 +1880,85 @@ function positionOverlayForObsCapture(win, width, height) {
   }
 }
 
-const OVERLAY_VERTICAL_STACK_PX = 36;
+/**
+ * Scoreboard + bracket overlays both occupy the same broadcast-native
+ * **physical** 1920×1080 region on the primary display. They overlap fully —
+ * the operator Alt+Tabs between them.
+ *
+ * Electron sizes BrowserWindows in DIPs (Device Independent Pixels), so on a
+ * Windows display running 150% scaling (typical on 2560×1600+ laptops) a
+ * naive `width: 1920` renders as 1920×1.5 = 2880 *physical* pixels and the
+ * window doesn't fit on the screen. Dividing by `display.scaleFactor` makes
+ * the *physical* backing surface land on exactly 1920×1080, which is also
+ * what `webContents.beginFrameSubscription` emits to NDI: pixel-accurate
+ * broadcast resolution regardless of the operator's display DPI.
+ *
+ * The renderer's CSS viewport then becomes `1920/sf × 1080/sf` (e.g.
+ * 1280×720 at 150%); the existing `transform: scale()` in `overlay-client.tsx`
+ * fits the 1920×1080 design canvas inside it, and `devicePixelRatio = sf`
+ * handles glyph / SVG rasterization at full physical resolution so quality
+ * doesn't degrade.
+ */
+function getScoreboardAndBracketBounds(display) {
+  const bounds = display.bounds;
+  const sf = display.scaleFactor || 1;
+  const widthDIP = Math.max(1, Math.round(OVERLAY_NATIVE_W / sf));
+  const heightDIP = Math.max(1, Math.round(OVERLAY_NATIVE_H / sf));
+  const x = Math.round(bounds.x + Math.max(0, (bounds.width - widthDIP) / 2));
+  const y = Math.round(bounds.y + Math.max(0, (bounds.height - heightDIP) / 2));
+  const win = { x, y, width: widthDIP, height: heightDIP };
+  return {
+    scoreboard: { ...win },
+    bracket: ENABLE_BRACKET_OVERLAY_WINDOW ? { ...win } : null,
+  };
+}
+
+function repositionAllOverlayWindows() {
+  try {
+    const td = pickTargetDisplayForOverlays();
+    const layout = getScoreboardAndBracketBounds(td);
+    const sb = scoreboardOverlayWindow;
+    if (sb && !sb.isDestroyed()) {
+      sb.setBounds(layout.scoreboard);
+      if (typeof sb.showInactive === "function") sb.showInactive();
+      else sb.show();
+    }
+    if (ENABLE_BRACKET_OVERLAY_WINDOW && layout.bracket) {
+      const br = bracketOverlayWindow;
+      if (br && !br.isDestroyed()) {
+        br.setBounds(layout.bracket);
+        if (typeof br.showInactive === "function") br.showInactive();
+        else br.show();
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Send the main dashboard window back to the top of the z-order. Called after
+ * showing / repositioning an overlay output window so the operator's UI stays
+ * visually in front. Deferred via `setTimeout(0)` because Chromium is still
+ * resolving focus / paint state from the overlay's `showInactive()` and a
+ * synchronous `moveTop()` can race with that and strand keyboard input on
+ * the dashboard until Alt+Tab. `forceMainWebContentsKeyboardFocus()` recovers
+ * the renderer-side focus afterward.
+ */
+function ensureMainWindowOnTop() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  setTimeout(() => {
+    try {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      if (typeof mainWindow.moveTop === "function") {
+        mainWindow.moveTop();
+      }
+      forceMainWebContentsKeyboardFocus();
+    } catch {
+      /* ignore */
+    }
+  }, 0);
+}
 
 /**
  * Overlay output window(s). Scoreboard always; bracket only when {@link ENABLE_BRACKET_OVERLAY_WINDOW}.
@@ -1347,22 +1970,32 @@ function createOverlayWindowForRole(role) {
     return;
   }
 
-  const primary = screen.getPrimaryDisplay();
-  const external = pickExternalDisplay();
-  const targetDisplay = external ?? primary;
-  const b0 = computeOverlayBounds(targetDisplay);
-  const wa = targetDisplay.workArea || targetDisplay.bounds;
+  const targetDisplay = pickTargetDisplayForOverlays();
+  const layout = getScoreboardAndBracketBounds(targetDisplay);
   const b =
-    role === "bracket"
-      ? {
-          ...b0,
-          y: Math.min(
-            b0.y + OVERLAY_VERTICAL_STACK_PX,
-            Math.max(wa.y, wa.y + wa.height - b0.height - 4),
-          ),
-        }
-      : b0;
+    role === "bracket" && layout.bracket ? layout.bracket : layout.scoreboard;
 
+  /**
+   * Per-role chrome:
+   *
+   * - **Scoreboard** is **transparent** so the graphic preserves alpha for
+   *   future built-in NDI capture and external compositors / chroma key
+   *   workflows. Windows does not support `transparent: true` together with
+   *   `frame: true` (the layered client area suppresses native chrome), so
+   *   the scoreboard window is necessarily chrome-less. The renderer paints
+   *   its own visible inset frame via `OVERLAY_OUTPUT_FRAME_STYLE`.
+   *
+   * - **Bracket** is **opaque** with the standard Windows title bar and a
+   *   black background. The bracket graphic is fully solid so transparency
+   *   buys nothing, and the visible Windows frame (title, minimize, close)
+   *   is friendlier for the operator.
+   *
+   * Both windows are focusable (default) and listed in the taskbar /
+   * Alt+Tab. `showInactive()` (below) and `ensureMainWindowOnTop()` keep
+   * them behind the dashboard at open / reposition time so the operator
+   * stays in their primary UI.
+   */
+  const isScoreboard = role !== "bracket";
   const win = new BrowserWindow({
     title: role === "bracket" ? "BRACKETOVERLAY" : "SCOREBOARDOVERLAY",
     icon: appIconPath,
@@ -1372,16 +2005,27 @@ function createOverlayWindowForRole(role) {
     height: b.height,
     minWidth: 640,
     minHeight: 360,
-    transparent: true,
-    frame: true,
-    thickFrame: process.platform === "win32",
+    transparent: isScoreboard,
+    frame: !isScoreboard,
+    thickFrame: !isScoreboard && process.platform === "win32",
+    backgroundColor: isScoreboard ? undefined : "#000000",
     autoHideMenuBar: true,
     show: false,
+    skipTaskbar: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
       backgroundThrottling: false,
+      /**
+       * Output overlay windows never receive user clicks (they exist behind
+       * the dashboard for capture / NDI). Without this flag Chromium's
+       * autoplay policy blocks the bracket music loop until a gesture
+       * occurs in that window — which never happens. The scoreboard window
+       * gets it too so future timer-cue audio can autoplay when the audio
+       * engine moves into that overlay (per the planned Option A).
+       */
+      autoplayPolicy: "no-user-gesture-required",
     },
   });
 
@@ -1395,33 +2039,35 @@ function createOverlayWindowForRole(role) {
     extraHeaders: "pragma: no-cache\r\nCache-Control: no-cache\r\n",
   });
 
+  /**
+   * Same as the main window: Next metadata sets document title to "Mat Beast Scoreboard",
+   * which Chromium forwards to the native title — both output windows looked identical.
+   * Keep stable, scene-specific titles for Alt+Tab / NDI source lists.
+   */
+  const overlayLockedTitle =
+    role === "bracket" ? "Mat Beast — Bracket output" : "Mat Beast — Scoreboard output";
+  win.webContents.on("page-title-updated", (event) => {
+    event.preventDefault();
+    if (win.isDestroyed()) return;
+    win.setTitle(overlayLockedTitle);
+  });
+
   win.once("ready-to-show", () => {
     if (win.isDestroyed()) return;
-    const td = pickExternalDisplay() ?? screen.getPrimaryDisplay();
-    const bShow = computeOverlayBounds(td);
-    const waShow = td.workArea || td.bounds;
-    const bounds =
-      role === "bracket"
-        ? {
-            ...bShow,
-            y: Math.min(
-              bShow.y + OVERLAY_VERTICAL_STACK_PX,
-              Math.max(waShow.y, waShow.y + waShow.height - bShow.height - 4),
-            ),
-          }
-        : bShow;
-    win.setBounds(bounds);
-    win.show();
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.focus();
-      if (process.platform === "darwin" && typeof mainWindow.moveTop === "function") {
-        try {
-          mainWindow.moveTop();
-        } catch {
-          /* ignore */
-        }
-      }
+    repositionAllOverlayWindows();
+    if (typeof win.showInactive === "function") {
+      win.showInactive();
+    } else {
+      win.show();
     }
+    /**
+     * Keep the dashboard visually on top after opening an overlay so the
+     * operator stays in their primary UI. `ensureMainWindowOnTop()` defers
+     * `moveTop()` to next tick to avoid the historical Chromium focus race
+     * where `<input>` fields on the dashboard could lose keyboard routing
+     * until Alt+Tab.
+     */
+    ensureMainWindowOnTop();
   });
 
   win.on("closed", () => {
@@ -1444,6 +2090,230 @@ function createOverlayWindows() {
   if (ENABLE_BRACKET_OVERLAY_WINDOW) {
     createOverlayWindowForRole("bracket");
   }
+}
+
+/**
+ * NDI offscreen-rendering smoke test. Builds an offscreen `BrowserWindow` for
+ * the scoreboard scene, captures ~5 seconds of frames at 30 fps, and writes
+ * sampled PNGs to `<userData>/ndi-test/<timestamp>/`. Used to validate the
+ * offscreen → frame-subscription path independent of any NDI library before
+ * v0.9.22 wires up `grandiose`. See `electron/ndi-smoke.js`.
+ *
+ * Surfaces a dialog at the end so the operator confirms the capture without
+ * hunting through DevTools.
+ */
+async function runNdiOffscreenSmokeTest() {
+  if (!appUrl) {
+    void dialog.showMessageBox(mainWindow, {
+      type: "error",
+      title: "NDI smoke test",
+      message: "Bundled server URL is not ready yet.",
+      detail: "Wait for the dashboard to finish loading and try again.",
+      buttons: ["OK"],
+    });
+    return;
+  }
+  const userDataDir = app.getPath("userData");
+  const preloadPath = path.join(__dirname, "preload.js");
+  appendUpdaterLog(`${nowIso()}  ndi-smoke: starting (appUrl=${appUrl})\n`);
+  let result;
+  try {
+    result = await runOffscreenSmokeTest({
+      appUrl,
+      userDataDir,
+      preloadPath,
+      onLog: (line) => appendUpdaterLog(`${nowIso()}  ${line}\n`),
+    });
+  } catch (err) {
+    result = { ok: false, error: String(err?.message || err) };
+  }
+  appendUpdaterLog(`${nowIso()}  ndi-smoke: finished ${JSON.stringify(result)}\n`);
+  if (result.ok) {
+    void dialog.showMessageBox(mainWindow, {
+      type: "info",
+      title: "NDI smoke test complete",
+      message: `Captured ${result.framesCaptured} frames in ${result.recordingDurationMs} ms (${result.observedFps} fps)`,
+      detail:
+        `Frames during warmup: ${result.framesDuringWarmup}\n` +
+        `PNGs written: ${result.pngsWritten}\n` +
+        `Output folder: ${result.outputDir}\n\n` +
+        "The folder should already be open in Explorer. Open any frame-NN.png " +
+        "to verify the offscreen renderer produced a 1920×1080 scoreboard frame.",
+      buttons: ["OK"],
+    });
+  } else {
+    void dialog.showMessageBox(mainWindow, {
+      type: "error",
+      title: "NDI smoke test failed",
+      message: "Offscreen capture did not complete.",
+      detail: result.error || "Unknown error",
+      buttons: ["OK"],
+    });
+  }
+}
+
+/**
+ * Start the live NDI feed for a scene (currently only "scoreboard"; the
+ * bracket feed is scaffolded in `ndi-feed.js` but not wired to a menu
+ * item until v0.9.30). Surfaces success/failure via a dialog so the
+ * operator gets immediate feedback in NDI Studio Monitor or vMix.
+ *
+ * Called from the menu and (in v0.9.30+) from auto-start at boot when
+ * `desktopPreferences.ndiAutoStart[scene]` is true. Today no auto-start —
+ * operator toggles each session manually.
+ */
+async function toggleNdiFeed(scene) {
+  if (!appUrl) {
+    void dialog.showMessageBox(mainWindow, {
+      type: "error",
+      title: "NDI",
+      message: "Bundled server URL is not ready yet.",
+      detail: "Wait for the dashboard to finish loading and try again.",
+      buttons: ["OK"],
+    });
+    return;
+  }
+  const log = (line) => appendUpdaterLog(`${nowIso()}  ${line}\n`);
+  const isRunning = ndiFeed.isFeedRunning(scene);
+  if (isRunning) {
+    log(`ndi-feed: stopping ${scene}`);
+    const stopResult = ndiFeed.stopNdiFeed(scene, log);
+    log(`ndi-feed: stop result ${JSON.stringify(stopResult)}`);
+    refreshApplicationMenu();
+    broadcastNdiState();
+    void dialog.showMessageBox(mainWindow, {
+      type: "info",
+      title: "NDI source stopped",
+      message: `"${ndiFeed.getDefaultSourceName(scene)}" is no longer broadcasting.`,
+      detail: "Receivers (NDI Studio Monitor, OBS, vMix, etc.) will lose the source within ~3 seconds.",
+      buttons: ["OK"],
+    });
+    return;
+  }
+  log(`ndi-feed: starting ${scene}`);
+  const preloadPath = path.join(__dirname, "preload.js");
+  let result;
+  try {
+    result = await ndiFeed.startNdiFeed({
+      scene,
+      appUrl,
+      preloadPath,
+      userDataDir: app.getPath("userData"),
+      onLog: log,
+    });
+  } catch (err) {
+    result = { ok: false, error: String(err?.message || err) };
+  }
+  log(`ndi-feed: start result ${JSON.stringify(result)}`);
+  refreshApplicationMenu();
+  broadcastNdiState();
+  if (result.ok) {
+    void dialog.showMessageBox(mainWindow, {
+      type: "info",
+      title: "NDI source running",
+      message: `"${ndiFeed.getDefaultSourceName(scene)}" is now broadcasting.`,
+      detail:
+        "Open NDI Studio Monitor (or vMix / OBS) on this network and the source " +
+        "should appear within ~3 seconds. Use the same menu entry to stop it.\n\n" +
+        `NDI runtime: ${ndiFeed.getAllStatuses().ndi.ndiVersion || "unknown"}`,
+      buttons: ["OK"],
+    });
+  } else {
+    void dialog.showMessageBox(mainWindow, {
+      type: "error",
+      title: "NDI source failed to start",
+      message: "Could not start the NDI sender.",
+      detail:
+        (result.error || "Unknown error") +
+        (result.ndiStatus
+          ? `\n\nNDI status: ${JSON.stringify(result.ndiStatus, null, 2)}`
+          : ""),
+      buttons: ["OK"],
+    });
+  }
+}
+
+/**
+ * v0.9.32: Launch the BGRA test-pattern sender.
+ *
+ * v0.9.31 diagnostics confirmed every layer of our scoreboard / bracket
+ * pipeline is healthy — buffers contain real BGRA pixel data, sender
+ * accepts every frame, sources appear in receivers' source lists — yet
+ * receivers display BLACK when subscribing. To isolate whether the bug
+ * is in (a) our React content / Electron BGRA conventions or (b) the
+ * NDI runtime / firewall / network layer, this entry skips both the
+ * offscreen window and React entirely. It generates a synthetic 8-bar
+ * SMPTE color pattern with a moving white square at full opacity
+ * (alpha=255 everywhere, no premultiplied-alpha math) and pushes it
+ * through `sender.video()` via grandiose at 30 fps for 30 seconds
+ * under the source name "Mat Beast Test Pattern".
+ *
+ * Outcome → diagnosis:
+ *   - Receivers show the bars + moving square → bug is specific to our
+ *     React-rendered content (premultiplied alpha is the leading
+ *     hypothesis; `transparent: true` on the offscreen `BrowserWindow`
+ *     hands us premultiplied BGRA, NDI may treat that as straight alpha
+ *     and double-multiply).
+ *   - Receivers still show nothing → bug is below the buffer layer.
+ *     Almost certainly Windows Firewall blocking NDI's TCP video-
+ *     delivery channel, or the NDI 5.5.2.0 runtime in grandiose has a
+ *     known incompatibility with current NDI Tools / OBS NDI plugin.
+ *
+ * The dialog informs the operator what to look for so they can answer
+ * us in one round-trip.
+ */
+async function runNdiTestPattern() {
+  if (ndiTestPattern.isTestPatternRunning()) {
+    void dialog.showMessageBox(mainWindow, {
+      type: "info",
+      title: "NDI test pattern",
+      message: "The test pattern is already running.",
+      detail:
+        "It will stop automatically after 30 seconds. Use this menu entry " +
+        "again afterwards to start a fresh run.",
+      buttons: ["OK"],
+    });
+    return;
+  }
+  void dialog.showMessageBox(mainWindow, {
+    type: "info",
+    title: "NDI test pattern starting",
+    message: "Sending an 8-bar SMPTE BGRA test pattern for 30 seconds.",
+    detail:
+      'Open NDI Studio Monitor (or OBS / vMix), pick "Mat Beast Test Pattern" ' +
+      "from the source list, and report back:\n\n" +
+      "  - If you see vertical color bars (white, yellow, cyan, green, magenta, " +
+      "red, blue, black) with a white square sliding across the bottom, the NDI " +
+      "pipeline works end-to-end. The scoreboard / bracket bug is specific to " +
+      "our React content (likely premultiplied-alpha BGRA) and we'll fix it next.\n\n" +
+      "  - If you see nothing (or only the source name with a black preview), " +
+      "the issue is below our pipeline — Windows Firewall blocking NDI's TCP " +
+      "delivery, an NDI runtime version mismatch, or a multi-NIC binding " +
+      "issue. Different fix path.",
+    buttons: ["OK"],
+  });
+  const log = (line) => appendUpdaterLog(`${nowIso()}  ${line}\n`);
+  log("ndi-test-pattern: launching");
+  let result;
+  try {
+    result = await ndiTestPattern.runTestPattern({ onLog: log, durationMs: 30_000 });
+  } catch (err) {
+    result = { ok: false, error: String(err?.message || err) };
+  }
+  log(`ndi-test-pattern: finished ${JSON.stringify(result)}`);
+  void dialog.showMessageBox(mainWindow, {
+    type: result.ok ? "info" : "error",
+    title: "NDI test pattern complete",
+    message: result.ok
+      ? `Sent ${result.framesSent} frames over ${result.durationMs} ms.`
+      : "Test pattern failed.",
+    detail: result.ok
+      ? `Send failures: ${result.sendFailures}\n` +
+        (result.lastError ? `Last error: ${result.lastError}\n\n` : "\n") +
+        "Reply with which of the two outcomes above you observed."
+      : result.error || "Unknown error",
+    buttons: ["OK"],
+  });
 }
 
 /**
@@ -1527,6 +2397,123 @@ const workspaceViewState = {
   hasTabs: false,
 };
 
+/**
+ * v0.9.33: Build the `Options ▸ NDI ▸ Network adapter` submenu. The
+ * submenu shows:
+ *
+ *   - Auto-select (prefer Ethernet) — default. Shows the IP it
+ *     currently resolves to in the label so the operator can verify
+ *     auto-mode picked the right NIC without opening the status panel.
+ *   - Per-IP entries grouped roughly by adapter type. APIPA addresses
+ *     and likely-virtual NICs are shown but visually de-prioritised
+ *     so the operator doesn't accidentally pin to a non-routable IP.
+ *   - A "Restart required" hint in the disabled summary line so
+ *     newcomers understand why nothing happens immediately after they
+ *     click an entry.
+ *
+ * Clicking any entry persists the choice, writes the config file, and
+ * shows a "restart now / later" dialog.
+ */
+function buildNdiAdapterSubmenu() {
+  const adapters = ndiAdapters.enumerateAdapters();
+  const preference = desktopPreferences.ndiBindAdapter || { kind: "auto" };
+  const autoResolved = ndiAdapters.pickAutoBinding(adapters);
+  const isAuto = preference.kind === "auto";
+  const items = [];
+  items.push({
+    label: "Apply takes effect after restart",
+    enabled: false,
+  });
+  items.push({ type: "separator" });
+  items.push({
+    type: "radio",
+    checked: isAuto,
+    label: autoResolved
+      ? `Auto-select (prefer Ethernet) — currently ${autoResolved.friendlyName} ${autoResolved.ip}`
+      : "Auto-select (prefer Ethernet) — no routable adapter found",
+    click: () => {
+      void confirmAndApplyNdiBindingChange({ kind: "auto" });
+    },
+  });
+  items.push({ type: "separator" });
+  if (adapters.length === 0) {
+    items.push({
+      label: "No network adapters detected",
+      enabled: false,
+    });
+    return items;
+  }
+  for (const adapter of adapters) {
+    const isCurrent =
+      preference.kind === "ip" && preference.ip === adapter.ip;
+    /** Decorate APIPA / virtual entries so the operator can see at a
+     *  glance why these IPs probably won't deliver to remote receivers. */
+    const suffix = adapter.isApipa
+      ? "  (APIPA / link-local)"
+      : adapter.isLikelyVirtual && adapter.type !== "wifi" && adapter.type !== "ethernet"
+        ? "  (virtual)"
+        : adapter.isLoopback
+          ? "  (loopback)"
+          : "";
+    items.push({
+      type: "radio",
+      checked: isCurrent && !isAuto,
+      label: `${adapter.friendlyName} (${adapter.adapterName}) — ${adapter.ip}${suffix}`,
+      click: () => {
+        void confirmAndApplyNdiBindingChange({ kind: "ip", ip: adapter.ip });
+      },
+    });
+  }
+  return items;
+}
+
+/**
+ * Persist the new NDI binding, write the config file, refresh the
+ * menu, and prompt the operator to restart so `NDIlib_initialize()`
+ * picks up the change. If the operator declines we leave the next-
+ * launch binding in place — they can also restart later from the
+ * dashboard's NDI status pill.
+ */
+async function confirmAndApplyNdiBindingChange(nextPreference) {
+  const previous = desktopPreferences.ndiBindAdapter || { kind: "auto" };
+  const same = JSON.stringify(previous) === JSON.stringify(nextPreference);
+  desktopPreferences.ndiBindAdapter = normalizeNdiBindAdapter(nextPreference);
+  persistDesktopPreferences();
+  applySavedNdiBinding();
+  refreshApplicationMenu();
+  broadcastNdiState();
+  if (same) return;
+  const adapters = ndiAdapters.enumerateAdapters();
+  const resolved = ndiAdapters.resolveBinding(adapters, nextPreference);
+  const human = resolved
+    ? `${resolved.friendlyName} (${resolved.adapterName}) — ${resolved.ip}`
+    : "Auto-select (no routable adapter found)";
+  const choice = await dialog.showMessageBox(mainWindow, {
+    type: "question",
+    title: "NDI binding updated",
+    message: "Restart Mat Beast Scoreboard to apply the new NDI binding?",
+    detail:
+      `New binding: ${human}\n\n` +
+      "The NDI runtime reads its network configuration only when the app " +
+      "starts. Without a restart, the new binding will take effect the " +
+      "next time you launch Mat Beast Scoreboard.",
+    buttons: ["Restart now", "Restart later"],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  if (choice.response === 0) {
+    try {
+      ndiFeed.stopAllNdiFeeds(/* onLog */ undefined);
+    } catch {
+      /* ignore */
+    }
+    setImmediate(() => {
+      app.relaunch();
+      app.exit(0);
+    });
+  }
+}
+
 function buildMenuTemplate() {
   /**
    * File menu toggle:
@@ -1606,6 +2593,80 @@ function buildMenuTemplate() {
             refreshApplicationMenu();
           },
         },
+        { type: "separator" },
+        {
+          /**
+           * v0.9.21–0.9.28: smoke-test only (no real NDI library).
+           * v0.9.29: scoreboard feed is live via `grandiose`. Toggle item
+           *   flips between "Start" and "Stop" labels.
+           * v0.9.30: bracket feed wired up alongside scoreboard (one
+           *   toggle per scene, both reuse `ndi-feed.js`); per-frame
+           *   buffer-vs-getSize diagnostic in `ndi-sender.js`; first-30-
+           *   frames warmup so receivers don't latch onto a partially-
+           *   hydrated React tree.
+           * v0.9.31+: source-name editor, frame-rate selector, "Show
+           *   visible monitor windows" checkbox, persisted auto-start
+           *   in desktopPreferences.
+           */
+          label: "NDI",
+          submenu: [
+            /**
+             * v0.9.33: Network-adapter picker. The NDI runtime
+             * announces sources on every NIC by default — including
+             * APIPA (169.254.*) addresses on disconnected Ethernet
+             * adapters and Wi-Fi Direct virtual adapters — which
+             * causes "source visible but blank preview" on remote
+             * receivers. Pinning to one IP via `ndi-config.v1.json`
+             * fixes it. Submenu is rebuilt every menu refresh so the
+             * IPs reflect whatever DHCP currently has.
+             */
+            {
+              label: "Network adapter",
+              submenu: buildNdiAdapterSubmenu(),
+            },
+            { type: "separator" },
+            {
+              label: ndiFeed.isFeedRunning("scoreboard")
+                ? `Stop "${ndiFeed.getDefaultSourceName("scoreboard")}"`
+                : `Start "${ndiFeed.getDefaultSourceName("scoreboard")}" NDI source`,
+              click: () => {
+                void toggleNdiFeed("scoreboard");
+              },
+            },
+            {
+              label: ndiFeed.isFeedRunning("bracket")
+                ? `Stop "${ndiFeed.getDefaultSourceName("bracket")}"`
+                : `Start "${ndiFeed.getDefaultSourceName("bracket")}" NDI source`,
+              click: () => {
+                void toggleNdiFeed("bracket");
+              },
+            },
+            { type: "separator" },
+            {
+              /**
+               * v0.9.32 diagnostic: send a synthetic SMPTE color-bar test
+               * pattern (no React, no offscreen window) so the operator can
+               * tell us whether NDI receivers display known-good frames.
+               * If yes → bug is in our React content. If no → bug is in
+               * Windows Firewall / NDI runtime / NIC binding. Definitive
+               * one-round-trip diagnostic.
+               */
+              label: ndiTestPattern.isTestPatternRunning()
+                ? `"${require("./ndi-test-pattern.js").TP_NAME}" running…`
+                : "Send BGRA test pattern (30s)",
+              enabled: !ndiTestPattern.isTestPatternRunning(),
+              click: () => {
+                void runNdiTestPattern();
+              },
+            },
+            {
+              label: "Run offscreen smoke test (5s)",
+              click: () => {
+                void runNdiOffscreenSmokeTest();
+              },
+            },
+          ],
+        },
         ...(demoMode
           ? []
           : [
@@ -1616,7 +2677,33 @@ function buildMenuTemplate() {
     },
     {
       label: "Window",
-      submenu: [{ role: "minimize" }, { role: "zoom" }, { role: "togglefullscreen" }],
+      submenu: [
+        {
+          /**
+           * Recreate the scoreboard output overlay if it was closed, or
+           * re-snap it to native 1920×1080 on the primary display. Always
+           * shown behind the dashboard via `ensureMainWindowOnTop()`.
+           */
+          label: "Open Scoreboard Overlay",
+          click: () => {
+            createOverlayWindowForRole("scoreboard");
+            repositionAllOverlayWindows();
+            ensureMainWindowOnTop();
+          },
+        },
+        {
+          label: "Open Bracket Overlay",
+          click: () => {
+            createOverlayWindowForRole("bracket");
+            repositionAllOverlayWindows();
+            ensureMainWindowOnTop();
+          },
+        },
+        { type: "separator" },
+        { role: "minimize" },
+        { role: "zoom" },
+        { role: "togglefullscreen" },
+      ],
     },
     {
       label: "Help",
@@ -1666,6 +2753,7 @@ if (!gotSingleInstanceLock) {
     if (mainWindow && !mainWindow.isDestroyed()) {
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.focus();
+      scheduleMainWebContentsKeyboardFocus();
     }
     let filePath = null;
     if (Array.isArray(argvOrCmdLine)) {
@@ -1679,6 +2767,32 @@ if (!gotSingleInstanceLock) {
   app.whenReady().then(() => {
   ensureWindowsShellEnvironment();
   loadDesktopPreferences();
+  /**
+   * Apply the operator's saved NDI binding BEFORE anything triggers
+   * `require("grandiose")`. The NDI runtime reads `NDI_CONFIG_DIR` at
+   * `NDIlib_initialize()` time exactly once per process, so setting it
+   * later in the session has no effect — the operator would have to
+   * restart the app for the change to take. This is the entire reason
+   * the NDI > Network adapter menu shows a "Restart required" prompt.
+   */
+  try {
+    const apply = applySavedNdiBinding();
+    appendUpdaterLog(
+      `${nowIso()}  ndi-bootstrap: applied binding ${JSON.stringify({
+        configDir: apply.result?.configDir || null,
+        configPath: apply.result?.configPath || null,
+        ip: apply.result?.ip || null,
+        preference: desktopPreferences.ndiBindAdapter,
+        adapter: apply.resolved
+          ? `${apply.resolved.friendlyName} (${apply.resolved.adapterName})`
+          : null,
+      })}\n`,
+    );
+  } catch (err) {
+    appendUpdaterLog(
+      `${nowIso()}  ndi-bootstrap: failed ${String(err?.message || err)}\n`,
+    );
+  }
   const launchEventFile = findEventFileInArgv(process.argv);
   let startupWarning = "";
   const boot = app.isPackaged
@@ -1690,13 +2804,245 @@ if (!gotSingleInstanceLock) {
       })
     : Promise.resolve();
 
-  boot.finally(() => {
+  boot.finally(async () => {
+  await maybeClearStaleRendererCachesOnUpgrade();
+  pruneStaleUserDataArtifacts();
   configureAutoUpdater();
 
   ipcMain.handle("overlay:open", () => {
     createOverlayWindows();
+    repositionAllOverlayWindows();
     return { ok: true };
   });
+
+  registerBracketMusicProtocol();
+
+  /**
+   * Read the operator's persisted bracket-music configuration. Called on
+   * mount by the dashboard and by the bracket overlay so both can render
+   * the right initial state without waiting for the next push.
+   */
+  ipcMain.handle("bracket-music:get-state", () => bracketMusicSnapshot());
+
+  /**
+   * Open a native file picker, persist the selected audio file, and push
+   * the new state to every renderer. `canceled: true` if the operator
+   * dismissed the dialog — caller leaves the existing track untouched.
+   */
+  ipcMain.handle("bracket-music:choose-file", async () => {
+    try {
+      /**
+       * Resolving the parent window:
+       *   - Prefer the dashboard (`mainWindow`) explicitly so the dialog
+       *     reliably parents to a visible, non-destroyed window.
+       *   - `BrowserWindow.getFocusedWindow()` can return `null` when the
+       *     popover-button click stole focus on Windows (the dropdown is
+       *     a transient element that loses focus before the IPC fires);
+       *     a `null` parent silently degrades to a non-modal dialog
+       *     that some Windows configurations render off-screen, which
+       *     is exactly the "nothing happens" symptom operators reported.
+       */
+      const win =
+        mainWindow && !mainWindow.isDestroyed()
+          ? mainWindow
+          : BrowserWindow.getFocusedWindow();
+      let defaultDir;
+      try {
+        defaultDir = desktopPreferences.bracketMusicFilePath
+          ? path.dirname(desktopPreferences.bracketMusicFilePath)
+          : app.getPath("music");
+      } catch {
+        /** Some Windows profiles redirect "Music" to a path that fails the
+         *  shell folder lookup; fall back to the user's home so the dialog
+         *  always has a valid `defaultPath`. */
+        defaultDir = app.getPath("home");
+      }
+      const options = {
+        title: "Choose bracket overlay music",
+        defaultPath: defaultDir,
+        properties: ["openFile"],
+        filters: BRACKET_MUSIC_AUDIO_FILTERS,
+      };
+      const result = win
+        ? await dialog.showOpenDialog(win, options)
+        : await dialog.showOpenDialog(options);
+      if (result.canceled || !result.filePaths?.[0]) {
+        return { ok: false, canceled: true };
+      }
+      const next = result.filePaths[0];
+      desktopPreferences.bracketMusicFilePath = next;
+      persistDesktopPreferences();
+      broadcastBracketMusicState();
+      return { ok: true, state: bracketMusicSnapshot() };
+    } catch (err) {
+      console.error("[matbeast] bracket-music:choose-file failed:", err);
+      return {
+        ok: false,
+        error: String(err?.message || err),
+      };
+    }
+  });
+
+  /** Set track to NONE — operator's "no music" choice. */
+  ipcMain.handle("bracket-music:clear-file", () => {
+    desktopPreferences.bracketMusicFilePath = null;
+    persistDesktopPreferences();
+    broadcastBracketMusicState();
+    return { ok: true, state: bracketMusicSnapshot() };
+  });
+
+  /**
+   * Use the bundled "DEFAULT" track. The audio file is shipped under
+   * `<resources>/default-music/tale.mp3` via `extraResources`. Returns
+   * `{ ok: false, error }` if the file is missing on disk (e.g.
+   * antivirus quarantined it post-install) so the dashboard can show
+   * a structured error instead of silently selecting nothing.
+   */
+  ipcMain.handle("bracket-music:use-default", () => {
+    const def = getBundledDefaultBracketMusicPath();
+    if (!def) {
+      return {
+        ok: false,
+        error: "Default bracket music track is not installed.",
+      };
+    }
+    desktopPreferences.bracketMusicFilePath = def;
+    persistDesktopPreferences();
+    broadcastBracketMusicState();
+    return { ok: true, state: bracketMusicSnapshot() };
+  });
+
+  ipcMain.handle("bracket-music:set-playing", (_event, payload) => {
+    const next = Boolean(payload && payload.playing);
+    if (desktopPreferences.bracketMusicPlaying === next) {
+      return { ok: true, state: bracketMusicSnapshot() };
+    }
+    desktopPreferences.bracketMusicPlaying = next;
+    persistDesktopPreferences();
+    broadcastBracketMusicState();
+    return { ok: true, state: bracketMusicSnapshot() };
+  });
+
+  ipcMain.handle("bracket-music:set-monitor", (_event, payload) => {
+    const next = Boolean(payload && payload.monitor);
+    if (desktopPreferences.bracketMusicMonitor === next) {
+      return { ok: true, state: bracketMusicSnapshot() };
+    }
+    desktopPreferences.bracketMusicMonitor = next;
+    persistDesktopPreferences();
+    broadcastBracketMusicState();
+    return { ok: true, state: bracketMusicSnapshot() };
+  });
+
+  /**
+   * v0.9.33: NDI network-binding IPC. Returns the same snapshot the
+   * Overlay-card status pill subscribes to via `matbeast:ndi:state`,
+   * so the renderer can render the initial value synchronously on
+   * mount before the first push event arrives.
+   */
+  ipcMain.handle("ndi:get-state", () => {
+    return buildNdiStateSnapshot();
+  });
+
+  /**
+   * Persist the operator's adapter choice and (asynchronously) prompt
+   * for app restart since `NDI_CONFIG_DIR` only takes effect at
+   * `NDIlib_initialize()` time.
+   *
+   * Payload: same shape `desktopPreferences.ndiBindAdapter` accepts —
+   *   - `{ kind: "auto" }`
+   *   - `{ kind: "ip", ip: "192.168.0.20" }`
+   *   - `{ kind: "adapter", adapterName: "Ethernet" }`
+   *
+   * Returns `{ ok, willTakeEffectAfterRestart, snapshot }` so the
+   * dashboard can show inline confirmation before the operator
+   * chooses Restart now / Restart later.
+   */
+  ipcMain.handle("ndi:set-binding", (_event, payload) => {
+    try {
+      const next = normalizeNdiBindAdapter(payload);
+      const previous = desktopPreferences.ndiBindAdapter || { kind: "auto" };
+      const same = JSON.stringify(previous) === JSON.stringify(next);
+      desktopPreferences.ndiBindAdapter = next;
+      persistDesktopPreferences();
+      /** Write the config file immediately even though it won't bind
+       *  until the next launch — that way an operator who CLI-relaunches
+       *  with `app.relaunch()` from the menu picks up the new binding
+       *  without us having to re-run `applyBinding` separately. */
+      applySavedNdiBinding();
+      const snapshot = broadcastNdiState();
+      refreshApplicationMenu();
+      return {
+        ok: true,
+        willTakeEffectAfterRestart: !same,
+        snapshot,
+      };
+    } catch (err) {
+      return { ok: false, error: String(err?.message || err) };
+    }
+  });
+
+  /** Restart the app so a new `NDI_CONFIG_DIR` / config-file binding
+   *  takes effect. Called from the dashboard's NDI status pill after
+   *  the operator picks a new adapter. */
+  ipcMain.handle("ndi:relaunch-for-binding", () => {
+    try {
+      ndiFeed.stopAllNdiFeeds(/* onLog */ undefined);
+    } catch {
+      /* ignore — relaunch is the actual fix */
+    }
+    /** Defer one tick so the IPC reply gets back to the renderer
+     *  before Electron tears down the renderer process. */
+    setImmediate(() => {
+      app.relaunch();
+      app.exit(0);
+    });
+    return { ok: true };
+  });
+
+  /** Push initial state once windows are ready, then refresh on a
+   *  5 s interval to catch OS-level NIC changes. */
+  startNdiStateRefreshTimer();
+  setTimeout(() => {
+    broadcastNdiState();
+  }, 1500);
+
+  /**
+   * v0.9.34: NDI audio fan-in. The offscreen NDI bracket renderer's
+   * AudioWorklet PCM tap pushes 1024-sample planar Float32 frames here
+   * via fire-and-forget `ipcRenderer.send`, and we forward each one to
+   * the active sender for that scene. If the feed isn't running yet
+   * (audio path can come up before video on mount) the frame is
+   * silently dropped — drops are normal at startup, not an error.
+   *
+   * Diagnostic logging is rate-limited inside `ndi-sender.js`'s
+   * `sendNdiAudioFrame` (first 3 frames per sender), so this handler
+   * stays cheap on the hot path.
+   */
+  ipcMain.on("ndi-audio:push", (_event, msg) => {
+    if (!msg || typeof msg !== "object") return;
+    const scene = msg.scene === "bracket" ? "bracket" : msg.scene === "scoreboard" ? "scoreboard" : null;
+    if (!scene) return;
+    const payload = msg.payload;
+    if (!payload || typeof payload !== "object") return;
+    const log = (line) => appendUpdaterLog(`${nowIso()}  ${line}\n`);
+    try {
+      ndiFeed.pushAudioForScene(scene, payload, log);
+    } catch (err) {
+      log(
+        `[ndi-audio] push failed for scene=${scene}: ${String(err?.message || err)}`,
+      );
+    }
+  });
+
+  try {
+    const onScreensChanged = () => scheduleRepositionOverlayOutputs();
+    screen.on("display-metrics-changed", onScreensChanged);
+    screen.on("display-added", onScreensChanged);
+    screen.on("display-removed", onScreensChanged);
+  } catch {
+    /* ignore */
+  }
   ipcMain.handle("overlay:set-tournament-id", (_event, payload) => {
     const nextId =
       payload && typeof payload.tournamentId === "string"
@@ -2043,8 +3389,18 @@ if (!gotSingleInstanceLock) {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.show();
         mainWindow.focus();
-        mainWindow.webContents.focus();
+        /** Deferred so we run after Windows foreground bookkeeping (see {@link scheduleMainWebContentsKeyboardFocus}). */
+        scheduleMainWebContentsKeyboardFocus();
       }
+    } catch {
+      /* ignore */
+    }
+    return { ok: true };
+  });
+
+  ipcMain.handle("app:restore-web-keyboard-focus", async () => {
+    try {
+      forceMainWebContentsKeyboardFocus();
     } catch {
       /* ignore */
     }
@@ -2059,9 +3415,16 @@ if (!gotSingleInstanceLock) {
       sendOptionsMenuAction("autosave-5m", {
         enabled: desktopPreferences.autoSaveEvery5Minutes,
       });
+      /**
+       * Create output overlay windows after the main shell has loaded so the
+       * bundled Next server is already serving `/overlay` (startup race when
+       * overlays were created synchronously with the main window).
+       */
+      createOverlayWindows();
     });
+  } else {
+    createOverlayWindows();
   }
-  createOverlayWindows();
   if (startupWarning) {
     void dialog.showMessageBox(mainWindow, {
       type: "warning",
@@ -2092,6 +3455,19 @@ app.on("window-all-closed", () => {
 
 app.on("before-quit", () => {
   app.isQuitting = true;
+  /**
+   * Stop NDI feeds first, before the offscreen `BrowserWindow`s would be
+   * torn down by `closeOverlayWindows()` (NDI feeds own their own
+   * offscreen windows but the order matters for clean log output and
+   * avoids "send to destroyed webContents" warnings during teardown).
+   * grandiose's `NDIlib_send_destroy` runs on JS GC and is best-effort
+   * here — receivers detect the dropout within ~3 s either way.
+   */
+  try {
+    ndiFeed.stopAllNdiFeeds((line) => appendUpdaterLog(`${nowIso()}  ${line}\n`));
+  } catch (err) {
+    appendUpdaterLog(`${nowIso()}  ndi-feed: stopAllNdiFeeds threw ${String(err?.message || err)}\n`);
+  }
   closeOverlayWindows();
   if (bundledServerProcess && !bundledServerProcess.killed) {
     bundledServerProcess.kill();

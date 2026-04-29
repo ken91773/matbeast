@@ -10,9 +10,24 @@ export const matbeastKeys = {
     [...matbeastKeys.all, "bracket", tournamentId ?? "none"] as const,
   teams: (tournamentId: string | null) =>
     [...matbeastKeys.all, "teams", tournamentId ?? "none"] as const,
-  /** Scoped by active tournament so live vs training caches never mix. */
-  playerProfiles: (tournamentId: string | null) =>
-    [...matbeastKeys.all, "player-profiles", tournamentId ?? "none"] as const,
-  masterTeamNames: (tournamentId: string | null) =>
-    [...matbeastKeys.all, "master-team-names", tournamentId ?? "none"] as const,
+  /** Scoped by active tournament + training tab so live vs training caches never mix. */
+  playerProfiles: (
+    tournamentId: string | null,
+    teamHintId?: string | null,
+    useTrainingMasters?: boolean,
+  ) =>
+    [
+      ...matbeastKeys.all,
+      "player-profiles",
+      tournamentId ?? "none",
+      teamHintId?.trim() ? teamHintId.trim() : "none",
+      useTrainingMasters === true ? "training" : "live",
+    ] as const,
+  masterTeamNames: (tournamentId: string | null, useTrainingMasters?: boolean) =>
+    [
+      ...matbeastKeys.all,
+      "master-team-names",
+      tournamentId ?? "none",
+      useTrainingMasters === true ? "training" : "live",
+    ] as const,
 };

@@ -24,12 +24,14 @@ export default async function DesktopTokensPage() {
       </h1>
       <p style={{ fontSize: 15, opacity: 0.75, marginTop: 0, lineHeight: 1.6 }}>
         Long-lived API tokens that the Mat Beast Scoreboard desktop app uses to
-        sync master lists with the cloud. Each desktop install needs its own
-        token. Revoke a token to instantly cut that desktop off from the cloud.
+        sync with the cloud. Each install should use its own token. You only see
+        and revoke tokens you created — other workspace members manage theirs
+        separately. Revoking a token immediately cuts that desktop off from the
+        cloud.
       </p>
 
       {userId ? (
-        <DesktopTokensClient currentUserId={userId} />
+        <DesktopTokensClient />
       ) : (
         <section
           style={{

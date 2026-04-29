@@ -11,9 +11,19 @@ import {
 import {
   buildFinalSummaryLine,
   fighterSummaryFromPlayerOrCustom,
+  formatMatchClockForResultSummary,
   formatTime12h,
+  resultRoundLabelForResultLog,
 } from "@/lib/result-log-summary";
 import { setBracketMatchWinner } from "@/lib/bracket-engine";
+import {
+  effectiveOtRoundElapsedSeconds,
+  foldOtRoundElapsedOrphanAnchorWhenPaused,
+  isOtRoundLabelFromDropdown,
+  otRoundElapsedTotalFromAnchoredBase,
+  otRoundIndexFromLabel,
+  reconcileBoardStateForRoundLabelChange,
+} from "@/lib/ot-round-label";
 import { FinalResultType, Prisma } from "@prisma/client";
 
 const FINAL_SAVE_TYPES = new Set<string>([
@@ -79,6 +89,7 @@ type PreFinalSnapshot = {
   matchSummaryResultLogId?: string | null;
   bracketMatchId?: string | null;
   bracketWinnerTeamIdBefore?: string | null;
+  showFinalWinnerHighlight?: boolean;
 };
 
 function prismaErrorMessage(error: unknown): string {
@@ -87,6 +98,18 @@ function prismaErrorMessage(error: unknown): string {
   }
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+function withOtPlayDirectionDefaults(
+  state: Awaited<ReturnType<typeof ensureLiveScoreboardState>>,
+) {
+  const next = { ...state };
+  next.otPlayDirection = next.otPlayDirection === -1 ? -1 : 1;
+  next.timerCuesResetNonce = Number.isFinite(next.timerCuesResetNonce)
+    ? next.timerCuesResetNonce
+    : 0;
+  next.otRoundTransferConsumed = Boolean(next.otRoundTransferConsumed);
+  return next;
 }
 
 function isMissingTournamentIdColumnMessage(message: string): boolean {
@@ -453,6 +476,13 @@ function effectiveSeconds(
   return Math.max(0, Math.ceil(ms / 1000));
 }
 
+/** JSON may deliver direction as a string; mis-parsed +/− must not flip OT mode. */
+function otPlayDirectionFromUnknown(direction: unknown): 1 | -1 {
+  if (direction === -1 || direction === "-1") return -1;
+  const n = Number(direction);
+  return n === -1 ? -1 : 1;
+}
+
 export async function GET(req: Request) {
   try {
     const tournamentId = await resolveTournamentIdFromRequest(req);
@@ -495,6 +525,9 @@ type Command =
   | { type: "play_sound_10_now" }
   | { type: "play_sound_0_now" }
   | { type: "set_timer_rest_period" }
+  | { type: "set_timer_ot_countup" }
+  | { type: "set_ot_play_direction"; direction: 1 | -1 }
+  | { type: "ot_round_transfer_elapsed_to_main" }
   | { type: "swap_mat_corners" }
   | {
       type: "final_save";
@@ -530,7 +563,30 @@ export async function PATCH(req: Request) {
 
     const state = await ensureLiveScoreboardState(tournamentId);
 
-    const next = { ...state };
+    const next = withOtPlayDirectionDefaults(state);
+    /**
+     * When false, OT secondary clock + transfer columns are omitted from the
+     * Prisma update so concurrent timer/OT writes are not clobbered by stale
+     * values from this request's initial read (e.g. amber APPLY with fighters).
+     */
+    let persistOtRoundSecondaryClock = false;
+    const markPersistOtRoundSecondaryClock = () => {
+      persistOtRoundSecondaryClock = true;
+    };
+    const bumpTimerCueNonce = () => {
+      next.timerCuesResetNonce = (next.timerCuesResetNonce ?? 0) + 1;
+    };
+    const resetOtRoundSecondary = () => {
+      markPersistOtRoundSecondaryClock();
+      next.otRoundElapsedBaseSeconds = 0;
+      next.otRoundElapsedRunStartedAt = null;
+      next.otRoundTransferConsumed = false;
+      next.otRoundTransferUndoMainSeconds = null;
+      next.otRoundTransferUndoElapsedTotal = null;
+    };
+    const dimWinnerGlowIfFinalSaved = () => {
+      if (next.finalSaved) next.showFinalWinnerHighlight = false;
+    };
 
   if (body.leftPlayerId !== undefined) {
     next.leftPlayerId = body.leftPlayerId;
@@ -563,7 +619,17 @@ export async function PATCH(req: Request) {
         : null;
   }
   if (typeof body.roundLabel === "string" && body.roundLabel.trim()) {
-    next.roundLabel = body.roundLabel.trim();
+    const trimmed = body.roundLabel.trim();
+    const prev = next.roundLabel;
+    /** Same label (e.g. fighter-only APPLY echoing the board) must not re-run OT reconcile. */
+    if (prev.trim() !== trimmed) {
+      const prevRoundLabelForOt = prev;
+      next.roundLabel = trimmed;
+      reconcileBoardStateForRoundLabelChange(prevRoundLabelForOt, next);
+      markPersistOtRoundSecondaryClock();
+    } else if (prev !== trimmed) {
+      next.roundLabel = trimmed;
+    }
   }
   if (body.currentRosterFileName !== undefined) {
     const rosterName =
@@ -583,23 +649,64 @@ export async function PATCH(req: Request) {
 
     switch (cmd.type) {
       case "timer_start": {
+        if (next.overtimeIndex === -3) {
+          const dir = next.otPlayDirection === -1 ? -1 : 1;
+          if (dir === 1) {
+            next.overtimeIndex = -2;
+            next.timerSeconds = 60;
+            next.timerRunning = true;
+            next.timerEndsAt = new Date(Date.now() + 60 * 1000);
+          } else {
+            const downSec = Math.min(
+              60,
+              Math.max(0, sec),
+            );
+            if (downSec <= 0) {
+              break;
+            }
+            next.overtimeIndex = -4;
+            next.timerSeconds = downSec;
+            next.timerRunning = true;
+            next.timerEndsAt = new Date(Date.now() + downSec * 1000);
+          }
+          break;
+        }
         next.timerSeconds = sec;
         next.timerRunning = true;
-        next.timerEndsAt = new Date(Date.now() + sec * 1000);
+        next.timerEndsAt = new Date(Date.now() + Math.max(0, sec) * 1000);
+        if (isOtRoundLabelFromDropdown(next.roundLabel)) {
+          markPersistOtRoundSecondaryClock();
+          next.otRoundElapsedRunStartedAt = new Date();
+        }
         break;
       }
       case "timer_pause": {
+        if (isOtRoundLabelFromDropdown(next.roundLabel)) {
+          markPersistOtRoundSecondaryClock();
+          if (next.timerRunning && next.otRoundElapsedRunStartedAt) {
+            const delta = Math.floor(
+              (Date.now() - next.otRoundElapsedRunStartedAt.getTime()) / 1000,
+            );
+            next.otRoundElapsedBaseSeconds = Math.max(
+              0,
+              next.otRoundElapsedBaseSeconds + delta,
+            );
+          }
+          next.otRoundElapsedRunStartedAt = null;
+        }
         next.timerSeconds = sec;
         next.timerRunning = false;
         next.timerEndsAt = null;
         break;
       }
       case "reset_match": {
+        bumpTimerCueNonce();
         next.timerSeconds = 240;
         next.timerRunning = false;
         next.timerEndsAt = null;
         next.timerPhase = "REGULATION";
         next.overtimeIndex = 0;
+        next.otPlayDirection = 1;
         next.overtimeWinsLeft = 0;
         next.overtimeWinsRight = 0;
         next.leftEliminatedCount = 0;
@@ -610,21 +717,42 @@ export async function PATCH(req: Request) {
         next.customLeftTeamName = null;
         next.customRightName = null;
         next.customRightTeamName = null;
+        resetOtRoundSecondary();
+        next.showFinalWinnerHighlight = true;
         break;
       }
       case "reset_timer_regulation": {
+        bumpTimerCueNonce();
+        resetOtRoundSecondary();
+        dimWinnerGlowIfFinalSaved();
         next.timerSeconds = 240;
         next.timerRunning = false;
         next.timerEndsAt = null;
-        next.timerPhase = "REGULATION";
-        next.overtimeIndex = 0;
+        next.otPlayDirection = 1;
+        if (isOtRoundLabelFromDropdown(next.roundLabel)) {
+          next.timerPhase = "OVERTIME";
+          next.overtimeIndex = otRoundIndexFromLabel(next.roundLabel) ?? 1;
+        } else {
+          next.timerPhase = "REGULATION";
+          next.overtimeIndex = 0;
+        }
         break;
       }
       case "reset_timer_overtime": {
+        bumpTimerCueNonce();
+        resetOtRoundSecondary();
+        dimWinnerGlowIfFinalSaved();
         next.timerSeconds = 60;
         next.timerRunning = false;
         next.timerEndsAt = null;
-        next.overtimeIndex = 0;
+        next.otPlayDirection = 1;
+        if (isOtRoundLabelFromDropdown(next.roundLabel)) {
+          next.timerPhase = "OVERTIME";
+          next.overtimeIndex = otRoundIndexFromLabel(next.roundLabel) ?? 1;
+        } else {
+          next.timerPhase = "REGULATION";
+          next.overtimeIndex = 0;
+        }
         break;
       }
       case "set_timer_seconds": {
@@ -633,25 +761,47 @@ export async function PATCH(req: Request) {
           0,
           Math.min(24 * 3600, Math.trunc(cmd.seconds)),
         );
+        bumpTimerCueNonce();
+        resetOtRoundSecondary();
+        if (clamped === 300 || clamped === 240 || clamped === 60) {
+          dimWinnerGlowIfFinalSaved();
+        }
         next.timerSeconds = clamped;
         next.timerRunning = false;
         next.timerEndsAt = null;
-        next.timerPhase = "REGULATION";
-        next.overtimeIndex = 0;
+        if (isOtRoundLabelFromDropdown(next.roundLabel)) {
+          next.timerPhase = "OVERTIME";
+          next.overtimeIndex = otRoundIndexFromLabel(next.roundLabel) ?? 1;
+        } else {
+          next.timerPhase = "REGULATION";
+          next.overtimeIndex = 0;
+        }
+        next.otPlayDirection = 1;
         break;
       }
       case "set_timer_rest_period": {
+        bumpTimerCueNonce();
+        resetOtRoundSecondary();
         next.timerSeconds = 60;
         next.timerRunning = false;
         next.timerEndsAt = null;
         next.timerPhase = "REGULATION";
         next.overtimeIndex = -1;
+        next.otPlayDirection = 1;
         break;
       }
       case "adjust_timer_seconds": {
         if (!Number.isFinite(cmd.deltaSeconds)) break;
         const delta = Math.trunc(cmd.deltaSeconds);
-        const adjusted = Math.max(0, sec + delta);
+        let adjusted = Math.max(0, sec + delta);
+        if (
+          next.overtimeIndex === -2 ||
+          next.overtimeIndex === -3 ||
+          next.overtimeIndex === -4
+        ) {
+          adjusted = Math.min(60, adjusted);
+        }
+        bumpTimerCueNonce();
         next.timerSeconds = adjusted;
         if (next.timerRunning) {
           next.timerEndsAt = new Date(Date.now() + adjusted * 1000);
@@ -660,7 +810,58 @@ export async function PATCH(req: Request) {
         }
         break;
       }
+      case "set_timer_ot_countup": {
+        bumpTimerCueNonce();
+        resetOtRoundSecondary();
+        next.timerSeconds = 0;
+        next.timerRunning = false;
+        next.timerEndsAt = null;
+        next.timerPhase = "REGULATION";
+        next.overtimeIndex = -3;
+        next.otPlayDirection = 1;
+        break;
+      }
+      case "set_ot_play_direction": {
+        bumpTimerCueNonce();
+        const dir = otPlayDirectionFromUnknown(cmd.direction);
+        const oi = next.overtimeIndex;
+        const secSnap = effectiveSeconds(
+          next.timerRunning,
+          next.timerEndsAt,
+          next.timerSeconds,
+        );
+        const paused = !next.timerRunning;
+
+        if (oi === -3) {
+          const wallSec = Math.min(60, Math.max(0, secSnap));
+          next.otPlayDirection = dir;
+          // +/− only switch count-up vs count-down arm; preserve wall time.
+          // `set_timer_ot_countup` (OT button) is the path that resets to +0:00.
+          next.timerSeconds = wallSec;
+          next.timerRunning = false;
+          next.timerEndsAt = null;
+          break;
+        }
+
+        // Paused OT minute (−2 count-up / −4 count-down): +/− re-arms so the
+        // control reacts instead of no-op while otMode is still true.
+        if (paused && (oi === -2 || oi === -4)) {
+          const wallSec =
+            oi === -2
+              ? Math.min(60, Math.max(0, 60 - secSnap))
+              : Math.min(60, Math.max(0, secSnap));
+          next.overtimeIndex = -3;
+          next.otPlayDirection = dir;
+          next.timerSeconds = wallSec;
+          next.timerRunning = false;
+          next.timerEndsAt = null;
+          break;
+        }
+
+        break;
+      }
       case "begin_overtime_period": {
+        bumpTimerCueNonce();
         next.timerPhase = "OVERTIME";
         next.overtimeIndex = next.overtimeIndex <= 0 ? 1 : next.overtimeIndex;
         next.timerSeconds = 60;
@@ -669,6 +870,7 @@ export async function PATCH(req: Request) {
         break;
       }
       case "advance_overtime_minute": {
+        bumpTimerCueNonce();
         if (next.timerPhase !== "OVERTIME") break;
         if (next.overtimeIndex >= 3) break;
         next.overtimeIndex = next.overtimeIndex + 1;
@@ -719,6 +921,55 @@ export async function PATCH(req: Request) {
         next.sound0PlayNonce = (next.sound0PlayNonce ?? 0) + 1;
         break;
       }
+      case "ot_round_transfer_elapsed_to_main": {
+        if (!isOtRoundLabelFromDropdown(next.roundLabel)) break;
+        if (next.timerRunning) break;
+        markPersistOtRoundSecondaryClock();
+        if (next.otRoundTransferConsumed) {
+          const backMain = next.otRoundTransferUndoMainSeconds;
+          const backElapsed = next.otRoundTransferUndoElapsedTotal;
+          bumpTimerCueNonce();
+          if (
+            backMain != null &&
+            Number.isFinite(backMain) &&
+            backElapsed != null &&
+            Number.isFinite(backElapsed)
+          ) {
+            next.timerSeconds = Math.max(
+              0,
+              Math.min(24 * 3600, Math.trunc(backMain)),
+            );
+            next.otRoundElapsedBaseSeconds = Math.max(
+              0,
+              Math.trunc(backElapsed),
+            );
+          }
+          next.otRoundElapsedRunStartedAt = null;
+          next.otRoundTransferConsumed = false;
+          next.otRoundTransferUndoMainSeconds = null;
+          next.otRoundTransferUndoElapsedTotal = null;
+          next.timerRunning = false;
+          next.timerEndsAt = null;
+          break;
+        }
+        const el = otRoundElapsedTotalFromAnchoredBase({
+          otRoundElapsedBaseSeconds: next.otRoundElapsedBaseSeconds,
+          otRoundElapsedRunStartedAt: next.otRoundElapsedRunStartedAt,
+        });
+        bumpTimerCueNonce();
+        next.otRoundTransferUndoMainSeconds = Math.max(
+          0,
+          Math.min(24 * 3600, sec),
+        );
+        next.otRoundTransferUndoElapsedTotal = Math.max(0, el);
+        next.timerSeconds = Math.max(0, Math.min(24 * 3600, el));
+        next.otRoundElapsedBaseSeconds = 0;
+        next.otRoundElapsedRunStartedAt = null;
+        next.otRoundTransferConsumed = true;
+        next.timerRunning = false;
+        next.timerEndsAt = null;
+        break;
+      }
       case "swap_mat_corners": {
         if (next.finalSaved) {
           return NextResponse.json(
@@ -753,12 +1004,18 @@ export async function PATCH(req: Request) {
         next.customLeftTeamName = null;
         next.customRightName = null;
         next.customRightTeamName = null;
+        const prevRlClear = next.roundLabel;
         next.roundLabel = "Quarter Finals";
+        reconcileBoardStateForRoundLabelChange(prevRlClear, next);
+        next.leftEliminatedCount = 0;
+        next.rightEliminatedCount = 0;
         next.finalSaved = false;
         next.finalResultType = null;
         next.finalWinnerName = null;
         next.finalResultLogId = null;
         next.preFinalStateJson = null;
+        resetOtRoundSecondary();
+        next.showFinalWinnerHighlight = true;
         break;
       }
       case "final_save": {
@@ -811,12 +1068,35 @@ export async function PATCH(req: Request) {
           next.customRightTeamName,
           rightP,
         );
+        const otRoundForSave = isOtRoundLabelFromDropdown(next.roundLabel);
+        const otElapsedSnap = otRoundForSave
+          ? effectiveOtRoundElapsedSeconds({
+              otRoundElapsedBaseSeconds: next.otRoundElapsedBaseSeconds,
+              otRoundElapsedRunStartedAt: next.otRoundElapsedRunStartedAt,
+              timerRunning: next.timerRunning,
+            })
+          : null;
+        const clockSnap = formatMatchClockForResultSummary(
+          next.overtimeIndex,
+          next.timerRunning,
+          next.timerEndsAt,
+          next.timerSeconds,
+          otElapsedSnap != null
+            ? { otRoundElapsedSeconds: otElapsedSnap }
+            : undefined,
+        );
+        const resultRound = resultRoundLabelForResultLog({
+          overtimeIndex: next.overtimeIndex,
+          roundLabel: next.roundLabel,
+        });
         const finalSummaryLine = buildFinalSummaryLine(
           savedAt,
           rt,
           leftFighter,
           rightFighter,
-          next.roundLabel,
+          resultRound,
+          clockSnap,
+          otRoundForSave ? "elapsed" : "clock",
         );
 
         // Capture merged board state *before* final bump (same request body as fighters).
@@ -834,21 +1114,25 @@ export async function PATCH(req: Request) {
           matchSummaryResultLogId: null,
           bracketMatchId: null,
           bracketWinnerTeamIdBefore: null,
+          showFinalWinnerHighlight: next.showFinalWinnerHighlight,
         };
 
         const lose = losingSideForFinal(rt);
         let newLeftElim = next.leftEliminatedCount;
         let newRightElim = next.rightEliminatedCount;
-        if (lose === "left") {
-          newLeftElim = Math.min(5, newLeftElim + 1);
-        } else if (lose === "right") {
-          newRightElim = Math.min(5, newRightElim + 1);
+        /** OT round finals are not quintet elimination — do not advance body X marks. */
+        if (!otRoundForSave) {
+          if (lose === "left") {
+            newLeftElim = Math.min(5, newLeftElim + 1);
+          } else if (lose === "right") {
+            newRightElim = Math.min(5, newRightElim + 1);
+          }
         }
 
         const insertResult = await insertResultLogForFinal({
           tournamentId,
           rosterFileName: next.currentRosterFileName,
-          roundLabel: next.roundLabel,
+          roundLabel: resultRound,
           leftName,
           rightName,
           leftTeamName: leftTeamName || null,
@@ -886,13 +1170,13 @@ export async function PATCH(req: Request) {
               : "";
 
         if (isMatchComplete && matchWinnerTeam && matchLoserTeam) {
-          const round = (next.roundLabel ?? "").trim().toUpperCase();
+          const round = resultRound.trim().toUpperCase();
           const roundSuffix = round ? ` — ${round}` : "";
           const summaryLine = `${formatTime12h(savedAt)} ${matchWinnerTeam.toUpperCase()} def. ${matchLoserTeam.toUpperCase()}${roundSuffix}`;
           const matchSummaryId = await insertResultLogForMatchSummary({
             tournamentId,
             rosterFileName: next.currentRosterFileName,
-            roundLabel: next.roundLabel,
+            roundLabel: resultRound,
             line: summaryLine,
           });
           snapshot.matchSummaryResultLogId = matchSummaryId;
@@ -932,6 +1216,7 @@ export async function PATCH(req: Request) {
         next.leftEliminatedCount = newLeftElim;
         next.rightEliminatedCount = newRightElim;
         next.finalSaved = true;
+        next.showFinalWinnerHighlight = true;
         next.finalResultType = rt;
         next.finalWinnerName =
           finalWinnerDisplay(
@@ -1020,6 +1305,11 @@ export async function PATCH(req: Request) {
                 Math.min(5, Math.trunc(snap.rightEliminatedCount)),
               );
             }
+            if (typeof snap.showFinalWinnerHighlight === "boolean") {
+              next.showFinalWinnerHighlight = snap.showFinalWinnerHighlight;
+            } else {
+              next.showFinalWinnerHighlight = true;
+            }
           }
         } catch (e) {
           console.warn("[api/board final_unsave] bad preFinalStateJson:", e);
@@ -1089,6 +1379,28 @@ export async function PATCH(req: Request) {
     }
   }
 
+  if (
+    next.timerRunning &&
+    next.timerEndsAt &&
+    next.timerEndsAt.getTime() <= Date.now()
+  ) {
+    next.timerSeconds = 0;
+    next.timerRunning = false;
+    next.timerEndsAt = null;
+    if (isOtRoundLabelFromDropdown(next.roundLabel) && next.otRoundElapsedRunStartedAt) {
+      markPersistOtRoundSecondaryClock();
+      const delta = Math.floor(
+        (Date.now() - next.otRoundElapsedRunStartedAt.getTime()) / 1000,
+      );
+      next.otRoundElapsedBaseSeconds = Math.max(0, next.otRoundElapsedBaseSeconds + delta);
+      next.otRoundElapsedRunStartedAt = null;
+    }
+  }
+
+  if (foldOtRoundElapsedOrphanAnchorWhenPaused(next)) {
+    markPersistOtRoundSecondaryClock();
+  }
+
   await prisma.liveScoreboardState.update({
     where: { tournamentId },
     data: {
@@ -1118,6 +1430,18 @@ export async function PATCH(req: Request) {
       sound0Enabled: next.sound0Enabled,
       sound10PlayNonce: next.sound10PlayNonce,
       sound0PlayNonce: next.sound0PlayNonce,
+      otPlayDirection: next.otPlayDirection,
+      ...(persistOtRoundSecondaryClock
+        ? {
+            otRoundElapsedBaseSeconds: next.otRoundElapsedBaseSeconds,
+            otRoundElapsedRunStartedAt: next.otRoundElapsedRunStartedAt,
+            otRoundTransferConsumed: next.otRoundTransferConsumed,
+            otRoundTransferUndoMainSeconds: next.otRoundTransferUndoMainSeconds,
+            otRoundTransferUndoElapsedTotal: next.otRoundTransferUndoElapsedTotal,
+          }
+        : {}),
+      showFinalWinnerHighlight: next.showFinalWinnerHighlight,
+      timerCuesResetNonce: next.timerCuesResetNonce,
     },
   });
 

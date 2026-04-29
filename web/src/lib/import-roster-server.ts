@@ -1,5 +1,7 @@
 import type { EventKind } from "@prisma/client";
+import { syncDownstreamRounds } from "@/lib/bracket-engine";
 import { prisma } from "@/lib/prisma";
+import { normalizeRosterDocumentLineups } from "@/lib/roster-lineup-normalize";
 import { ensureEightTeamSlots } from "@/lib/teams-bootstrap";
 import type { RosterFileDocument } from "@/lib/roster-file-types";
 
@@ -8,26 +10,13 @@ function validateImportDocument(doc: RosterFileDocument) {
     if (team.seedOrder < 1 || team.seedOrder > 8) {
       throw new Error("Team seeds must be between 1 and 8");
     }
-    const seenSlots = new Set<number>();
-    for (const player of team.players) {
-      if (!player.firstName.trim() || !player.lastName.trim()) {
-        throw new Error(`Seed ${team.seedOrder} has player missing names`);
-      }
-      if (seenSlots.has(player.lineupOrder)) {
-        throw new Error(`Seed ${team.seedOrder} has duplicate lineup slots`);
-      }
-      seenSlots.add(player.lineupOrder);
-    }
-    if (team.players.length > 7) {
-      throw new Error(`Seed ${team.seedOrder} has more than 7 players`);
-    }
   }
 }
 
 /** Apply roster JSON to tournament’s primary event (replaces players, updates team names, syncs event kind). */
 export async function importRosterDocumentForTournament(
   tournamentId: string,
-  document: RosterFileDocument,
+  documentIn: RosterFileDocument,
   bracket?: {
     version: 1;
     matches: Array<{
@@ -39,6 +28,7 @@ export async function importRosterDocumentForTournament(
     }>;
   },
 ) {
+  const document = normalizeRosterDocumentLineups(documentIn);
   validateImportDocument(document);
 
   const targetKind = document.eventKind as EventKind;
@@ -150,6 +140,7 @@ export async function importRosterDocumentForTournament(
           },
         });
       }
+      await syncDownstreamRounds(tx, ev.id);
     });
   }
 }

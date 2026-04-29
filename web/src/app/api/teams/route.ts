@@ -7,7 +7,7 @@ import {
   upsertMasterTeamName,
   upsertTrainingMasterTeamName,
 } from "@/lib/master-team-names";
-import { tournamentUsesTrainingMasters } from "@/lib/masters-training-mode";
+import { resolveUseTrainingMastersForProfileRequest } from "@/lib/masters-training-mode";
 import {
   forbiddenUserChosenTeamNameMessage,
   isForbiddenUserChosenTeamName,
@@ -86,6 +86,7 @@ export async function POST(req: Request) {
       seedOrder?: number;
       eventKind?: EventKind;
       tournamentId?: string;
+      useTrainingMasters?: unknown;
     };
     const name = body.name?.trim();
     if (!name) {
@@ -127,7 +128,10 @@ export async function POST(req: Request) {
         seedOrder: body.seedOrder ?? count + 1,
       },
     });
-    const training = await tournamentUsesTrainingMasters(tournamentId);
+    const training = await resolveUseTrainingMastersForProfileRequest(req, {
+      tournamentId,
+      useTrainingMasters: body.useTrainingMasters,
+    });
     if (training) {
       await upsertTrainingMasterTeamName(name);
     } else {

@@ -52,6 +52,7 @@ type BoardSnapshot = {
   secondsRemaining: number;
   timerRunning: boolean;
   timerPhase: "REGULATION" | "OVERTIME";
+  /** Includes `-1` rest / `-2` OT count-up when captured from the live board API. */
   overtimeIndex: number;
   overtimeWinsLeft: number;
   overtimeWinsRight: number;

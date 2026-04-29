@@ -15,7 +15,8 @@ export type RosterFilePlayer = {
   beltRank: BeltRank;
   profilePhotoUrl: string | null;
   headShotUrl: string | null;
-  lineupOrder: number;
+  /** `null` = not in the 1–7 quintet lineup (bench, etc.). */
+  lineupOrder: number | null;
   lineupConfirmed: boolean;
   weighedConfirmed: boolean;
 };

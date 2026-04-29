@@ -4,7 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { ensureMasterTeamNameTable } from "@/lib/master-team-name-table";
 import { upsertMasterTeamName } from "@/lib/master-team-names";
 import { migrateMastersSplitIfNeeded } from "@/lib/migrate-masters-split";
-import { resolveUseTrainingMasters } from "@/lib/masters-training-mode";
+import { resolveUseTrainingMastersForProfileRequest } from "@/lib/masters-training-mode";
 import {
   forbiddenUserChosenTeamNameMessage,
   isForbiddenUserChosenTeamName,
@@ -23,7 +23,17 @@ function isMissingMasterTeamNameTable(error: unknown): boolean {
 export async function GET(req: Request) {
   try {
     await migrateMastersSplitIfNeeded();
-    const training = await resolveUseTrainingMasters(req);
+    const url = new URL(req.url);
+    const tournamentIdHint = url.searchParams.get("tournamentId");
+    const umRaw = url.searchParams.get("useTrainingMasters")?.trim().toLowerCase();
+    let useTrainingHint: boolean | undefined;
+    if (umRaw === "0" || umRaw === "false") useTrainingHint = false;
+    else if (umRaw === "1" || umRaw === "true") useTrainingHint = true;
+    const training = await resolveUseTrainingMastersForProfileRequest(req, {
+      tournamentId: tournamentIdHint,
+      teamId: null,
+      ...(useTrainingHint !== undefined ? { useTrainingMasters: useTrainingHint } : {}),
+    });
     if (training) {
       await prisma.trainingMasterTeamName.deleteMany({
         where: {
@@ -66,8 +76,20 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   try {
     await migrateMastersSplitIfNeeded();
-    const training = await resolveUseTrainingMasters(req);
-    const body = (await req.json()) as { name?: string };
+    const body = (await req.json()) as {
+      name?: string;
+      tournamentId?: string;
+      useTrainingMasters?: unknown;
+    };
+    const tid =
+      typeof body.tournamentId === "string" ? body.tournamentId.trim() : "";
+    const training = await resolveUseTrainingMastersForProfileRequest(req, {
+      tournamentId: tid || null,
+      teamId: null,
+      ...("useTrainingMasters" in body
+        ? { useTrainingMasters: body.useTrainingMasters }
+        : {}),
+    });
     const name = body.name?.trim().toUpperCase() ?? "";
     if (!name) {
       return NextResponse.json({ error: "name is required" }, { status: 400 });
@@ -111,8 +133,20 @@ async function upsertTrainingOnly(name: string): Promise<void> {
 export async function DELETE(req: Request) {
   try {
     await migrateMastersSplitIfNeeded();
-    const training = await resolveUseTrainingMasters(req);
-    const body = (await req.json()) as { name?: string };
+    const body = (await req.json()) as {
+      name?: string;
+      tournamentId?: string;
+      useTrainingMasters?: unknown;
+    };
+    const tid =
+      typeof body.tournamentId === "string" ? body.tournamentId.trim() : "";
+    const training = await resolveUseTrainingMastersForProfileRequest(req, {
+      tournamentId: tid || null,
+      teamId: null,
+      ...("useTrainingMasters" in body
+        ? { useTrainingMasters: body.useTrainingMasters }
+        : {}),
+    });
     const name = body.name?.trim().toUpperCase() ?? "";
     if (!name) {
       return NextResponse.json({ error: "name is required" }, { status: 400 });

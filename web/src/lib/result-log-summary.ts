@@ -1,4 +1,5 @@
 import type { FinalResultType } from "@/types/board";
+import { isOtRoundLabelFromDropdown } from "@/lib/ot-round-label";
 
 export type FighterSummary = {
   team: string;
@@ -8,6 +9,60 @@ export type FighterSummary = {
 
 function pad2(n: number) {
   return n < 10 ? `0${n}` : String(n);
+}
+
+function fmtClockTotalSec(totalSec: number) {
+  const s = Math.max(0, Math.trunc(totalSec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${pad2(r)}`;
+}
+
+function effectiveTimerRemainSeconds(
+  timerRunning: boolean,
+  timerEndsAt: Date | null,
+  timerSeconds: number,
+): number {
+  if (!timerRunning || !timerEndsAt) return Math.max(0, timerSeconds);
+  const ms = timerEndsAt.getTime() - Date.now();
+  return Math.max(0, Math.ceil(ms / 1000));
+}
+
+/** Round text stored on final result rows when the scoreboard subclock shows OT/REST. */
+export function resultRoundLabelForResultLog(params: {
+  overtimeIndex: number;
+  roundLabel: string;
+}): string {
+  const oi = params.overtimeIndex;
+  if (isOtRoundLabelFromDropdown(params.roundLabel)) {
+    return params.roundLabel.trim();
+  }
+  if (oi === -1) return "REST PERIOD";
+  if (oi === -2 || oi === -3 || oi === -4) return "OT PERIOD";
+  const r = params.roundLabel.trim();
+  return r || "Quarter Finals";
+}
+
+/** Match clock as recorded on final save (count-down, or OT count-up 0:00–1:00 as `OT M:SS`). */
+export function formatMatchClockForResultSummary(
+  overtimeIndex: number,
+  timerRunning: boolean,
+  timerEndsAt: Date | null,
+  timerSeconds: number,
+  opts?: { otRoundElapsedSeconds?: number | null },
+): string {
+  if (opts?.otRoundElapsedSeconds != null) {
+    return fmtClockTotalSec(opts.otRoundElapsedSeconds);
+  }
+  const sec = effectiveTimerRemainSeconds(timerRunning, timerEndsAt, timerSeconds);
+  if (overtimeIndex === -2) {
+    const elapsed = Math.min(60, Math.max(0, 60 - sec));
+    return `OT ${fmtClockTotalSec(elapsed)}`;
+  }
+  if (overtimeIndex === -3 || overtimeIndex === -4) {
+    return `OT ${fmtClockTotalSec(sec)}`;
+  }
+  return fmtClockTotalSec(sec);
 }
 
 /** US-style date and 24h time as in "1/1/2026 14:28" */
@@ -77,6 +132,8 @@ export function buildFinalSummaryLine(
   left: FighterSummary,
   right: FighterSummary,
   roundLabel?: string | null,
+  matchClock?: string | null,
+  matchClockVerb: "clock" | "elapsed" = "clock",
 ): string | null {
   const wl = winnerLoserFromResultType(resultType, left, right);
   if (!wl) return null;
@@ -87,7 +144,12 @@ export function buildFinalSummaryLine(
   const by = method ? ` by ${method}` : "";
   const round = roundLabel?.trim() ?? "";
   const roundSuffix = round ? ` — ${round.toUpperCase()}` : "";
-  return `${timeStr} ${w} def ${l}${by}${roundSuffix}`;
+  const clockSuffix = matchClock?.trim()
+    ? matchClockVerb === "elapsed"
+      ? ` | Elapsed: ${matchClock.trim()}`
+      : ` | clock ${matchClock.trim()}`
+    : "";
+  return `${timeStr} ${w} def ${l}${by}${roundSuffix}${clockSuffix}`;
 }
 
 export function fighterSummaryFromPlayerOrCustom(
@@ -169,5 +231,6 @@ export function getResultLogOneLine(r: {
     left,
     right,
     r.roundLabel,
+    null,
   );
 }

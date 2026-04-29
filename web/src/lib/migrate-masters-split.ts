@@ -16,18 +16,24 @@ const MIGRATION_ID = "masters_live_training_split_v1";
  * rows into Training* (preserving ids where possible), then **clears** Master*
  * so live work starts clean while training events keep the old sample rows.
  *
- * Runs on master-list API access until Master* is empty. Safe to call repeatedly:
- * if Master* is already empty, we only ensure the migration marker exists.
+ * Runs on master-list API access. Safe to call repeatedly: once the migration
+ * marker exists, this is a no-op — **new** rows in `Master*` are live production
+ * data and must not be re-processed by the legacy copy-and-wipe path.
  *
- * **Repair:** If the marker was recorded early but Master* still had rows (e.g.
- * a race or old bug), we no longer bail out just because the marker exists —
- * we finish copy + delete whenever Master* is non-empty.
+ * If Master* is empty on first access, we only ensure the migration marker exists.
  *
  * After clearing live Master*, cloud **pull** for those tables is disabled so
  * Mat Beast Masters does not immediately refill local SQLite. Re-enable in
  * Cloud sync settings when you want live lists synced from the cloud again.
  */
 export async function migrateMastersSplitIfNeeded(): Promise<void> {
+  const alreadyMigrated = await prisma.appSchemaMigration.findUnique({
+    where: { id: MIGRATION_ID },
+  });
+  if (alreadyMigrated) {
+    return;
+  }
+
   const masterProfiles = await prisma.masterPlayerProfile.count();
   const masterTeams = await prisma.masterTeamName.count();
   if (masterProfiles === 0 && masterTeams === 0) {

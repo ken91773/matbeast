@@ -1,6 +1,6 @@
 {
   "name": "matbeastscore",
-  "version": "0.9.11",
+  "version": "1.0.0",
   "private": true,
   "description": "Mat Beast Scoreboard - quintet roster, mat control, and broadcast overlay (Windows desktop)",
   "author": "Mat Beast",
@@ -27,7 +27,9 @@
     "desktop:release": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/publish-release.ps1",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "postinstall": "node ./scripts/patch-grandiose.mjs",
+    "ndi:rebuild-electron": "electron-rebuild -f -w grandiose"
   },
   "dependencies": {
     "@fontsource/bebas-neue": "^5.2.7",
@@ -35,6 +37,7 @@
     "@prisma/client": "^6.5.0",
     "@tanstack/react-query": "^5.96.2",
     "electron-updater": "^6.6.2",
+    "grandiose": "github:Streampunk/grandiose#c350e0fb6e74bbf2e4b10144fee456aa1af93f47",
     "next": "^15.2.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
@@ -43,6 +46,7 @@
     "sql.js": "^1.11.0"
   },
   "devDependencies": {
+    "@electron/rebuild": "^4.0.4",
     "@eslint/eslintrc": "^3",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
@@ -66,6 +70,9 @@
   "build": {
     "appId": "com.matbeastscore.scoreboard",
     "productName": "Mat Beast Scoreboard",
+    "electronLanguages": [
+      "en-US"
+    ],
     "afterPack": "./scripts/after-pack-embed-icon.js",
     "directories": {
       "output": "dist"
@@ -82,7 +89,15 @@
       "!node_modules/@next/**/*",
       "!node_modules/sharp/**/*",
       "!node_modules/tailwindcss/**/*",
-      "!node_modules/@tailwindcss/**/*"
+      "!node_modules/@tailwindcss/**/*",
+      "!node_modules/grandiose/build/Release/*.{pdb,iobj,ipdb,exp,lib}",
+      "!node_modules/grandiose/build/Release/obj/**/*",
+      "!node_modules/grandiose/lib/linux_arm64/**/*",
+      "!node_modules/grandiose/lib/linux_x64/**/*",
+      "!node_modules/grandiose/lib/mac_universal/**/*",
+      "!node_modules/grandiose/lib/win_x86/**/*",
+      "!node_modules/grandiose/src/**/*",
+      "!node_modules/grandiose/include/**/*"
     ],
     "extraResources": [
       {
@@ -120,7 +135,16 @@
       {
         "from": "build/demo-seed/sample-events",
         "to": "sample-events",
-        "filter": ["**/*.matb"]
+        "filter": [
+          "**/*.matb"
+        ]
+      },
+      {
+        "from": "build/default-music",
+        "to": "default-music",
+        "filter": [
+          "**/*.{mp3,m4a,aac,ogg,oga,wav,flac,webm,opus}"
+        ]
       }
     ],
     "fileAssociations": [
