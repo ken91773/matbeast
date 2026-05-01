@@ -1,6 +1,43 @@
 # Progress Log
 
 ## Current Build Status
+- **v1.2.10 (2026-05-01)** — mandatory update on launch. When the
+  startup auto-update check finds a newer GitHub release, the
+  dashboard is now blocked by a full-screen overlay until the user
+  installs the update. The operator cannot keep using the outdated
+  build.
+  - **New `MandatoryUpdateGate`**
+    (`src/components/MandatoryUpdateGate.tsx`). Subscribes to the
+    same `app:update-state` IPC stream the header status line uses,
+    and renders a fixed full-screen overlay (z-index 100001 — above
+    the password gate at 99999 and every other dialog) whenever
+    `updateState.status` is `available`, `downloading`, `downloaded`,
+    or `installing`. Shows "Install and restart" only when status
+    is `downloaded`; otherwise shows progress copy + a pulsing dot
+    so the operator knows it isn't a hang.
+  - **Deliberately not blocking** on `up-to-date`, `checking`,
+    `offline`, `error`, or `disabled`. We can't strand operators
+    on field laptops with intermittent connectivity — those states
+    surface in the existing header status line but don't lock the
+    UI.
+  - **Mounted in `RouteChromeShell`** wrapping the existing
+    `FirstLaunchPasswordGate`. Updates take priority because a
+    user shouldn't enter a password into an outdated build whose
+    auth mechanism may have changed in the new release. Skipped on
+    `/overlay` routes so popped-out NDI surfaces never lock up.
+  - **Faster auto-check (`electron/main.js`).** Reduced
+    `scheduleDeferredAutoUpdateCheck`'s startup delay from 45 s to
+    6 s so the gate appears within a few seconds of launch instead
+    of after a long open window where the operator could start
+    tournament work and then be interrupted. The 6 s delay still
+    gives the bundled Next server time to come up so the renderer's
+    IPC subscriber is ready to receive the first state push.
+  - The existing header "Install & restart" pill is preserved (it
+    becomes hidden under the new full-screen gate while a
+    mandatory update is pending). It still serves the
+    user-initiated `Help ▸ Check for Updates…` flow.
+  - Bumped `web/package.json` to `1.2.10`.
+
 - **v1.2.9 (2026-05-01)** — fixes "the password is required on every
   launch instead of only the first" + removes the diagnostic logs
   added in v1.2.2 / v1.2.4 + adds `web/build-*.log` and stray

@@ -982,7 +982,17 @@ function scheduleDeferredAutoUpdateCheck() {
     appendUpdaterLog(`${nowIso()}  Auto update check skipped (MAT_BEAST_SKIP_AUTO_UPDATE_CHECK=1)\n`);
     return;
   }
-  const delayMs = 45000;
+  /**
+   * v1.2.10: shortened from 45s → 6s. The renderer now mounts
+   * `MandatoryUpdateGate` which blocks the entire dashboard while
+   * an update is downloading/ready. We want that gate to appear
+   * within a few seconds of launch so an operator on an outdated
+   * version can't start (and then be interrupted in) tournament
+   * work. Subtle delay (not 0) so the bundled Next server has had
+   * a chance to come up and the renderer's IPC subscriber is ready
+   * to receive the first state push.
+   */
+  const delayMs = 6000;
   appendUpdaterLog(`${nowIso()}  Auto update check scheduled in ${delayMs}ms\n`);
   setTimeout(() => {
     appendUpdaterLog(`${nowIso()}  Deferred checkForUpdates() starting\n`);
