@@ -693,11 +693,9 @@ function ModalShell({
 /* ===========================================================================
  * Not-configured notice — shared by Open and Upload dialogs
  *
- * Appears when /api/cloud/config reports `configured: false`. We split
- * the two underlying reasons (no token vs. sync paused) because they
- * need different actions:
- *   - no token   -> user must paste a token from matbeast-masters
- *   - paused     -> user just needs to flip the toggle back on
+ * Appears when /api/cloud/config reports `configured: false`. v1.2.0
+ * dropped the token requirement, so the only remaining reason for this
+ * is sync being explicitly paused by the operator.
  * ======================================================================== */
 
 function NotConfiguredNotice({
@@ -709,11 +707,9 @@ function NotConfiguredNotice({
 }) {
   const reason = !status
     ? "Cloud settings could not be read."
-    : !status.tokenSet
-      ? "No desktop token is saved on this install. Sign in at Mat Beast Masters → Desktop tokens and paste a token you generated there."
-      : !status.syncEnabled
-        ? "Cloud sync is paused. Re-enable it in Cloud Sync settings."
-        : "Cloud is not configured.";
+    : !status.syncEnabled
+      ? "Cloud sync is paused. Re-enable it in Cloud Sync settings."
+      : "Cloud is not configured.";
   return (
     <>
       <p className="text-[12px] leading-relaxed">{reason}</p>

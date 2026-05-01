@@ -60,8 +60,15 @@ function cloudUrl(cfg: CloudConfig, path: string): string {
   return `${cfg.cloudBaseUrl.replace(/\/+$/, "")}${path}`;
 }
 
+/**
+ * v1.2.0: only forward a Bearer header when a legacy token is still
+ * saved locally (audit-trail continuity for older installs). Returns
+ * an empty header set otherwise — the masters/ cloud server treats
+ * unauthenticated requests as the shared workspace user.
+ */
 function authHeaders(cfg: CloudConfig): Record<string, string> {
-  return { Authorization: `Bearer ${cfg.desktopToken}` };
+  const token = cfg.desktopToken.trim();
+  return token.length > 0 ? { Authorization: `Bearer ${token}` } : {};
 }
 
 async function withTimeout<T>(

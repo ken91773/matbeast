@@ -86,9 +86,17 @@ export async function updateCloudConfig(
 }
 
 /**
- * True when the desktop is fully wired to call the cloud (has a token AND
- * sync is enabled). All cloud sync helpers no-op when this returns false.
+ * True when the desktop is allowed to talk to the cloud right now.
+ *
+ * v1.2.0 (Model A — shared workspace, no auth): the cloud no longer
+ * requires a token, so the only gate is whether the operator has
+ * paused sync from Cloud Settings. The `desktopToken` field is kept
+ * for backwards compatibility (some installs still have one saved
+ * from v1.1.x and earlier) and is forwarded as a Bearer header when
+ * present, but its presence/absence no longer affects "configured".
+ *
+ * All cloud sync helpers no-op when this returns false.
  */
 export function isCloudConfigured(cfg: CloudConfig): boolean {
-  return cfg.syncEnabled && cfg.desktopToken.trim().length > 0;
+  return cfg.syncEnabled;
 }

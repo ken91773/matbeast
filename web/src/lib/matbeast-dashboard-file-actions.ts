@@ -1047,35 +1047,28 @@ export async function matbeastCreateNewEventTab(opts: {
   } = opts;
 
   /**
-   * Pre-flight: refuse to create a new event unless the cloud is
-   * reachable. Events are cloud-first in this build — creating an
-   * event while offline would leave a permanently-LOCAL-ONLY
-   * tournament on this install (no link to a cloud event, no
-   * filename slot reserved, no catalog row). The user's recovery
-   * path from that state is murky, so we'd rather block creation
-   * up front with a clear message than produce a half-synced tab.
+   * Pre-flight (v1.2.0): cloud sync requires no registration anymore.
    *
-   * The demo variant is always offline-by-design, so the probe
-   * would always fail. We skip it entirely and the
-   * `createCloudUntitledForNewTab` call later in this function is
-   * similarly guarded so no cloud POST is ever issued.
+   * - When cloud sync is enabled and the cloud is currently
+   *   UNREACHABLE, we still block creation. Cloud-first semantics
+   *   haven't changed: creating a new event while the cloud is down
+   *   would silently produce a tournament that never makes it into
+   *   the shared catalog, which is confusing on the receiving end.
+   * - When cloud sync is paused ("not-configured"), we let creation
+   *   proceed. The downstream `createCloudUntitledForNewTab` call
+   *   returns `{ status: "not-configured" }` in that case and the
+   *   caller treats it as a successful local-only create.
+   * - Demo mode is always offline-by-design and skips the probe.
    */
   const demoMode = isMatbeastDemo();
   if (!demoMode) {
     const probed = await probeCloud();
-    if (!probed.online) {
-      if (probed.reason === "not-configured") {
-        window.alert(
-          "Cloud sync is not configured on this machine. Configure it under " +
-            "Options ▸ CLOUD SYNC… before creating a new event.",
-        );
-      } else {
-        window.alert(
-          "Can't reach the cloud right now, so a new event can't be created. " +
-            "Check your internet connection and try again. Your existing open " +
-            "events will keep working and re-sync when the connection returns.",
-        );
-      }
+    if (!probed.online && probed.reason !== "not-configured") {
+      window.alert(
+        "Can't reach the cloud right now, so a new event can't be created. " +
+          "Check your internet connection and try again. Your existing open " +
+          "events will keep working and re-sync when the connection returns.",
+      );
       return { ok: false } as const;
     }
   }

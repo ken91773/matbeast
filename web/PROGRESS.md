@@ -20,8 +20,329 @@
   bracket NDI source alongside the scoreboard, and introduces a
   receiver-format-stability warmup so receivers don't latch onto a
   partially-hydrated React tree. Receiving NDI clients now show the
-  actual scoreboard within ~1 s of subscription.
+  actual scoreboard within ~1 s of subscription.   v1.0.1 (2026-04-29)
+  is a small visual refresh: the SHOW TEAMS overlay (the two-team
+  list that appears in the Overlay card) now uses a single 1344×168
+  `teamsbg.png` artwork with the "MAT BEAST CHAMPIONSHIP" title
+  baked in, replacing the previous bordered-rectangle + separate
+  logo composition. No surrounding box, border, or shadow is drawn
+  any more — only the artwork plus the team text rendered beneath
+  the built-in title. Same Oswald font, same yellow click-to-glow
+  highlight, same click-driven cross-window broadcast, same
+  shrink-to-fit for long rosters. v1.2.0 (2026-04-30) drops the
+  cloud auth requirement entirely (Mat Beast Masters is now an
+  open shared workspace — no tokens, no per-user accounts) and
+  adds a first-launch password gate (`Kuwy`) that blocks the
+  dashboard until the operator types the access password once per
+  install. v1.2.0 supersedes the brief v1.1.0 optional-registration
+  experiment.
 - Latest installer artifact:
+  - `dist/Mat Beast Scoreboard Setup 1.2.0.exe` (2026-04-30 —
+    **Open cloud (Model A) + first-launch password gate.** Operator
+    request: "Can we just eliminate registration and token requirements
+    altogether and allow syncing and cloud access to any user?" followed
+    by a chosen architecture of "1.a;2.a;" (one shared global cloud, no
+    per-user accounts) and a separate first-launch gate: "I want the
+    user to enter the password 'Kuwy' before the app can launch for the
+    first time." This release implements both at once, replacing the
+    short-lived v1.1.0 optional-registration model.
+
+    Cloud server (`masters/` v0.5.0):
+    - `src/lib/auth.ts` — `requireUserId()` is now total. Resolution
+      order is unchanged for the happy paths (Clerk session → desktop
+      bearer token), but a missing/invalid/revoked credential no longer
+      returns 401; instead the request is attributed to a sentinel
+      userId `"shared-workspace"` and `via: "shared"`. Every existing
+      route handler keeps its `if ("response" in a) return a.response;`
+      guard so the type contract is preserved, but that branch is no
+      longer reachable in normal traffic. Old desktop installs that
+      still send a Bearer header keep their per-user audit attribution;
+      everyone else writes show up under the shared sentinel.
+    - No schema migration required — the various `*UserId` columns are
+      already plain strings, not foreign keys, and the catalog query
+      already returns every event to every signed-in user (see the
+      "5-user / shared-workspace model" comment in `events/route.ts`).
+      The only behavioural change is that "every signed-in user" now
+      means literally everyone.
+    - Deploy story: push the `masters/` package to Vercel (or trigger a
+      redeploy of the existing project) BEFORE shipping the desktop
+      v1.2.0 installer to operators. v1.1.x desktops keep working
+      against the v0.5.0 cloud (their token still validates and they
+      stay attributed to themselves); v1.2.0 desktops only work
+      against the v0.5.0+ cloud.
+
+    Desktop app (`web/` v1.2.0):
+    - `src/components/FirstLaunchPasswordGate.tsx` (new file, already
+      authored before this session as a work-in-progress and now
+      shipped) — full-screen modal mounted by `RouteChromeShell` above
+      the entire dashboard tree. On first dashboard mount it reads
+      `localStorage["matbeast.firstLaunchPasswordEntered"]`; if not
+      set, the dashboard chrome stays unmounted (no flash) and the
+      operator must type the access password (`"Kuwy"`) before
+      anything else loads. Submitting the correct password sets the
+      flag and unlocks the install; incorrect submissions clear the
+      field and re-focus. Overlay routes (`/overlay/*`) are never
+      gated, so popped-out / NDI offscreen windows always work even
+      on a freshly-installed locked machine. The password is **not** a
+      security boundary — the expected value is in the shipped JS
+      bundle and trivially extractable — it exists to filter casual /
+      unintended launches by people who weren't given the password
+      verbally.
+    - `src/components/RouteChromeShell.tsx` — wraps the dashboard
+      bridges + chrome + page in `<FirstLaunchPasswordGate>`. The
+      `pathname?.startsWith("/overlay")` short-circuit at the top of
+      the component is preserved, so the gate is enforced exactly on
+      the routes a fresh-install operator would see.
+    - `src/lib/cloud-config.ts` — `isCloudConfigured(cfg)` now returns
+      just `cfg.syncEnabled`. The `desktopToken.length > 0` half of
+      the gate is gone; the cloud no longer requires a token. The
+      `desktopToken` field itself stays on the singleton row for
+      backwards compatibility with old installs that have one saved.
+    - `src/lib/cloud-sync.ts` + `src/lib/cloud-events.ts` — `cloudFetch`
+      / `authHeaders` only attach an `Authorization: Bearer …` header
+      when a non-empty token is saved locally. A blank token no longer
+      sends a malformed `Bearer ` value (some intermediaries reject
+      that) and the cloud's `requireUserId()` accepts the missing
+      credential as the shared workspace user.
+    - `src/components/HomeCloudPanel.tsx` — removed the v1.1.0
+      "Registered" (emerald) / "Unregistered" (zinc) status line and
+      the unregistered empty-state explainer panel. The home page
+      header is back to a single line and the only remaining
+      banner-style empty state is amber "Cloud sync is paused" when
+      the operator has explicitly paused sync from Cloud Settings.
+    - `src/components/CloudSettingsModal.tsx` — rewritten. Title is
+      always "Cloud sync" (no more switching between "Register Mat
+      Beast Scoreboard" / "Cloud sync"); the v1.1.0 "Registering is
+      optional" explainer panel is gone; the entire Desktop token
+      section (paste / save / unlink) is gone. The modal is now a
+      pure status + control panel: sync enabled toggle, live-master
+      pulls toggle, cloud URL display, last-pull timestamps, pending
+      outbox count, last error, and a Sync Now button.
+    - `src/components/CloudEventDialogs.tsx` — `NotConfiguredNotice`
+      drops the "no desktop token" branch since that state can no
+      longer occur. The remaining branches handle "config could not
+      be read" and "sync paused".
+    - `src/components/AppChrome.tsx` — removed the `<FirstRunRegisterDialog />`
+      mount and import.
+    - `src/components/FirstRunRegisterDialog.tsx` — deleted.
+    - `src/components/NativeFileMenuBridge.tsx` — removed the
+      `d.action === "register"` handler.
+    - `electron/main.js` — removed the File ▸ Register… menu item and
+      its trailing separator, and removed `"register"` from the
+      `sendFileMenuAction` allow-list.
+    - `src/lib/matbeast-dashboard-file-actions.ts` — pre-flight
+      comment in `matbeastCreateNewEventTab` updated to drop the
+      "registered / unregistered" framing; behaviour is unchanged
+      (still blocks creation if cloud is `unreachable`, still
+      proceeds locally if cloud is `not-configured`/paused).
+  - `dist/Mat Beast Scoreboard Setup 1.1.0.exe` (2026-04-30 —
+    Optional registration. Operator request: "Make a new version of
+    the app that does not require a token when installed on a new
+    computer. The token should be optional. If no token is obtained
+    then the app will not have access to the master profiles names
+    list and master team names lists in either training or
+    production modes. The drop-down list for that will simply not
+    populate. Therefore, after the user installs the app on a new
+    computer, it should give the option to 'register' the app which
+    means to generate and install a token and the app should
+    explain the difference. The home screen should display a small
+    text status line that says either 'Unregistered' or 'Registered'.
+    The file menu should give the option to Register which will
+    take the user to the screen to sign in and obtain a token."
+    Five surfaces changed:
+    (1) `src/lib/matbeast-dashboard-file-actions.ts` —
+    `matbeastCreateNewEventTab`'s pre-flight cloud-online probe used
+    to hard-block creation when no token was set, alerting the
+    operator to configure Options ▸ CLOUD SYNC… first. That gate
+    was the one place a brand-new install actually broke without a
+    token, since every other flow already tolerated unconfigured
+    cloud (master-list dropdowns read from local SQLite which is
+    just empty without sync; `createCloudUntitledForNewTab` returns
+    `{ status: "not-configured" }` and the caller already keeps the
+    local tournament). The probe now only blocks when `tokenSet`
+    AND the cloud is actively unreachable; `reason ===
+    "not-configured"` falls through and creation proceeds locally.
+    (2) `src/components/HomeCloudPanel.tsx` — added a small
+    "Registered" (emerald) / "Unregistered" (zinc) status line
+    under the "Mat Beast Scoreboard" title (purely informational
+    per operator preference), reworked the empty-state from the
+    legacy amber "Cloud not configured" warning to a calm
+    informational panel that opens with "This install is
+    unregistered." and explains the registration model in the
+    same wording the welcome dialog uses. The Open Cloud Settings
+    button on this panel is now labelled "Register this computer".
+    Subtitle copy reworded from "New events are saved to the cloud
+    automatically." → "New events are saved to the cloud
+    automatically when this install is registered." so the
+    operator's expectations match what actually happens on an
+    unregistered install. The amber warning is preserved for the
+    edge case where a token IS set but cloud sync is paused / down.
+    (3) `src/components/CloudSettingsModal.tsx` (already on disk
+    from an earlier work-in-progress patch) — modal title flips
+    between "Register Mat Beast Scoreboard" (no token) and "Cloud
+    sync" (token set), and the no-token state now renders an
+    explainer panel above the existing Status / Sync / Token
+    sections. The explainer says "Registering is optional." with
+    "With registration:" / "Without registration:" bullets that
+    track the same wording the home empty-state and welcome dialog
+    use. (4) `electron/main.js` — added "register" to
+    `sendFileMenuAction`'s allowed action set, plus a new
+    "File ▸ Register…" menu item near the bottom of the File
+    submenu (after Backup / Restore copy from disk) so first-time
+    operators can find it without digging through Options ▸ CLOUD
+    SYNC…; hidden in the demo variant since the demo never talks to
+    the cloud. (5) `src/components/NativeFileMenuBridge.tsx`
+    (already on disk from the same earlier patch) — translates the
+    new "register" action into the existing `matbeast-native-options`
+    custom event with action: "cloud" so AppChrome's existing
+    listener pops `CloudSettingsModal` for free; no second listener
+    surface needed. New file: `src/components/FirstRunRegisterDialog.tsx`
+    — one-shot welcome dialog mounted from `AppChrome.tsx` that
+    self-gates to "render only when `tokenSet === false` AND
+    `localStorage["matbeast.seenRegisterPrompt"] !== "true"`" so it
+    shows exactly once per fresh install, dismisses to either
+    "Skip for now" or "Register now" (the latter chains into
+    `CloudSettingsModal` via the same options-menu event path), and
+    persists the seen-flag in localStorage on either dismiss path.
+    Wording matches the operator's literal request: "This app is
+    unregistered. You can use it as-is, or register this computer
+    now to unlock master profile names and master team names. For
+    team setup, registration is recommended. For only timer and
+    scoreboard operation, registration is not needed. You can
+    register anytime from File ▸ Register." Architecture note: the
+    seen-flag intentionally lives in localStorage rather than
+    `desktopPreferences` so the existing IPC plumbing doesn't have
+    to grow another channel; localStorage is per-install on
+    Electron's user-data dir, which is exactly the persistence
+    domain we want for "did this install's operator already see
+    the welcome?". File trail:
+    `src/lib/matbeast-dashboard-file-actions.ts`,
+    `src/components/HomeCloudPanel.tsx`,
+    `src/components/AppChrome.tsx`,
+    `src/components/FirstRunRegisterDialog.tsx` (new),
+    `electron/main.js`, `package.json`. The CloudSettingsModal
+    explainer + NativeFileMenuBridge "register" handler from a
+    prior work-in-progress edit ship as part of this release.)
+  - `dist/Mat Beast Scoreboard Setup 1.0.1.exe` (2026-04-29 —
+    Team-list overlay artwork refresh. Operator request: "I want to
+    replace the background for the Team names list overlay (the
+    overlay that appears when you click SHOW TEAMS in the Overlay
+    card). Use `teamsbg.png` (1344×168) which already includes the
+    'MAT BEAST CHAMPIONSHIP' title baked into the artwork. Do not
+    generate a box or background — only text using the same font
+    and same highlighting functionality as before. The text should
+    be centered and show as one or two lines beneath the title."
+    Replaced the legacy `bgteam.png` (1920×187) + separate
+    `CHAMPIONSHIP.png` logo + bordered rectangle composition with a
+    single 1344×168 `teamsbg.png` rendered at native resolution and
+    centered inside the same 1920 × 187 band the bordered rectangle
+    used to occupy (band y 316 → 503). The bordered rectangle is
+    gone entirely — no `border`, no `boxShadow`, no
+    `backgroundColor` fallback, no `overflow: hidden` clipping.
+    Pixels outside the 1344×168 image are now fully transparent so
+    the underlying scoreboard shows through; this matches the
+    decorative side-accents in the new artwork, which are designed
+    to read as part of the scene rather than fenced inside a
+    rectangle. The `<img src="/CHAMPIONSHIP.png">` logo element was
+    removed from the DOM tree because the title is now part of the
+    bg image; this also lets us drop the logo's `onLoad` re-measure
+    hook (the only async image-decode dependency this overlay had).
+    Team text is overlaid below the title via a clipped flexbox
+    region positioned at `top: 60px, left: 64px, right: 64px,
+    bottom: 8px` inside the 1344×168 image, giving an effective
+    text area of 1216 × 100 px — wide enough for the 4-NBSP
+    `TEAMNAME:    NAME1    NAME2…` format used since v0.8.0, tall
+    enough for two stacked lines at the locked 40 px Oswald with
+    20 px gap (40 + 20 + 40 = 100 exactly). Shrink-to-fit is
+    preserved: the line-stack wrapper is rendered with
+    `width: max-content` so its `offsetWidth` always reflects the
+    true natural pre-scale width, then a uniform
+    `transform: scale(min(1, 1216 / naturalW, 100 / naturalH))` is
+    applied so long rosters compress instead of overflowing. Same
+    `useLayoutEffect` measurement pipeline as v1.0.0 (rAF-deferred
+    initial measure → `document.fonts.ready` re-measure for the
+    Oswald font swap → ResizeObserver for everything else) so the
+    measurement converges cleanly even when Oswald hasn't finished
+    loading on the first paint. Font / color / highlight
+    semantics are identical to v1.0.0: Oswald 700 at 40 px in
+    `#99c5ff` for `TEAMNAME:`, Oswald 400 at 40 px in `#d9d9d9` for
+    player names, click any name to toggle a yellow
+    (`#ffec4d`) breathing-glow highlight driven by the
+    `matbeastTeamGlow` keyframe (1 s color cross-fade + 2 s
+    text-shadow pulse), keyboard-activatable via Enter / Space.
+    Click forwarding still goes through the existing
+    `OverlayTeamListLayer` → `onPlayerClick({team, playerIndex})`
+    contract, so `overlay-client.tsx`'s broadcast-channel-driven
+    selection logic is unchanged and keeps every overlay window
+    on the same highlighted name. New asset committed at
+    `web/public/teamsbg.png`; the old `bgteam.png` and
+    `CHAMPIONSHIP.png` PNGs are no longer referenced from any
+    source file but were left on disk so existing build artifacts
+    continue to validate (they can be removed in a future cleanup
+    pass once we're confident no off-tree consumer depends on
+    them). File trail:
+    `src/app/overlay/overlay-team-list-layer.tsx`,
+    `web/public/teamsbg.png`, `package.json`.)
+  - `dist/Mat Beast Scoreboard Setup 1.0.1.exe` (2026-04-29 —
+    Team-list overlay artwork refresh. Operator request: "I want to
+    replace the background for the Team names list overlay (the
+    overlay that appears when you click SHOW TEAMS in the Overlay
+    card). Use `teamsbg.png` (1344×168) which already includes the
+    'MAT BEAST CHAMPIONSHIP' title baked into the artwork. Do not
+    generate a box or background — only text using the same font
+    and same highlighting functionality as before. The text should
+    be centered and show as one or two lines beneath the title."
+    Replaced the legacy `bgteam.png` (1920×187) + separate
+    `CHAMPIONSHIP.png` logo + bordered rectangle composition with a
+    single 1344×168 `teamsbg.png` rendered at native resolution and
+    centered inside the same 1920 × 187 band the bordered rectangle
+    used to occupy (band y 316 → 503). The bordered rectangle is
+    gone entirely — no `border`, no `boxShadow`, no
+    `backgroundColor` fallback, no `overflow: hidden` clipping.
+    Pixels outside the 1344×168 image are now fully transparent so
+    the underlying scoreboard shows through; this matches the
+    decorative side-accents in the new artwork, which are designed
+    to read as part of the scene rather than fenced inside a
+    rectangle. The `<img src="/CHAMPIONSHIP.png">` logo element was
+    removed from the DOM tree because the title is now part of the
+    bg image; this also lets us drop the logo's `onLoad` re-measure
+    hook (the only async image-decode dependency this overlay had).
+    Team text is overlaid below the title via a clipped flexbox
+    region positioned at `top: 60px, left: 64px, right: 64px,
+    bottom: 8px` inside the 1344×168 image, giving an effective
+    text area of 1216 × 100 px — wide enough for the 4-NBSP
+    `TEAMNAME:    NAME1    NAME2…` format used since v0.8.0, tall
+    enough for two stacked lines at the locked 40 px Oswald with
+    20 px gap (40 + 20 + 40 = 100 exactly). Shrink-to-fit is
+    preserved: the line-stack wrapper is rendered with
+    `width: max-content` so its `offsetWidth` always reflects the
+    true natural pre-scale width, then a uniform
+    `transform: scale(min(1, 1216 / naturalW, 100 / naturalH))` is
+    applied so long rosters compress instead of overflowing. Same
+    `useLayoutEffect` measurement pipeline as v1.0.0 (rAF-deferred
+    initial measure → `document.fonts.ready` re-measure for the
+    Oswald font swap → ResizeObserver for everything else) so the
+    measurement converges cleanly even when Oswald hasn't finished
+    loading on the first paint. Font / color / highlight
+    semantics are identical to v1.0.0: Oswald 700 at 40 px in
+    `#99c5ff` for `TEAMNAME:`, Oswald 400 at 40 px in `#d9d9d9` for
+    player names, click any name to toggle a yellow
+    (`#ffec4d`) breathing-glow highlight driven by the
+    `matbeastTeamGlow` keyframe (1 s color cross-fade + 2 s
+    text-shadow pulse), keyboard-activatable via Enter / Space.
+    Click forwarding still goes through the existing
+    `OverlayTeamListLayer` → `onPlayerClick({team, playerIndex})`
+    contract, so `overlay-client.tsx`'s broadcast-channel-driven
+    selection logic is unchanged and keeps every overlay window
+    on the same highlighted name. New asset committed at
+    `web/public/teamsbg.png`; the old `bgteam.png` and
+    `CHAMPIONSHIP.png` PNGs are no longer referenced from any
+    source file but were left on disk so existing build artifacts
+    continue to validate (they can be removed in a future cleanup
+    pass once we're confident no off-tree consumer depends on
+    them). File trail:
+    `src/app/overlay/overlay-team-list-layer.tsx`,
+    `web/public/teamsbg.png`, `package.json`.)
   - `dist/Mat Beast Scoreboard Setup 1.0.0.exe` (2026-04-29 — First
     stable release. v1.0.0 is a milestone marker, not a feature
     release: it captures the cumulative state of the desktop app
@@ -2687,6 +3008,66 @@ embedded via `afterPack` as before.
 - Audio source path handling supports `.mp3` and `.MP3` variants.
 - Next.js build still shows existing non-blocking `<img>` lint warnings in overlay route.
 
+## Last Verified
+- Typecheck and lints pass after latest changes.
+- Desktop rebuild succeeded with latest Brackets/Timer/Electron workflow updates.
+
+### 2026-04-08 — Timer audio: correct pitch across outputs
+
+- Resolved timer **10s / air horn** pitch and speed issues by routing Web Audio **directly** to `AudioContext.destination` and applying **`setSinkId` on the `AudioContext`** when supported, instead of `MediaStreamDestination` + hidden `<audio>` (see `useTimerAlertSounds.ts`, `audio-output.ts`). Added optional `console.debug` to confirm direct vs fallback path.
+
+### 2026-04-08 — Brackets, file persistence, desktop workflow, audio controls
+
+- Brackets card behavior/UI:
+  - Added clickable "current match" border highlight with true toggle on/off.
+  - Quarter-finals column visibility now depends on team readiness:
+    - show QF only when 5+ named teams exist;
+    - otherwise show Semi-finals, Grand final, Champion sections only.
+  - Semi-finals / Grand final / Champion boxes remain visible with blank placeholders until populated.
+  - Reworked vertical alignment so Semi-final boxes center against preceding match boxes (independent of section titles).
+  - TV icon workflow implemented:
+    - QF TV icons are non-clickable.
+    - Semi/Grand/Champion TV icons are clickable per current rules.
+    - Only one active TV group at a time; Champion is its own selection.
+  - Removed experimental SVG connector-line rendering (rolled back in favor of TV-icon-only signaling).
+  - Champion styling:
+    - no gold highlight until winner exists;
+    - lower `CHAMPION` label hidden until winner exists;
+    - champion TV icon shown next to the title; enabled only after winner exists.
+- Event file persistence enhancements:
+  - Save now includes bracket snapshot (`bracket.version=1`, seed-based match rows) plus `audioVolumePercent`.
+  - Open/import restores bracket state and audio volume from event file when present.
+  - Implemented in:
+    - `roster-file-types.ts`
+    - `roster-file-parse.ts`
+    - `roster-export-build.ts`
+    - `matbeast-dashboard-file-actions.ts`
+    - `/api/tournament/import-roster`
+    - `import-roster-server.ts`
+- Desktop runtime/menu integrations:
+  - Added desktop preload + IPC helpers for reading files and adding recent docs.
+  - Added Electron menu refresh for `Open Recent` updates after save/open actions.
+## Next Steps (Shortlist)
+1. Rebuild and smoke-test overlay behavior on desktop (`LIVE/STOPPED`, preview positioning, transparency in OBS).
+2. Add optional user-toggle for overlay auto-open / off-screen mode.
+3. Add automated UI/API checks for overlay live state sync and tournament switch behavior.
+
+---
+
+## Local setup (reminder)
+```bash
+cd web
+npm install
+npx prisma generate
+npx prisma db push
+npm run dev
+```
+
+Use `/overlay` for output and `/overlay?preview=1` for dashboard preview.
+
+---
+
+*Last updated: 2026-04-28 — v0.9.19 desktop build + GitHub release; OT round transitions preserve secondary ELAPSED across OT-to-OT switches (v0.9.12), overlay output windows now pixel-accurate 1920 × 1080 across all display scaling factors via `display.scaleFactor` division (v0.9.14), bracket overlay music feature with operator-PC silent playback / NDI-ready audio graph / native file picker / `mat-beast-asset://` custom protocol / autoplay (v0.9.13), hardened preload script with always-on `__matBeastPreloadStatus` sentinel for actionable bridge diagnostics (v0.9.19), and `latest.yml` artifact restored to GitHub releases so `electron-updater` no longer 404s on launch.*
 ## Last Verified
 - Typecheck and lints pass after latest changes.
 - Desktop rebuild succeeded with latest Brackets/Timer/Electron workflow updates.

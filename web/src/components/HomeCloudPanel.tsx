@@ -26,6 +26,7 @@ type CloudEventMeta = {
 
 type CloudConfig = {
   configured: boolean;
+  /** Kept for backwards compatibility; v1.2.0 ignores it for gating. */
   tokenSet: boolean;
   syncEnabled: boolean;
 };
@@ -397,7 +398,7 @@ export default function HomeCloudPanel() {
             </h1>
             <p className="mt-1 text-[12px] text-zinc-400">
               Pick a cloud event to open, or create a new one. New events are
-              saved to the cloud automatically.
+              saved to the shared cloud catalog automatically.
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
@@ -421,14 +422,18 @@ export default function HomeCloudPanel() {
         {cfg === null ? (
           <p className="text-[12px] text-zinc-500">Loading…</p>
         ) : !cfg.configured ? (
+          /**
+           * v1.2.0: cloud auth is gone, so the only way `configured`
+           * is false is when the operator has paused sync from Cloud
+           * Settings. Surface that as an actionable amber banner so
+           * they remember to flip it back on before working on
+           * cloud-shared events.
+           */
           <div className="rounded border border-amber-700/50 bg-amber-900/20 p-4 text-[12px] text-amber-100">
-            <p className="m-0 font-semibold">Cloud not configured</p>
+            <p className="m-0 font-semibold">Cloud sync is paused</p>
             <p className="m-0 mt-1 text-amber-100/80">
-              {!cfg.tokenSet
-                ? "No desktop token saved on this install. Sign in at Mat Beast Masters → Desktop tokens, generate a token, and paste it here to see your cloud event list."
-                : !cfg.syncEnabled
-                  ? "Cloud sync is paused. Re-enable it to see your cloud event list here."
-                  : "Cloud is unavailable."}
+              Re-enable cloud sync to see the shared event catalog and to
+              save new events to the cloud.
             </p>
             <div className="mt-3 flex gap-2">
               <button

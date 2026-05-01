@@ -7,33 +7,29 @@ import { useLayoutEffect, useMemo, useRef, useState } from "react";
  * Sits in a fixed 1920×1080 vertical band (y 316 → 503) and crossfades in
  * when the dashboard APPLIES teams mode.
  *
- * Format (locked 2026-04-17, logo added 2026-04-17):
- * - Font: Oswald 700 (team label, color `#99c5ff`) + Oswald 400 (players,
- *   color `#d9d9d9`) at 40 px.
- * - One line per team, `TEAMNAME:␠␠␠␠NAME1␠␠␠␠NAME2…` (4 spaces throughout).
- * - Team name + player names uppercased. Player order = lineupOrder asc,
- *   skipping TBD / empty slots. Always "FIRST LAST" (no nickname). Player
- *   list capped upstream at 5 (starters only).
- * - Logo (`/CHAMPIONSHIP.png`, 50 px tall, auto width) sits at the top of the
- *   gradient box with a 16 px gap above the first team line. Its measured
- *   width participates in the shrink-to-fit calc so a future wider logo still
- *   stays inside the 1920 canvas.
- * - One team → line vertically centered (logo above). Two teams → both
- *   centered with ~0.5-line (≈ 20 px) gap between them, logo above.
- * - Background: content-hugging rect, padding ≈ 32 px horizontal / 20 px
- *   vertical, 0.5 px border `#d9d9d9`. Filled with `/bgteam.png` (1920×187)
- *   centered at native resolution so the rectangle crops the image around
- *   its center; any rectangle overflow falls through to a solid black
- *   fallback. The background image does NOT scale with the content — it's a
- *   separate fixed-size layer behind the transformed content, so long
- *   rosters / 2-team shrink-to-fit only shrink text+logo.
- * - Shrink-to-fit: the content wrapper (logo + team lines + padding) is
- *   measured at its natural size, then a single uniform scale is applied so
- *   the wrapper fits into the 1920 × 187 band (horizontal: keep a 24 px
- *   safety margin per side; vertical: cap at 187 px). The rectangle is then
- *   sized to the scaled content so the border hugs the visible content —
- *   critical for the 2-team case, which is naturally ~206 px tall and must
- *   be clamped to 187 px per spec.
+ * Format (updated 2026-04-29 — transparent-background artwork):
+ * - Background: `/teamsbg3.png` (1920×187, 32-bit ARGB with full alpha)
+ *   rendered at native resolution and aligned to the band's top-left so
+ *   it covers the band edge-to-edge. The image is mostly transparent and
+ *   only contains a small white "MatBeast" logo near the top center
+ *   (opaque bounding box ≈ x [787..1156] y [23..65]). Everywhere else,
+ *   the underlying scoreboard shows through. We DO NOT draw any extra
+ *   border, box, shadow, or fallback fill around the image.
+ * - Team text: rendered as one or two lines centered horizontally inside
+ *   the band and vertically centered in the lower portion (beneath the
+ *   logo). One team → one line, two teams → two lines stacked with a
+ *   small gap.
+ * - Font / colors / highlighting: unchanged from the previous design.
+ *   - Team label: Oswald 700 at 40 px in `#99c5ff`.
+ *   - Player names: Oswald 400 at 40 px in `#d9d9d9`, uppercased, separated
+ *     by 4 non-breaking spaces (`TEAMNAME:␠␠␠␠NAME1␠␠␠␠NAME2…`).
+ *   - Click a player name to toggle a yellow breathing-glow highlight
+ *     (`#ffec4d`); same `matbeastTeamGlow` keyframe as before.
+ * - Shrink-to-fit: the line wrapper is measured at its natural width and
+ *   uniformly scaled if it would overflow the available text area
+ *   (1920 px canvas minus side insets, 187 px band minus the reserved
+ *   logo strip on top). Long rosters shrink, short rosters render at
+ *   natural size.
  */
 
 const BAND_TOP_PX = 316;
@@ -42,27 +38,45 @@ const BAND_HEIGHT_PX = BAND_BOTTOM_PX - BAND_TOP_PX;
 const CANVAS_WIDTH_PX = 1920;
 const FONT_SIZE_PX = 40;
 const LINE_GAP_PX = Math.round(FONT_SIZE_PX * 0.5);
-const PADDING_X_PX = 32;
-const PADDING_Y_PX = 20;
-/** Horizontal cap: rectangle may span up to the 1920 canvas width minus a
- *  48 px safety margin per side (max border-box width = 1824 px). Long
- *  rosters trigger shrink-to-fit; shorter rosters render at natural width
- *  and center inside the band. */
-const CANVAS_EDGE_PADDING_PX = 48;
-const MAX_RECT_WIDTH_PX = CANVAS_WIDTH_PX - CANVAS_EDGE_PADDING_PX * 2;
-/** Vertical cap: the rectangle must fit inside the 187 px band. When the
- *  natural content height exceeds this (2-team layouts are ~206 px tall), a
- *  uniform content scale is applied so the rectangle ends up at exactly
- *  `BAND_HEIGHT_PX` tall. 1-team layouts (~146 px natural) sit under this
- *  cap so they render at their natural size. */
-const MAX_RECT_HEIGHT_PX = BAND_HEIGHT_PX;
-/** Logo dimensions: intrinsic 50 px tall (aspect ratio preserved via `width:
- *  auto`). `LOGO_GAP_PX` is the space between the bottom of the logo and the
- *  top of the first team line. Both are scaled together with the lines via
- *  the enclosing `transform: scale()` when shrink-to-fit kicks in. */
-const LOGO_SRC = "/CHAMPIONSHIP.png";
-const LOGO_HEIGHT_PX = 50;
-const LOGO_GAP_PX = 16;
+
+/**
+ * Background image (native pixel size). Transparent PNG containing only
+ * a centered white "MatBeast" logo near the top — text is overlaid below
+ * the logo region using the constants below to position / clip the text
+ * area.
+ */
+const BACKGROUND_IMAGE_URL = "/teamsbg3.png";
+const BACKGROUND_IMAGE_WIDTH_PX = 1920;
+const BACKGROUND_IMAGE_HEIGHT_PX = 187;
+
+/**
+ * Vertical strip at the top of `teamsbg3.png` reserved for the built-in
+ * white logo (opaque pixels live in y ≈ 23..65). Team text is rendered
+ * inside the area below this strip so the descenders of the topmost line
+ * have a small visual gap below the logo's baseline.
+ */
+const TITLE_AREA_HEIGHT_PX = 75;
+
+/**
+ * Horizontal padding inside the band (per side). The artwork has no side
+ * accents (it's transparent outside the centered logo), so insets here
+ * are purely for breathing room between the team text and the canvas
+ * edges; tightened from the v1.0.1 value because there's no decorative
+ * border to clear any more.
+ */
+const TEXT_AREA_SIDE_INSET_PX = 48;
+
+/**
+ * Small bottom inset so the descenders of the bottommost line don't kiss
+ * the bottom edge of the band.
+ */
+const TEXT_AREA_BOTTOM_INSET_PX = 8;
+
+const TEXT_AREA_WIDTH_PX =
+  BACKGROUND_IMAGE_WIDTH_PX - TEXT_AREA_SIDE_INSET_PX * 2;
+const TEXT_AREA_HEIGHT_PX =
+  BACKGROUND_IMAGE_HEIGHT_PX - TITLE_AREA_HEIGHT_PX - TEXT_AREA_BOTTOM_INSET_PX;
+
 const TEAM_NAME_COLOR = "#99c5ff";
 const PLAYER_NAME_COLOR = "#d9d9d9";
 /** Highlighted player styling. Yellow text with a continuously pulsing
@@ -97,17 +111,6 @@ const BREATHE_KEYFRAMES_CSS = `
   }
 }
 `;
-/** Rectangle background: 1920×187 PNG sized to match the band the rectangle
- *  is centered inside. Rendered at its native pixel size via
- *  `background-size: <w>px <h>px` + `background-position: center`, so the
- *  rectangle simply acts as a window cropping the image. Transparent areas
- *  outside the image (e.g. when a 2-team layout is taller than the 187 px
- *  band) fall through to `BACKGROUND_FALLBACK_COLOR` for a seamless feel. */
-const BACKGROUND_IMAGE_URL = "/bgteam.png";
-const BACKGROUND_IMAGE_WIDTH_PX = 1920;
-const BACKGROUND_IMAGE_HEIGHT_PX = 187;
-const BACKGROUND_FALLBACK_COLOR = "#000000";
-const BORDER_COLOR = "#d9d9d9";
 /** Team label and player names share the Oswald typeface — only the weight
  *  differs (700 for the team label so it reads as the heading, 400 for the
  *  players). Both variants are self-hosted via fontsource; the 400 + 700
@@ -266,21 +269,16 @@ export function OverlayTeamListLayer({
   const normalizedA = useMemo(() => normalizeLine(teamA), [teamA]);
   const normalizedB = useMemo(() => normalizeLine(teamB), [teamB]);
 
-  const logoRef = useRef<HTMLImageElement | null>(null);
   const contentWrapperRef = useRef<HTMLDivElement | null>(null);
 
   /**
-   * `dims` is the result of measuring the content wrapper (logo + lines +
-   * padding) at its natural, unscaled size and computing the uniform scale
-   * that makes it fit inside the 1920 × 187 band. The rectangle is then
-   * rendered at `{ w, h }` so the border hugs the scaled content; the scale
-   * is applied only to the content layer, leaving the `bgteam.png`
-   * background at its native 1920×187 resolution behind the scaled text.
-   * Null until the first measurement lands — the rectangle is rendered at
-   * opacity 0 during that initial frame to avoid a flash of over-tall
-   * content.
+   * `dims` holds the uniform scale that makes the natural-width line
+   * stack fit inside the text area (everything beneath the title strip
+   * of the bg image). Null until the first measurement lands — the
+   * overlay is rendered at opacity 0 during the initial frame so a
+   * temporarily over-wide stack never flashes onscreen.
    */
-  const [dims, setDims] = useState<{ scale: number; w: number; h: number } | null>(null);
+  const [dims, setDims] = useState<{ scale: number } | null>(null);
 
   const measureAndFit = () => {
     const wrapper = contentWrapperRef.current;
@@ -294,18 +292,10 @@ export function OverlayTeamListLayer({
       setDims(null);
       return;
     }
-    const scaleW = MAX_RECT_WIDTH_PX / naturalW;
-    const scaleH = MAX_RECT_HEIGHT_PX / naturalH;
+    const scaleW = TEXT_AREA_WIDTH_PX / naturalW;
+    const scaleH = TEXT_AREA_HEIGHT_PX / naturalH;
     const scale = Math.min(1, scaleW, scaleH);
-    /* Use `Math.ceil` on the width so sub-pixel rounding never truncates
-       the last glyph; `Math.round` on the height is fine because the cap
-       (187) is the visual ceiling and rounding up would push it beyond the
-       band, which is exactly what we're trying to avoid. */
-    setDims({
-      scale,
-      w: Math.ceil(naturalW * scale),
-      h: Math.min(MAX_RECT_HEIGHT_PX, Math.round(naturalH * scale)),
-    });
+    setDims({ scale });
   };
 
   useLayoutEffect(() => {
@@ -313,9 +303,7 @@ export function OverlayTeamListLayer({
     /* Defer one frame so the browser has painted the new text with the
        freshly-loaded Oswald face before we read `offsetWidth`; synchronous
        reads during the same layout pass sometimes return 0 while the font
-       is still swapping in. The logo's `onLoad` separately re-measures
-       once the PNG decodes, so slow-loading images can't pin us at a stale
-       scale. */
+       is still swapping in. */
     const raf = requestAnimationFrame(() => {
       if (cancelled) return;
       measureAndFit();
@@ -325,14 +313,14 @@ export function OverlayTeamListLayer({
      * Oswald is async-loaded via @fontsource (@font-face rules). On first
      * paint the fallback stack (`Bebas Neue` → system-ui) is used, which
      * has noticeably narrower glyphs than Oswald — so the raf-scheduled
-     * measurement above records a too-small `naturalW`, the rectangle is
-     * sized to that, and when Oswald swaps in a moment later the wider
-     * text overflows and gets clipped by `overflow: hidden` on the
-     * rectangle. `document.fonts.ready` resolves once every declared font
-     * face has finished loading (or failed), so re-running the measure
-     * then gives us the true post-swap width. Wrapped in a try/catch
-     * because older browsers (and some Electron edge cases) expose
-     * `document.fonts` without `ready` or throw on access. */
+     * measurement above records a too-small `naturalW`, the scale is
+     * computed against that, and when Oswald swaps in a moment later the
+     * wider text would overflow. `document.fonts.ready` resolves once
+     * every declared font face has finished loading (or failed), so
+     * re-running the measure then gives us the true post-swap width.
+     * Wrapped in a try/catch because older browsers (and some Electron
+     * edge cases) expose `document.fonts` without `ready` or throw on
+     * access. */
     try {
       const fonts = (
         typeof document !== "undefined"
@@ -352,11 +340,11 @@ export function OverlayTeamListLayer({
     /**
      * ResizeObserver on the content wrapper catches any further natural
      * size changes we don't explicitly trigger above: late CSS rules,
-     * additional font-face swaps, logo decode jitter, window DPR changes,
-     * etc. Because the observed element's `width: max-content` always
-     * reflects the true natural content size (ignoring containing-block
-     * clamping), each callback reads a correct `naturalW` / `naturalH`
-     * and keeps the rectangle in sync with what's actually rendered.
+     * additional font-face swaps, window DPR changes, etc. Because the
+     * observed element's `width: max-content` always reflects the true
+     * natural content size (ignoring containing-block clamping), each
+     * callback reads a correct `naturalW` / `naturalH` and keeps the
+     * scale in sync with what's actually rendered.
      */
     const wrapper = contentWrapperRef.current;
     let resizeObs: ResizeObserver | null = null;
@@ -382,8 +370,6 @@ export function OverlayTeamListLayer({
 
   if (!normalizedA && !normalizedB) return null;
 
-  const resolvedW = dims ? dims.w : undefined;
-  const resolvedH = dims ? dims.h : undefined;
   const resolvedScale = dims ? dims.scale : 1;
 
   return (
@@ -414,135 +400,107 @@ export function OverlayTeamListLayer({
       <div
         style={{
           position: "relative",
-          /* Explicit scaled dimensions so the border hugs the visible
-             (scaled) content — this is what keeps the 2-team rectangle at
-             exactly 187 px tall instead of 206 px. */
-          width: resolvedW,
-          height: resolvedH,
-          overflow: "hidden",
-          backgroundColor: BACKGROUND_FALLBACK_COLOR,
-          border: `0.5px solid ${BORDER_COLOR}`,
-          borderRadius: "2px",
-          boxShadow: "0 2px 12px rgba(0,0,0,0.55)",
+          width: BACKGROUND_IMAGE_WIDTH_PX,
+          height: BACKGROUND_IMAGE_HEIGHT_PX,
           opacity: dims ? 1 : 0,
           transition: "opacity 120ms linear",
         }}
       >
         {/*
-         * Background layer: rendered at native 1920 × 187 px regardless of
-         * the rectangle's current scaled size, so the image is never
-         * stretched / shrunk when the content layer scales down. Center it
-         * absolutely (not via `background-position`) so the rectangle's
-         * `overflow: hidden` crops it around the same center point as the
-         * content layer.
+         * Background image — rendered at native 1920×187 px. Mostly
+         * transparent with the white MatBeast logo baked into the upper
+         * portion of the artwork; no additional border, fill, or shadow
+         * is drawn around it.
          */}
-        <div
+        <img
+          src={BACKGROUND_IMAGE_URL}
+          alt=""
+          draggable={false}
           style={{
             position: "absolute",
-            top: "50%",
-            left: "50%",
+            top: 0,
+            left: 0,
             width: `${BACKGROUND_IMAGE_WIDTH_PX}px`,
             height: `${BACKGROUND_IMAGE_HEIGHT_PX}px`,
-            transform: "translate(-50%, -50%)",
-            backgroundImage: `url(${BACKGROUND_IMAGE_URL})`,
-            backgroundRepeat: "no-repeat",
-            backgroundPosition: "center center",
-            backgroundSize: `${BACKGROUND_IMAGE_WIDTH_PX}px ${BACKGROUND_IMAGE_HEIGHT_PX}px`,
+            display: "block",
             pointerEvents: "none",
           }}
         />
         {/*
-         * Content wrapper: rendered at natural size (no width/height set),
-         * centered inside the rectangle, then `scale()` applied as the last
-         * step so the visible footprint matches `dims.w × dims.h`. Because
-         * the wrapper is `position: absolute`, its layout box does not
-         * participate in the rectangle's intrinsic sizing, which is how the
-         * outer rectangle can hold an explicit scaled-down size while the
-         * wrapper is still measured at natural dimensions.
+         * Text region: clipped to the area beneath the logo strip and
+         * inside the side insets. Flex-centers the line stack
+         * horizontally + vertically inside that area.
          */}
         <div
-          ref={contentWrapperRef}
           style={{
             position: "absolute",
-            top: "50%",
-            left: "50%",
-            transform: `translate(-50%, -50%) scale(${resolvedScale})`,
-            transformOrigin: "center center",
-            display: "inline-flex",
-            flexDirection: "column",
+            top: `${TITLE_AREA_HEIGHT_PX}px`,
+            left: `${TEXT_AREA_SIDE_INSET_PX}px`,
+            width: `${TEXT_AREA_WIDTH_PX}px`,
+            height: `${TEXT_AREA_HEIGHT_PX}px`,
+            display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            /* Force the wrapper to size to its natural content rather than
-               the shrink-to-fit width of its (absolute-positioning)
-               containing block. Without this, a briefly-narrow rectangle on
-               the very first layout pass can clamp `offsetWidth` below the
-               true natural width and cause the measurement → scale cycle to
-               lock in a too-small rectangle, visually cropping the team
-               list well short of 1920 px. `max-content` tells the browser
-               "use the widest the content prefers" regardless of
-               ancestors. */
-            width: "max-content",
-            height: "max-content",
-            /* `gap` drives team-to-team spacing; the logo sits in its own
-               flex slot and tunes its gap to the first line via a dedicated
-               `marginBottom` below so we can size logo-gap independently. */
-            gap: `${LINE_GAP_PX}px`,
-            padding: `${PADDING_Y_PX}px ${PADDING_X_PX}px`,
-            textAlign: "center",
-            whiteSpace: "nowrap",
             pointerEvents: "none",
           }}
         >
-          <img
-            ref={logoRef}
-            src={LOGO_SRC}
-            alt=""
-            draggable={false}
-            onLoad={measureAndFit}
+          {/*
+           * Inner line wrapper: rendered at natural size (max-content),
+           * uniformly scaled down via `transform: scale()` when the
+           * lines would overflow the text area. `width: max-content`
+           * lets us measure the true natural width regardless of the
+           * absolute-positioning containing block.
+           */}
+          <div
+            ref={contentWrapperRef}
             style={{
-              display: "block",
-              height: `${LOGO_HEIGHT_PX}px`,
-              width: "auto",
-              marginBottom: `${LOGO_GAP_PX - LINE_GAP_PX}px`,
-              /* `LINE_GAP_PX` already separates the logo's flex slot from the
-                 first team line via the column `gap`; this negative-or-positive
-                 delta on `marginBottom` tunes the logo-to-first-line distance
-                 to the desired 16 px without disturbing the team-to-team gap. */
+              display: "inline-flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              width: "max-content",
+              height: "max-content",
+              gap: `${LINE_GAP_PX}px`,
+              textAlign: "center",
+              whiteSpace: "nowrap",
+              transform: `scale(${resolvedScale})`,
+              transformOrigin: "center center",
               pointerEvents: "none",
             }}
-          />
-          {normalizedA ? (
-            <Line
-              label={normalizedA.label}
-              players={normalizedA.players}
-              highlightedIndex={
-                highlight && highlight.team === "A"
-                  ? highlight.playerIndex
-                  : null
-              }
-              onPlayerClick={
-                onPlayerClick
-                  ? (index) => onPlayerClick({ team: "A", playerIndex: index })
-                  : undefined
-              }
-            />
-          ) : null}
-          {normalizedB ? (
-            <Line
-              label={normalizedB.label}
-              players={normalizedB.players}
-              highlightedIndex={
-                highlight && highlight.team === "B"
-                  ? highlight.playerIndex
-                  : null
-              }
-              onPlayerClick={
-                onPlayerClick
-                  ? (index) => onPlayerClick({ team: "B", playerIndex: index })
-                  : undefined
-              }
-            />
-          ) : null}
+          >
+            {normalizedA ? (
+              <Line
+                label={normalizedA.label}
+                players={normalizedA.players}
+                highlightedIndex={
+                  highlight && highlight.team === "A"
+                    ? highlight.playerIndex
+                    : null
+                }
+                onPlayerClick={
+                  onPlayerClick
+                    ? (index) => onPlayerClick({ team: "A", playerIndex: index })
+                    : undefined
+                }
+              />
+            ) : null}
+            {normalizedB ? (
+              <Line
+                label={normalizedB.label}
+                players={normalizedB.players}
+                highlightedIndex={
+                  highlight && highlight.team === "B"
+                    ? highlight.playerIndex
+                    : null
+                }
+                onPlayerClick={
+                  onPlayerClick
+                    ? (index) => onPlayerClick({ team: "B", playerIndex: index })
+                    : undefined
+                }
+              />
+            ) : null}
+          </div>
         </div>
       </div>
     </div>

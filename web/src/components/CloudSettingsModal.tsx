@@ -7,6 +7,7 @@ type CloudConfigSnapshot = {
   syncEnabled: boolean;
   /** When false, live Master* lists are not downloaded from the cloud on each open. */
   liveMastersPullFromCloud: boolean;
+  /** Legacy v1.1.x field. v1.2.0 ignores this for gating. */
   tokenSet: boolean;
   tokenPreview: string;
   configured: boolean;
@@ -70,18 +71,6 @@ const buttonStyle: React.CSSProperties = {
   cursor: "pointer",
 };
 
-const inputStyle: React.CSSProperties = {
-  width: "100%",
-  padding: "10px 12px",
-  fontSize: 13,
-  fontFamily: "ui-monospace, Menlo, Consolas, 'Courier New', monospace",
-  border: "1px solid #475569",
-  borderRadius: 6,
-  backgroundColor: "#1e293b",
-  color: "#e2e8f0",
-  boxSizing: "border-box",
-};
-
 function fmtDate(iso: string | null): string {
   if (!iso) return "never";
   const d = new Date(iso);
@@ -89,6 +78,20 @@ function fmtDate(iso: string | null): string {
   return d.toLocaleString();
 }
 
+/**
+ * v1.2.0 Cloud Settings.
+ *
+ * Mat Beast Masters is now a single shared workspace with no
+ * authentication, so this panel is purely informational + control:
+ * the operator can see the cloud URL, last sync timestamps, pending
+ * outbox count, pause / resume the live-master pulls or the cloud
+ * sync entirely, and trigger a manual sync.
+ *
+ * The legacy "Desktop token" section is gone — the cloud no longer
+ * issues or requires tokens. Old installs that still have a saved
+ * token will keep sending it (purely for audit-trail continuity);
+ * nothing in the UI mentions it.
+ */
 export default function CloudSettingsModal({
   open,
   onClose,
@@ -98,10 +101,6 @@ export default function CloudSettingsModal({
 }) {
   const [cfg, setCfg] = useState<CloudConfigSnapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-
-  const [tokenInput, setTokenInput] = useState("");
-  const [savingToken, setSavingToken] = useState(false);
-  const [saveMsg, setSaveMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
 
   const [syncing, setSyncing] = useState(false);
   const [lastSyncSummary, setLastSyncSummary] = useState<string | null>(null);
@@ -124,8 +123,6 @@ export default function CloudSettingsModal({
   useEffect(() => {
     if (open) {
       void reload();
-      setTokenInput("");
-      setSaveMsg(null);
       setLastSyncSummary(null);
     }
   }, [open, reload]);
@@ -139,57 +136,6 @@ export default function CloudSettingsModal({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
-
-  const saveToken = useCallback(async () => {
-    const trimmed = tokenInput.trim();
-    if (!trimmed) return;
-    setSavingToken(true);
-    setSaveMsg(null);
-    try {
-      const r = await fetch("/api/cloud/config", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ desktopToken: trimmed }),
-      });
-      const data = (await r.json()) as { ok?: boolean; error?: string };
-      if (!r.ok || !data.ok) {
-        setSaveMsg({
-          kind: "err",
-          text: data.error || `Save failed (HTTP ${r.status})`,
-        });
-      } else {
-        setSaveMsg({ kind: "ok", text: "Token saved." });
-        setTokenInput("");
-        await reload();
-      }
-    } catch (e) {
-      setSaveMsg({
-        kind: "err",
-        text: e instanceof Error ? e.message : "save failed",
-      });
-    } finally {
-      setSavingToken(false);
-    }
-  }, [tokenInput, reload]);
-
-  const clearToken = useCallback(async () => {
-    if (!window.confirm("Unlink this desktop from the cloud? Local data is unchanged. You'll need to paste a token again to re-link.")) {
-      return;
-    }
-    setSavingToken(true);
-    setSaveMsg(null);
-    try {
-      const r = await fetch("/api/cloud/config", { method: "DELETE" });
-      if (!r.ok) {
-        setSaveMsg({ kind: "err", text: `Unlink failed (HTTP ${r.status})` });
-      } else {
-        setSaveMsg({ kind: "ok", text: "Desktop unlinked from cloud." });
-        await reload();
-      }
-    } finally {
-      setSavingToken(false);
-    }
-  }, [reload]);
 
   const toggleSync = useCallback(async () => {
     if (!cfg) return;
@@ -265,11 +211,12 @@ export default function CloudSettingsModal({
             Close
           </button>
         </div>
-        <p style={{ fontSize: 13, opacity: 0.75, lineHeight: 1.6 }}>
-          Sync the master player profile and master team name lists with the
-          shared cloud database (Mat Beast Masters). Sync runs automatically
-          when you open or edit a master list. Use this panel to link a new
-          desktop, retry after going offline, or temporarily disable sync.
+        <p style={{ fontSize: 13, opacity: 0.75, lineHeight: 1.6, marginTop: 8 }}>
+          Mat Beast Scoreboard syncs the master player profile list, the
+          master team name list, and your event catalog with the shared
+          Mat Beast Masters cloud. Sync runs automatically when you open
+          or edit a master list. Use this panel to retry after going
+          offline, temporarily pause sync, or check status.
         </p>
 
         {loadError && (
@@ -278,20 +225,9 @@ export default function CloudSettingsModal({
           </p>
         )}
 
-        {/* STATUS */}
         <div style={sectionTitle}>Status</div>
         {cfg ? (
           <div style={{ fontSize: 13, lineHeight: 1.8 }}>
-            <div>
-              Linked:{" "}
-              {cfg.tokenSet ? (
-                <span style={{ color: "#86efac" }}>
-                  yes ({cfg.tokenPreview ? `...${cfg.tokenPreview}` : "set"})
-                </span>
-              ) : (
-                <span style={{ color: "#fca5a5" }}>no - paste a token below</span>
-              )}
-            </div>
             <div>
               Sync enabled:{" "}
               <span style={{ color: cfg.syncEnabled ? "#86efac" : "#fca5a5" }}>
@@ -362,13 +298,12 @@ export default function CloudSettingsModal({
           <p style={{ fontSize: 13, opacity: 0.6 }}>Loading...</p>
         ) : null}
 
-        {/* SYNC NOW */}
         <div style={{ marginTop: 16 }}>
           <button
             type="button"
             onClick={syncNow}
             disabled={syncing || !cfg?.configured}
-            title={!cfg?.configured ? "Paste a token first" : undefined}
+            title={!cfg?.configured ? "Cloud sync is paused — resume it first" : undefined}
             style={{
               ...buttonStyle,
               backgroundColor: syncing ? "#475569" : "#3b82f6",
@@ -385,67 +320,6 @@ export default function CloudSettingsModal({
             </p>
           )}
         </div>
-
-        {/* LINK / RELINK */}
-        <div style={sectionTitle}>Desktop token</div>
-        <p style={{ fontSize: 13, lineHeight: 1.6 }}>
-          Sign in at{" "}
-          <code style={{ opacity: 0.85 }}>
-            {(cfg?.cloudBaseUrl ?? "https://matbeast-masters.vercel.app").replace(/\/+$/, "")}
-            /desktop-tokens
-          </code>{" "}
-          (your account only lists tokens you created), generate a token, then paste it below and
-          click <strong>Save token</strong>.
-        </p>
-        <input
-          type="password"
-          placeholder="mbk_..."
-          value={tokenInput}
-          onChange={(e) => setTokenInput(e.target.value)}
-          disabled={savingToken}
-          style={inputStyle}
-        />
-        <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
-          <button
-            type="button"
-            onClick={saveToken}
-            disabled={savingToken || tokenInput.trim().length === 0}
-            style={{
-              ...buttonStyle,
-              backgroundColor: savingToken ? "#475569" : "#16a34a",
-              color: "#fff",
-              cursor: savingToken ? "wait" : "pointer",
-              opacity: tokenInput.trim().length === 0 ? 0.5 : 1,
-            }}
-          >
-            {savingToken ? "Saving..." : "Save token"}
-          </button>
-          {cfg?.tokenSet && (
-            <button
-              type="button"
-              onClick={clearToken}
-              disabled={savingToken}
-              style={{
-                ...buttonStyle,
-                backgroundColor: "#7f1d1d",
-                color: "#fff",
-              }}
-            >
-              Unlink desktop
-            </button>
-          )}
-        </div>
-        {saveMsg && (
-          <p
-            style={{
-              marginTop: 8,
-              fontSize: 13,
-              color: saveMsg.kind === "ok" ? "#86efac" : "#fca5a5",
-            }}
-          >
-            {saveMsg.text}
-          </p>
-        )}
       </div>
     </div>
   );

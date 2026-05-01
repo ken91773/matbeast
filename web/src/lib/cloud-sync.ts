@@ -91,13 +91,26 @@ async function cloudFetch(
   const url = `${cfg.cloudBaseUrl.replace(/\/+$/, "")}${path}`;
   const ac = new AbortController();
   const timeout = setTimeout(() => ac.abort(), REQUEST_TIMEOUT_MS);
+  /**
+   * v1.2.0: the cloud no longer requires authentication. We still
+   * forward a Bearer header when a legacy token happens to be saved
+   * locally so older installs keep their audit-trail attribution,
+   * but a missing token is no longer an error and we do not send an
+   * empty `Bearer ` header (which some proxies reject as malformed).
+   */
+  const token = cfg.desktopToken.trim();
+  const baseHeaders: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (token.length > 0) {
+    baseHeaders.Authorization = `Bearer ${token}`;
+  }
   try {
     return await fetch(url, {
       ...init,
       signal: ac.signal,
       headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${cfg.desktopToken}`,
+        ...baseHeaders,
         ...(init.headers ?? {}),
       },
       cache: "no-store",
