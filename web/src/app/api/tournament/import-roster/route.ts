@@ -33,25 +33,6 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "document is required" }, { status: 400 });
     }
     const document = parseRosterDocument(body.document);
-    /**
-     * v1.2.2 diagnostic: log per-team player counts on import so we can
-     * compare against the push log. If push had N players for a team
-     * but import sees N-1, the cloud round-trip dropped a row. If
-     * import sees N but the user sees N-1 in the lineup, the loss is
-     * downstream (lineupOrder coercion, slotsForTeam filter, etc.).
-     */
-    try {
-      const counts = (document.teams ?? []).map((t) => ({
-        teamName: t.name,
-        playerCount: Array.isArray(t.players) ? t.players.length : 0,
-      }));
-      console.log(
-        "[POST /api/tournament/import-roster][v1.2.2] document team counts",
-        JSON.stringify({ tournamentId, teams: counts }),
-      );
-    } catch {
-      /* logging only */
-    }
     const bracket =
       body.bracket &&
       body.bracket.version === 1 &&

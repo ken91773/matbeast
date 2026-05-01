@@ -3407,6 +3407,52 @@ if (!gotSingleInstanceLock) {
     return { ok: true };
   });
 
+  /**
+   * v1.2.9: First-launch password gate persistence. The renderer's
+   * `localStorage` is keyed by origin and the bundled Next server
+   * picks a fresh loopback port every launch (`getFreeIpv4Port`),
+   * so any flag we wrote to `localStorage` was invisible to the
+   * next launch's renderer. Persist the unlock flag here under
+   * `userData/first-launch-password.json` instead — survives port
+   * changes, app updates, and renderer reloads.
+   */
+  ipcMain.handle("app:get-first-launch-password-unlocked", async () => {
+    try {
+      const filePath = path.join(
+        app.getPath("userData"),
+        "first-launch-password.json",
+      );
+      if (!fs.existsSync(filePath)) return { ok: true, unlocked: false };
+      const text = fs.readFileSync(filePath, "utf8");
+      const data = JSON.parse(text);
+      return { ok: true, unlocked: data && data.unlocked === true };
+    } catch {
+      return { ok: true, unlocked: false };
+    }
+  });
+
+  ipcMain.handle(
+    "app:set-first-launch-password-unlocked",
+    async (_event, payload) => {
+      try {
+        const unlocked = Boolean(payload && payload.unlocked);
+        const filePath = path.join(
+          app.getPath("userData"),
+          "first-launch-password.json",
+        );
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(
+          filePath,
+          JSON.stringify({ unlocked, savedAt: new Date().toISOString() }, null, 2),
+          "utf8",
+        );
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: String(err && err.message ? err.message : err) };
+      }
+    },
+  );
+
   refreshApplicationMenu();
   createMainWindow();
   if (launchEventFile) enqueueOpenEventFile(launchEventFile);

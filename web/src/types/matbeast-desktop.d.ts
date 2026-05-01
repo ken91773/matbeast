@@ -93,6 +93,15 @@ interface MatBeastDesktopApi {
   focusMainWindow?: () => Promise<{ ok: boolean }>;
   /** Focus main `webContents` even when the window is already foreground (Windows keyboard routing after in-app actions). */
   restoreWebKeyboardFocus?: () => Promise<{ ok: boolean }>;
+  /**
+   * v1.2.9: First-launch password gate persistence under
+   * `userData/first-launch-password.json`. Origin-stable so the
+   * unlock survives the bundled Next server's per-launch port roll.
+   */
+  getFirstLaunchPasswordUnlocked?: () => Promise<{ ok: boolean; unlocked: boolean }>;
+  setFirstLaunchPasswordUnlocked?: (
+    unlocked: boolean,
+  ) => Promise<{ ok: boolean }>;
   checkForUpdates: () => Promise<{ ok: boolean; reason?: string; state?: UpdateState }>;
   checkForUpdatesWithDebug: () => Promise<{
     ok: boolean;

@@ -13,5 +13,7 @@ web/*.db
 web/prisma/dev.db*
 web/public/uploads/*
 !web/public/uploads/.gitkeep
+web/build-*.log
+web/preload.js
 Thumbs.db
 .DS_Store

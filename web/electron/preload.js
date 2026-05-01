@@ -107,6 +107,22 @@ if (!contextBridge || !ipcRenderer) {
       .catch(() => ({ ok: false })),
   /** Bring the main dashboard window to the foreground (keyboard focus). */
   focusMainWindow: () => ipcRenderer.invoke("app:focus-main-window"),
+  /**
+   * v1.2.9: First-launch password gate persistence. Stored in a small
+   * JSON file under `userData/` rather than `localStorage`, because
+   * the bundled Next server picks a different loopback port every
+   * launch (`getFreeIpv4Port`), which changes the renderer origin and
+   * silently invalidates origin-keyed `localStorage`. The IPC pair
+   * survives port changes.
+   */
+  getFirstLaunchPasswordUnlocked: () =>
+    ipcRenderer
+      .invoke("app:get-first-launch-password-unlocked")
+      .catch(() => ({ ok: false, unlocked: false })),
+  setFirstLaunchPasswordUnlocked: (unlocked) =>
+    ipcRenderer
+      .invoke("app:set-first-launch-password-unlocked", { unlocked: Boolean(unlocked) })
+      .catch(() => ({ ok: false })),
   /** Nudge `webContents.focus()` without requiring a window deactivation (fixes dead inputs after overlay/bracket work). */
   restoreWebKeyboardFocus: () =>
     ipcRenderer.invoke("app:restore-web-keyboard-focus"),

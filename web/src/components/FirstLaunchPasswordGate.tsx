@@ -3,22 +3,31 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
- * v1.1.1 first-launch password gate.
+ * First-launch password gate.
  *
  * Renders a full-screen modal on the very first dashboard mount of
  * a fresh install. The operator must enter the access password
- * before any dashboard UI is even mounted underneath. Once the
- * correct password is entered we persist a localStorage flag so
- * subsequent launches skip the gate entirely.
+ * before any dashboard UI is mounted underneath. Once the correct
+ * password is entered we persist an unlock flag so subsequent
+ * launches skip the gate entirely.
+ *
+ * v1.2.9 persistence overhaul: the unlock flag is now stored via
+ * Electron IPC in a JSON file under `userData/`, NOT `localStorage`.
+ * Reason: the bundled Next server picks a fresh loopback port every
+ * launch (`getFreeIpv4Port` in `electron/main.js`), which changes
+ * the renderer origin (`http://127.0.0.1:<port>`). Browser
+ * `localStorage` is keyed by origin, so the flag written on launch
+ * N was invisible on launch N+1 — the operator was prompted on
+ * EVERY launch instead of only the first. The IPC path survives
+ * port changes; we keep `localStorage` as a fallback for the dev
+ * browser session (where `matBeastDesktop` is undefined and the
+ * dev port stays at 3000).
  *
  * Notes:
  *   - The gate is mounted by `RouteChromeShell`, which already
  *     short-circuits on `/overlay` routes. Overlay BrowserWindows
  *     (offscreen NDI surfaces, popped-out overlay output) are
  *     therefore never gated.
- *   - All Electron windows share the same renderer origin, so
- *     unlocking once in the dashboard implicitly unlocks every
- *     window of the same install.
  *   - This is **not** a security boundary. The expected password
  *     lives in this source file and is trivially extractable from
  *     the shipped bundle. It exists to filter casual / unintended
@@ -30,6 +39,67 @@ import { useCallback, useEffect, useRef, useState } from "react";
  */
 const PASSWORD_FLAG_KEY = "matbeast.firstLaunchPasswordEntered";
 const REQUIRED_PASSWORD = "Kuwy";
+
+type DesktopBridge = {
+  getFirstLaunchPasswordUnlocked?: () => Promise<{ ok: boolean; unlocked: boolean }>;
+  setFirstLaunchPasswordUnlocked?: (
+    unlocked: boolean,
+  ) => Promise<{ ok: boolean }>;
+};
+
+function getDesktopBridge(): DesktopBridge | null {
+  if (typeof window === "undefined") return null;
+  const w = window as unknown as { matBeastDesktop?: DesktopBridge };
+  return w.matBeastDesktop ?? null;
+}
+
+async function readUnlockFlag(): Promise<boolean> {
+  const desk = getDesktopBridge();
+  if (desk?.getFirstLaunchPasswordUnlocked) {
+    try {
+      const r = await desk.getFirstLaunchPasswordUnlocked();
+      if (r && r.unlocked === true) return true;
+      /**
+       * One-time migration: if the desktop file says "locked" but
+       * the legacy `localStorage` flag is set, the user already
+       * unlocked under a previous origin/port. Promote it to the
+       * persistent IPC store so they aren't re-prompted.
+       */
+      try {
+        if (window.localStorage.getItem(PASSWORD_FLAG_KEY) === "true") {
+          await desk.setFirstLaunchPasswordUnlocked?.(true);
+          return true;
+        }
+      } catch {
+        /* localStorage unavailable */
+      }
+      return false;
+    } catch {
+      /* fall through to localStorage */
+    }
+  }
+  try {
+    return window.localStorage.getItem(PASSWORD_FLAG_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+async function writeUnlockFlag(): Promise<void> {
+  const desk = getDesktopBridge();
+  if (desk?.setFirstLaunchPasswordUnlocked) {
+    try {
+      await desk.setFirstLaunchPasswordUnlocked(true);
+    } catch {
+      /* fall through */
+    }
+  }
+  try {
+    window.localStorage.setItem(PASSWORD_FLAG_KEY, "true");
+  } catch {
+    /* persistence failed — IPC path is the source of truth in production */
+  }
+}
 
 const overlay: React.CSSProperties = {
   position: "fixed",
@@ -93,18 +163,22 @@ export default function FirstLaunchPasswordGate({
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   /**
-   * Read the persisted unlock flag once on mount. We deliberately
-   * default to LOCKED if localStorage is unavailable — that way a
+   * Read the persisted unlock flag once on mount. Source of truth in
+   * production is the IPC-backed `userData/first-launch-password.json`
+   * (see `electron/main.js`); browser/dev falls back to localStorage.
+   * We deliberately default to LOCKED on any read failure so a
    * misconfigured renderer can never accidentally bypass the gate.
    */
   useEffect(() => {
-    let isFlagSet = false;
-    try {
-      isFlagSet = window.localStorage.getItem(PASSWORD_FLAG_KEY) === "true";
-    } catch {
-      isFlagSet = false;
-    }
-    setState(isFlagSet ? "unlocked" : "locked");
+    let cancelled = false;
+    void (async () => {
+      const unlocked = await readUnlockFlag();
+      if (cancelled) return;
+      setState(unlocked ? "unlocked" : "locked");
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   /**
@@ -121,12 +195,7 @@ export default function FirstLaunchPasswordGate({
 
   const submit = useCallback(() => {
     if (draft === REQUIRED_PASSWORD) {
-      try {
-        window.localStorage.setItem(PASSWORD_FLAG_KEY, "true");
-      } catch {
-        /* persistence failed — user will be re-prompted next launch
-         * but at least gets to use the app this session. */
-      }
+      void writeUnlockFlag();
       setError(null);
       setDraft("");
       setState("unlocked");

@@ -1,6 +1,50 @@
 # Progress Log
 
 ## Current Build Status
+- **v1.2.9 (2026-05-01)** — fixes "the password is required on every
+  launch instead of only the first" + removes the diagnostic logs
+  added in v1.2.2 / v1.2.4 + adds `web/build-*.log` and stray
+  `web/preload.js` to `.gitignore`.
+  - **Password gate persistence (root cause + fix).** The bundled
+    Next server in `electron/main.js` calls `getFreeIpv4Port()` on
+    every launch, so the renderer's URL origin is
+    `http://127.0.0.1:<random>` — different every time. Browser
+    `localStorage` is keyed by origin, so the unlock flag we wrote
+    on launch N (`matbeast.firstLaunchPasswordEntered = "true"`)
+    was simply invisible to launch N+1's renderer, and the gate
+    re-prompted forever.
+  - **Fix:** persist the unlock flag through Electron IPC into a
+    JSON file under `app.getPath("userData")/first-launch-password.json`.
+    Two new handlers in `electron/main.js`
+    (`app:get-first-launch-password-unlocked` /
+    `app:set-first-launch-password-unlocked`); two new methods on
+    the preload bridge (`getFirstLaunchPasswordUnlocked`,
+    `setFirstLaunchPasswordUnlocked`); `FirstLaunchPasswordGate.tsx`
+    now reads/writes through those when running inside the desktop
+    app, and falls back to `localStorage` only in the dev browser
+    (port 3000 stays put). Includes a one-time migration: if the
+    desktop file says "locked" but the legacy `localStorage` flag
+    is set, we promote it to the IPC store so existing installs
+    don't have to re-enter the password.
+  - **Removed v1.2.2 / v1.2.4 diagnostic logging.** The bug-hunt
+    console output added to `bundled-server.log` is no longer
+    needed (the player-persistence and draw fixes shipped). Removed
+    from:
+    - `src/app/api/players/route.ts` — the `created player` log.
+    - `src/app/api/cloud/events/push/route.ts` — the
+      `envelope team counts` log.
+    - `src/app/api/tournament/import-roster/route.ts` — the
+      `document team counts` log.
+    - `src/lib/bracket-engine.ts` — the QF auto-advance decision
+      log + the `autoAdvanceLog` accumulator that fed it. The
+      auto-advance behavior itself is unchanged; only the log line
+      is gone.
+  - **`.gitignore` cleanup.** Added `web/build-*.log` and
+    `web/preload.js` so future stray copies don't show up as
+    untracked. The actual stale files were deleted (canonical
+    preload remains `web/electron/preload.js`).
+  - Bumped `web/package.json` to `1.2.9`.
+
 - **v1.2.8 (2026-05-01)** — fixes the "Results record disappears when
   the file is closed and reopened" bug. Result log rows lived only in
   the local SQLite `ResultLog` table; they were never written into
