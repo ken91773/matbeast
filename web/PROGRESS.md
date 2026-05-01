@@ -1,6 +1,415 @@
 # Progress Log
 
 ## Current Build Status
+- **v1.2.8 (2026-05-01)** — fixes the "Results record disappears when
+  the file is closed and reopened" bug. Result log rows lived only in
+  the local SQLite `ResultLog` table; they were never written into
+  the saved `.matb` envelope or the cloud blob, so any reopen (disk
+  open, cloud open, restore-from-disk, or opening the file on a
+  second computer) produced an empty Results card. End-to-end fix
+  across the save and load pipeline:
+  - **Envelope schema (`src/lib/roster-file-types.ts`).** Added
+    `RosterFileResultLog` (mirrors `ResultLogEntry` minus `id`) and
+    an optional `resultLogs?: RosterFileResultLog[]` field on
+    `MatBeastEventEnvelope`. Optional means pre-v1.2.8 files load
+    unchanged — missing field ⇒ "don't touch live results".
+  - **Save (`src/lib/roster-export-build.ts` +
+    `src/lib/matbeast-dashboard-file-actions.ts`).**
+    `wrapMatBeastEventFile` now accepts `resultLogs`. `buildEnvelopeText`
+    reuses its existing `GET /api/board` call (the one that already
+    grabs `trainingMode`) and pulls `board.resultsLog` (the same
+    rows the Results card displays — `getResultLogsCompat` already
+    filters by tournament + roster file), maps them into the
+    envelope shape, and passes them through. The board endpoint is
+    cached and tournament-scoped, so this adds zero extra round
+    trips.
+  - **Parse (`src/lib/roster-file-parse.ts`).**
+    `parseMatBeastEventFileJson` extracts the optional `resultLogs`
+    array, validates `resultType` against the canonical set, drops
+    rows missing `createdAt`/`resultType`, and returns a typed
+    array. Lenient validation so a corrupted blob never blocks the
+    rest of the import.
+  - **Import server
+    (`src/app/api/tournament/import-roster/route.ts` +
+    `src/lib/import-roster-server.ts`).** Route accepts an optional
+    `resultLogs` field on the JSON body with the same lenient
+    validation. `importRosterDocumentForTournament` now takes a
+    `resultLogs?: RosterFileResultLog[] | null` parameter; when the
+    array is provided (truthy `Array.isArray`), it deletes all
+    existing `ResultLog` rows for the target `tournamentId` inside
+    a transaction and re-inserts each row preserving original
+    `createdAt`. When the field is omitted (legacy envelope OR
+    in-memory undo path which never includes it), live results are
+    not touched — so undo / older files still behave as before.
+  - **Open paths (`matbeast-dashboard-file-actions.ts`).** Both
+    `matbeastImportOpenedEventFile` (regular open + cloud open via
+    `HomeCloudPanel.openCloudEvent`) and
+    `matbeastRestoreFromDiskToCloud` now thread `resultLogs` from
+    the parser into the `POST /api/tournament/import-roster` body.
+  - **Round-trip behaviour.** A saved envelope contains the rows
+    visible in the Results card at save time. Reopening (locally
+    or on another install via cloud) wipes the new tournament's
+    `ResultLog` for that id and replays the rows with their
+    original timestamps, so the panel renders identically to the
+    pre-close state.
+  - Bumped `web/package.json` to `1.2.8`.
+
+- **v1.2.7 (2026-05-01)** — bracket card "current match" selection is
+  now click-anywhere instead of click-the-thin-border. In
+  `src/components/BracketPanel.tsx` the `MatchCard` wrapper `<div>`
+  used to call `handleCardBorderClick`, which only toggled the
+  match's selected state when the click landed within a 10 px ring
+  around the outside edge of the card. The intent of that gate was to
+  avoid double-firing whenever the user clicked an inner control
+  (home/away team, VS toggle, edit-teams icon), but it forced the
+  user to aim at a slim border to mark the current match.
+  - Replaced with `handleCardBackgroundClick`, which checks
+    `target.closest("button, select, input, textarea, label, a")`.
+    If the click descended from any interactive child it bails (so
+    picking a winner, toggling VS, opening the team-edit form, and
+    selecting/cancel/apply inside that form all keep their existing
+    behavior). Otherwise — anywhere else in the card background, the
+    rounded-corner padding, the gaps between the team buttons, the
+    border itself — the click toggles `selectedMatchId`.
+  - Added `cursor-pointer` to the wrapper and updated the hover
+    `title` so the affordance matches: "Click anywhere in the card
+    background to set the current match".
+  - No bracket engine, overlay, or persistence changes; the new
+    handler still calls the same `onSelect(isSelected ? null : m.id)`
+    so a second click on the highlighted card still clears the
+    "current match" pick (matches v1.2.4's "click winner button
+    again to clear" pattern).
+  - Bumped `web/package.json` to `1.2.7`.
+
+- **v1.2.6 (2026-04-30)** — three small scoreboard-overlay polish
+  changes around the post-final winner highlight and draw eliminations.
+  All changes live in `src/app/api/board/route.ts` (the single
+  authoritative scoreboard state machine).
+  - **OT left-arrow button now dims the green winner name.** The
+    `ot_round_transfer_elapsed_to_main` command (the "←" button that
+    only appears in OT-round mode and moves OT ELAPSED into the main
+    clock) now calls the same `dimWinnerGlowIfFinalSaved()` helper
+    that `reset_timer_regulation` already uses. Functionally that
+    button starts the next OT sub-round, so painting the previous
+    sub-round's winner in green on the broadcast overlay was stale.
+    Now the green clears as soon as the operator advances to the
+    next OT round, matching the "reset timer" behavior the user
+    relies on.
+  - **Regulation draw paints a red X on BOTH teams' health bars.**
+    Inside `final_save`, the elimination-count update used to only
+    increment `leftEliminatedCount` (when the right side won) or
+    `rightEliminatedCount` (when the left side won), and a `DRAW`
+    incremented neither. Per the user's clarification, a regulation
+    draw eliminates a player from each team for the next round, so
+    we now bump both counters when `rt === "DRAW"` AND we are NOT
+    in OT-round mode (`!otRoundForSave`). The pre-existing
+    `crossedFromCount(leftEliminatedCount)` /
+    `crossedFromCount(rightEliminatedCount)` projection in
+    `src/lib/board.ts` automatically picks up the new counts and
+    `OverlayClient` paints `/redx.png` over the corresponding body
+    silhouette on both sides without any overlay-side change.
+  - **Edge case: 5-5 simultaneous elim on a draw does not auto-pick
+    a bracket winner.** With the new draw behavior, a draw at 4-4
+    moves both teams to 5 elims, technically completing the match.
+    The bracket auto-advance logic at the bottom of `final_save`
+    used to choose the FIRST side that hit 5 (i.e. always "right"
+    in the 5-5 tie), which would arbitrarily advance one team. We
+    now explicitly return `matchWinnerSide = null` when both sides
+    are at >= 5, leaving the bracket pick to the operator.
+  - **Snapshot/undo unchanged.** `final_unsave` already restores
+    `leftEliminatedCount` and `rightEliminatedCount` from the
+    pre-save snapshot, so undoing a draw correctly removes both red
+    Xs and the OT-arrow path leaves no extra state to restore.
+  - Bumped `web/package.json` to `1.2.6`.
+
+- **v1.2.5 (2026-04-30)** — second attempt at the recurring "clicked
+  the input, it visually focused, but my keystrokes go nowhere until I
+  Alt-Tab" bug. The v1.2.4 triple-attempt nudge helped but did not
+  eliminate it; the user reported the bug still fires after a normal
+  sequence of native `<select>` dropdown + button clicks, before
+  clicking an input. This release adds three defensive layers in
+  `src/lib/matbeast-panel-pointer-recovery.ts`:
+  - **Always nudge on every pointerdown / mousedown / touchstart.**
+    Previously the nudge was gated on `isLikelyEditableInteractionTarget`,
+    so clicks on buttons / dropdowns / divs did not refresh keyboard
+    routing. Native `<select>` interactions and button presses can
+    leave Windows keyboard routing in a half-bound state where the
+    next input click visually focuses but the keys never arrive.
+    Firing `webContents.focus()` after every interaction prevents the
+    half-bound state from accumulating.
+  - **Nudge on `<select>` `change` events.** Native `<select>`
+    dropdowns on Windows show an OS-level popup that temporarily
+    steals keyboard routing from Chromium; after the user picks an
+    item the popup closes and `change` fires. Nudging here restores
+    routing before the user clicks the next input.
+  - **Dead-keystroke rescue.** Track the most recently clicked
+    editable element. If a printable single-character keystroke later
+    reaches `document` / `body` (the smoking gun for "Chromium lost
+    the input"), refocus that element and nudge keyboard routing.
+    This is the last-resort path that lets the user keep typing
+    without Alt-Tab if every prior nudge failed.
+  - Existing per-tick coalescing (one schedule per click burst with
+    three fires at microtask + 80 ms + 320 ms) is preserved, so the
+    new always-on pointerdown handler does not multiply IPC traffic.
+  - Bumped `web/package.json` to `1.2.5`.
+
+- **v1.2.4 (2026-04-30)** — three small bracket-card / desktop polish
+  changes plus bracket diagnostic logging.
+  - **Bracket card: removed redundant "Clear winner" button.** In
+    `src/components/BracketPanel.tsx`, the explicit row-wide "Clear
+    winner" button that appeared after picking a QF/SF/GF winner is
+    gone. The team-toggle buttons already handle the unset path —
+    clicking the highlighted home team calls
+    `onPickWinner(m.id, homeWon ? null : m.homeTeam.id)`, which sends
+    `null` (clears the pick) when `homeWon` is already true; same for
+    away. The standalone button was visually busy and duplicated work
+    already covered by tapping the highlighted winner a second time.
+  - **Input focus: triple-attempt keyboard nudge.** In
+    `src/lib/matbeast-panel-pointer-recovery.ts`, the per-tick coalesced
+    `restoreWebKeyboardFocus` IPC now fires THREE times per editable
+    interaction (next microtask, +80 ms, +320 ms) instead of once. The
+    bug being chased is the Windows "active input but dead keys until
+    Alt-Tab" failure: Chromium's `webContents.focus()` sometimes lands
+    before the underlying ViewHost has finished re-binding keyboard
+    routing (most often after a child window or modal closes), and
+    the single nudge is silently dropped. Repeating the call at
+    growing delays catches the late-binding case at ~zero cost (each
+    call is one IPC + one Win32 SetFocus). Existing per-tick
+    coalescing in the renderer is preserved so the burst of
+    `mousedown` + `pointerdown` + `focusin` from a single click still
+    triggers exactly one schedule (with three fires).
+  - **Bracket auto-advance diagnostic.** In
+    `src/lib/bracket-engine.ts`, `generateBracketFromSeeds` now logs
+    per-QF the home/away team names, the `isByeName(home)` /
+    `isByeName(away)` decisions, and the resulting `autoWinner` to
+    `bundled-server.log`. The user reported "team paired with BYE
+    should auto-advance — it isn't" but the existing engine logic
+    (auto-set `winnerTeamId` when one side passes `isByeName`,
+    `applyByeWalkoversToRound`, `syncDownstreamRounds` to project
+    forward) looks correct on inspection. The most plausible
+    remaining cause is name normalization — if a user types "BYE 1"
+    or similar instead of literal "BYE" / "TBD" / empty, `isByeName`
+    correctly returns `false` and no auto-advance fires. The new log
+    line lets us confirm or refute that without a second round trip.
+  - Bumped `web/package.json` to `1.2.4`.
+
+- **v1.2.3 (2026-04-30)** — fixes the v1.2.2 regression where the
+  "Cloud conflict" dialog popped up on every player save.
+  - Root cause: v1.2.2's per-save safety-net push runs on top of the
+    pre-existing autosave subscriber (`AppChrome.tsx` listens to
+    `subscribeDocumentDirty` and fires `matbeastSaveTabById` when a
+    tournament becomes dirty, gated only on the `autoSaveEvery5Minutes`
+    preference). When that preference is on, BOTH save paths fire on
+    a single player save. They both read `CloudEventLink.baseVersion`,
+    both PUT `/api/events/:id/blob` with the same `X-Expected-Version`,
+    the masters server accepts the first push (bumps `currentVersion`
+    to N+1) and rejects the second with 409. The 409 dispatches
+    `matbeast-cloud-conflict`, which `CloudEventDialogs.tsx` shows as
+    the "Cloud conflict / Overwrite / Keep cloud / Save mine as local"
+    dialog the user reported seeing on every save.
+  - Fix: per-tab save mutex inside `matbeastSaveTabById` in
+    `src/lib/matbeast-dashboard-file-actions.ts`. The exported
+    function now wraps the previous body (renamed
+    `matbeastSaveTabByIdInner`) in a `Map<tabId, Promise>`. A second
+    caller for the same tab awaits the in-flight save before starting
+    its own. Once the prior save resolves, the second call runs
+    against the just-updated `link.baseVersion` and either
+    short-circuits via the push endpoint's `kind: "no-op"` branch
+    (when nothing changed) or pushes cleanly with the correct
+    expected version. No two concurrent PUTs on the same blob.
+  - Other concurrent save sources (close-tab silent save in
+    `requestCloseTab`, `__MATBEAST_SAVE_BEFORE_QUIT__` in
+    `QuitSaveBridge`, the manual File ▸ Save action) all funnel
+    through the same `matbeastSaveTabById` and so all benefit from
+    the new mutex without further changes.
+  - The v1.2.2 mechanic — `PlayerEntryForm.submit()` calls
+    `matbeastSaveTabById({ silent: true })` after a successful
+    `POST /api/players` — is preserved. That call is what guarantees
+    the new player lands on the cloud immediately and was the actual
+    fix for the "last-saved player vanishes on reopen" bug.
+  - Tests / scope: surgical addition of a per-tab `Promise` map to
+    `matbeastSaveTabById`, plus splitting its body into an inner
+    function. No schema, no API, no UI tweaks. Bumped
+    `web/package.json` to `1.2.3`.
+
+- **v1.2.2 (2026-04-30)** — second attempt at the "last player saved on
+  focused team vanishes on reopen" bug. The v1.2.1 mutation-drain fix
+  did not change the user's reproduction, so the close-tab silent save
+  reading a stale SQLite WAL snapshot is NOT the (only) cause. v1.2.2
+  takes a belt-and-suspenders approach:
+  - **Belt — explicit per-save cloud push.** `PlayerEntryForm.submit()`
+    in `src/app/roster/RosterClient.tsx` now calls
+    `matbeastSaveTabById(silent: true)` immediately after a successful
+    `POST /api/players` + `POST /api/player-profiles` round trip. This
+    happens INSIDE `submit()` so we know (because we awaited the POST
+    response) the row is committed in SQLite. By the time the form
+    reports "Profile saved", the cloud blob already contains the new
+    player. Subsequent close-tab silent saves are no-ops (the masters
+    push endpoint short-circuits when `localSha === lastSyncedSha`),
+    so this is robust regardless of close timing or what the user does
+    next (switching SHOW TEAM, immediately closing, opening a different
+    file, etc.). Cloud push errors are caught and swallowed inside
+    `submit()` because the local save already succeeded — a cloud blip
+    must not back-fail the form. The v1.2.1 in-flight mutation drain
+    is still in place as a second line of defense.
+  - **Suspenders — server-side diagnostic logging.** Three routes now
+    log structured JSON to `bundled-server.log` so a follow-up bug
+    report can pinpoint where data is dropped:
+    - `POST /api/players`: every successful create logs the player id,
+      team id, assigned `lineupOrder`, and the team's player count
+      after `normalizeTeamLineup` runs. Confirms the row really
+      committed and how many players the team has on disk.
+    - `POST /api/cloud/events/push`: parses the incoming envelope and
+      logs per-team player counts plus the envelope sha (12-char prefix)
+      and byte length. Tells us exactly what the renderer pushed to the
+      cloud.
+    - `POST /api/tournament/import-roster`: logs per-team player counts
+      from the parsed document on every import (open from cloud, open
+      from disk). Tells us exactly what the renderer received from the
+      cloud blob on reopen.
+    With these three points the user can install 1.2.2, reproduce the
+    bug, and `bundled-server.log` will say either:
+      - "POST shows N+1, push shows N+1, import shows N" → cloud
+        round-trip is the culprit (masters server bug or stale blob).
+      - "POST shows N+1, push shows N" → renderer's
+        `buildRosterDocumentFromTeamsApi` or the `/api/teams` GET is
+        dropping the row (most likely race or cache).
+      - "POST shows N" → the player never made it to the DB despite the
+        UI showing it.
+  - Tests / scope: form-level safety net + read-only logging. No
+    schema, no API contract changes, no UI tweaks. Bumped
+    `web/package.json` to `1.2.2`. Log path on Windows:
+    `%APPDATA%\\Mat Beast Scoreboard\\bundled-server.log`.
+
+- **v1.2.1 (2026-04-30)** — single bug-fix release. Roster card players
+  occasionally vanished on reopen: specifically, the LAST player saved on
+  the team that was in focus (selected in `SHOW TEAM`) at the moment the
+  user closed the file. The user discovered that switching `SHOW TEAM`
+  to a different team between the save and close masked the bug — that
+  was the diagnostic clue that pointed at a save-vs-close timing race,
+  not a hardcoded slot limit, lineup-order normalization quirk, or
+  envelope-import defect.
+  - Root cause: `matbeastFetch` in `src/lib/matbeast-fetch.ts` calls
+    `markTournamentDirty(tid)` BEFORE awaiting the actual `fetch()`, so
+    the tab is marked dirty as soon as the user clicks the form's Save
+    icon — well before `POST /api/players` finishes round-tripping
+    through Prisma + SQLite. If the user then immediately clicks the
+    close-tab `x`, `requestCloseTab` sees `isTournamentDirty(tabId)` is
+    already `true` and fires `matbeastSaveTabById({ silent: true })`
+    asynchronously. That silent save reads `/api/teams` to build the
+    cloud envelope; under SQLite WAL semantics the GET only sees data
+    from already-committed transactions, so if the player POST has not
+    yet committed on the server, the envelope is built WITHOUT the just
+    saved player. The cloud blob is uploaded (now N-1 players), the
+    POST commits a moment later, the UI refreshes and shows the new
+    player — but the cloud (which is the source of truth on reopen) is
+    permanently missing it. Switching `SHOW TEAM` between save and
+    close worked around the bug because the dropdown click took long
+    enough for the in-flight POST to commit before close could fire the
+    silent save.
+  - Fix: `src/lib/matbeast-fetch.ts` now tracks every in-flight
+    `POST/PUT/PATCH/DELETE` issued through `matbeastFetch` in a module
+    level counter and exposes `awaitPendingMatbeastMutations()` which
+    resolves once that counter is back to zero. `matbeastSaveTabById`
+    in `src/lib/matbeast-dashboard-file-actions.ts` awaits this drain
+    BEFORE reading `/api/board` and `/api/teams` to build the envelope,
+    so the silent save always sees every committed write — including
+    the player POST the user just kicked off. Internal GET requests
+    issued by the silent save itself are not tracked (only mutation
+    methods increment the counter), so the await cannot deadlock on
+    its own work.
+  - Tests / scope: surgical change. No schema, no API, no UI tweaks.
+    Only the close-tab silent save and any future caller of
+    `awaitPendingMatbeastMutations` are affected. Bumped
+    `web/package.json` to `1.2.1`.
+
+
+- **v1.2.1 (2026-04-30)** — single bug-fix release. Roster card players
+  occasionally vanished on reopen: specifically, the LAST player saved on
+  the team that was in focus (selected in `SHOW TEAM`) at the moment the
+  user closed the file. The user discovered that switching `SHOW TEAM`
+  to a different team between the save and close masked the bug — that
+  was the diagnostic clue that pointed at a save-vs-close timing race,
+  not a hardcoded slot limit, lineup-order normalization quirk, or
+  envelope-import defect.
+  - Root cause: `matbeastFetch` in `src/lib/matbeast-fetch.ts` calls
+    `markTournamentDirty(tid)` BEFORE awaiting the actual `fetch()`, so
+    the tab is marked dirty as soon as the user clicks the form's Save
+    icon — well before `POST /api/players` finishes round-tripping
+    through Prisma + SQLite. If the user then immediately clicks the
+    close-tab `x`, `requestCloseTab` sees `isTournamentDirty(tabId)` is
+    already `true` and fires `matbeastSaveTabById({ silent: true })`
+    asynchronously. That silent save reads `/api/teams` to build the
+    cloud envelope; under SQLite WAL semantics the GET only sees data
+    from already-committed transactions, so if the player POST has not
+    yet committed on the server, the envelope is built WITHOUT the just
+    saved player. The cloud blob is uploaded (now N-1 players), the
+    POST commits a moment later, the UI refreshes and shows the new
+    player — but the cloud (which is the source of truth on reopen) is
+    permanently missing it. Switching `SHOW TEAM` between save and
+    close worked around the bug because the dropdown click took long
+    enough for the in-flight POST to commit before close could fire the
+    silent save.
+  - Fix: `src/lib/matbeast-fetch.ts` now tracks every in-flight
+    `POST/PUT/PATCH/DELETE` issued through `matbeastFetch` in a module
+    level counter and exposes `awaitPendingMatbeastMutations()` which
+    resolves once that counter is back to zero. `matbeastSaveTabById`
+    in `src/lib/matbeast-dashboard-file-actions.ts` awaits this drain
+    BEFORE reading `/api/board` and `/api/teams` to build the envelope,
+    so the silent save always sees every committed write — including
+    the player POST the user just kicked off. Internal GET requests
+    issued by the silent save itself are not tracked (only mutation
+    methods increment the counter), so the await cannot deadlock on
+    its own work.
+  - Tests / scope: surgical change. No schema, no API, no UI tweaks.
+    Only the close-tab silent save and any future caller of
+    `awaitPendingMatbeastMutations` are affected. Bumped
+    `web/package.json` to `1.2.1`.
+
+
+- **v1.2.1 (2026-04-30)** — single bug-fix release. Roster card players
+  occasionally vanished on reopen: specifically, the LAST player saved on
+  the team that was in focus (selected in `SHOW TEAM`) at the moment the
+  user closed the file. The user discovered that switching `SHOW TEAM`
+  to a different team between the save and close masked the bug — that
+  was the diagnostic clue that pointed at a save-vs-close timing race,
+  not a hardcoded slot limit, lineup-order normalization quirk, or
+  envelope-import defect.
+  - Root cause: `matbeastFetch` in `src/lib/matbeast-fetch.ts` calls
+    `markTournamentDirty(tid)` BEFORE awaiting the actual `fetch()`, so
+    the tab is marked dirty as soon as the user clicks the form's Save
+    icon — well before `POST /api/players` finishes round-tripping
+    through Prisma + SQLite. If the user then immediately clicks the
+    close-tab `x`, `requestCloseTab` sees `isTournamentDirty(tabId)` is
+    already `true` and fires `matbeastSaveTabById({ silent: true })`
+    asynchronously. That silent save reads `/api/teams` to build the
+    cloud envelope; under SQLite WAL semantics the GET only sees data
+    from already-committed transactions, so if the player POST has not
+    yet committed on the server, the envelope is built WITHOUT the just
+    saved player. The cloud blob is uploaded (now N-1 players), the
+    POST commits a moment later, the UI refreshes and shows the new
+    player — but the cloud (which is the source of truth on reopen) is
+    permanently missing it. Switching `SHOW TEAM` between save and
+    close worked around the bug because the dropdown click took long
+    enough for the in-flight POST to commit before close could fire the
+    silent save.
+  - Fix: `src/lib/matbeast-fetch.ts` now tracks every in-flight
+    `POST/PUT/PATCH/DELETE` issued through `matbeastFetch` in a module
+    level counter and exposes `awaitPendingMatbeastMutations()` which
+    resolves once that counter is back to zero. `matbeastSaveTabById`
+    in `src/lib/matbeast-dashboard-file-actions.ts` awaits this drain
+    BEFORE reading `/api/board` and `/api/teams` to build the envelope,
+    so the silent save always sees every committed write — including
+    the player POST the user just kicked off. Internal GET requests
+    issued by the silent save itself are not tracked (only mutation
+    methods increment the counter), so the await cannot deadlock on
+    its own work.
+  - Tests / scope: surgical change. No schema, no API, no UI tweaks.
+    Only the close-tab silent save and any future caller of
+    `awaitPendingMatbeastMutations` are affected. Bumped
+    `web/package.json` to `1.2.1`.
+
+
 - Desktop app rebuilt successfully multiple times. v0.9.13 → v0.9.19
   in a single session diagnosed and shipped a hardened preload-bridge
   pipeline along with the new bracket-music feature; full breakdown

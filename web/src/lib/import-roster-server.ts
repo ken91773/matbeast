@@ -1,9 +1,12 @@
-import type { EventKind } from "@prisma/client";
+import type { EventKind, FinalResultType } from "@prisma/client";
 import { syncDownstreamRounds } from "@/lib/bracket-engine";
 import { prisma } from "@/lib/prisma";
 import { normalizeRosterDocumentLineups } from "@/lib/roster-lineup-normalize";
 import { ensureEightTeamSlots } from "@/lib/teams-bootstrap";
-import type { RosterFileDocument } from "@/lib/roster-file-types";
+import type {
+  RosterFileDocument,
+  RosterFileResultLog,
+} from "@/lib/roster-file-types";
 
 function validateImportDocument(doc: RosterFileDocument) {
   for (const team of doc.teams) {
@@ -27,6 +30,12 @@ export async function importRosterDocumentForTournament(
       winnerSeedOrder: number | null;
     }>;
   },
+  /**
+   * v1.2.8: Results card rows from the saved envelope. The route
+   * passes through whatever `parseMatBeastEventFileJson` parsed; we
+   * delete any pre-existing rows for this tournament and insert these.
+   */
+  resultLogs?: RosterFileResultLog[] | null,
 ) {
   const document = normalizeRosterDocumentLineups(documentIn);
   validateImportDocument(document);
@@ -141,6 +150,48 @@ export async function importRosterDocumentForTournament(
         });
       }
       await syncDownstreamRounds(tx, ev.id);
+    });
+  }
+
+  /**
+   * v1.2.8: rebuild this tournament's `ResultLog` rows from the
+   * envelope. Run AFTER the roster transaction so that even a
+   * cloud-pushed envelope opened on a fresh install starts with a
+   * clean slate. Skipped entirely when the envelope omits the field
+   * (pre-v1.2.8 saves) so we don't wipe live results just because
+   * the user reopened an older file format.
+   */
+  if (Array.isArray(resultLogs)) {
+    await prisma.$transaction(async (tx) => {
+      await tx.resultLog.deleteMany({ where: { tournamentId } });
+      if (resultLogs.length === 0) return;
+      for (const r of resultLogs) {
+        try {
+          await tx.resultLog.create({
+            data: {
+              tournamentId,
+              rosterFileName: r.rosterFileName ?? "UNTITLED",
+              roundLabel: r.roundLabel ?? "",
+              leftName: r.leftName ?? "",
+              rightName: r.rightName ?? "",
+              leftTeamName: r.leftTeamName ?? null,
+              rightTeamName: r.rightTeamName ?? null,
+              resultType: r.resultType as FinalResultType,
+              winnerName: r.winnerName ?? null,
+              isManual: Boolean(r.isManual),
+              manualDate: r.manualDate ?? null,
+              manualTime: r.manualTime ?? null,
+              finalSummaryLine: r.finalSummaryLine ?? null,
+              createdAt: new Date(r.createdAt),
+            },
+          });
+        } catch (err) {
+          console.warn(
+            "[importRosterDocumentForTournament] result log row import skipped",
+            err,
+          );
+        }
+      }
     });
   }
 }

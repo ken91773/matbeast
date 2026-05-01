@@ -247,16 +247,45 @@ export async function generateBracketFromSeeds(tournamentId: string) {
       await syncDownstreamRounds(tx, eventId);
       return;
     }
+    /**
+     * v1.2.4 diagnostic: log per-QF auto-winner decision so when a
+     * user reports "team paired with BYE didn't auto-advance", we can
+     * read `bundled-server.log` and confirm whether the team name was
+     * actually classified as a BYE by `isByeName`. If a user names a
+     * team something like "BYE 1" or "Bye-A" instead of literal "BYE"
+     * / "TBD" / "" the auto-advance never fires — the log will show
+     * `homeIsBye=false, awayIsBye=false, autoWinner=null` for that
+     * pairing, pointing the fix at name normalization rather than the
+     * generation logic.
+     */
+    const autoAdvanceLog: Array<{
+      bracketIndex: number;
+      home: string;
+      away: string;
+      homeIsBye: boolean;
+      awayIsBye: boolean;
+      autoWinner: "home" | "away" | null;
+    }> = [];
     for (let i = 0; i < 4; i++) {
       const [ia, ib] = QF_PAIR_SEED_INDICES[i];
       const home = teamsBySeed[ia];
       const away = teamsBySeed[ib];
+      const homeIsBye = isByeName(home.name);
+      const awayIsBye = isByeName(away.name);
       const autoWinner =
-        isByeName(home.name) && !isByeName(away.name)
+        homeIsBye && !awayIsBye
           ? away.id
-          : isByeName(away.name) && !isByeName(home.name)
+          : awayIsBye && !homeIsBye
             ? home.id
             : null;
+      autoAdvanceLog.push({
+        bracketIndex: i,
+        home: home.name,
+        away: away.name,
+        homeIsBye,
+        awayIsBye,
+        autoWinner: autoWinner === home.id ? "home" : autoWinner === away.id ? "away" : null,
+      });
       await tx.bracketMatch.create({
         data: {
           eventId,
@@ -270,6 +299,14 @@ export async function generateBracketFromSeeds(tournamentId: string) {
     }
     await applyByeWalkoversToRound(tx, eventId, "QUARTER_FINAL");
     await syncDownstreamRounds(tx, eventId);
+    try {
+      console.log(
+        "[generateBracketFromSeeds][v1.2.4] QF auto-advance",
+        JSON.stringify({ tournamentId, autoAdvance: autoAdvanceLog }),
+      );
+    } catch {
+      /* logging only */
+    }
   });
 
   return loadBracketForTournament(tournamentId);

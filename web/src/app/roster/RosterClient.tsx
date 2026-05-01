@@ -10,6 +10,7 @@ import {
 } from "@/lib/matbeast-fetch";
 import { matbeastKeys } from "@/lib/matbeast-query-keys";
 import { matbeastJson } from "@/lib/matbeast-query";
+import { matbeastSaveTabById } from "@/lib/matbeast-dashboard-file-actions";
 import { openScoreboardOverlayWindow } from "@/lib/open-scoreboard-overlay";
 import { useEventWorkspace } from "@/components/EventWorkspaceProvider";
 import { SkullCrossbonesIcon } from "@/components/icons/SkullCrossbonesIcon";
@@ -1265,8 +1266,16 @@ function PlayerEntryForm({
   liveTournamentId?: string | null;
 }) {
   const queryClient = useQueryClient();
-  const { tournamentId: workspaceTournamentId, tournamentTrainingMode } =
-    useEventWorkspace();
+  const {
+    tournamentId: workspaceTournamentId,
+    tournamentTrainingMode,
+    openTabs,
+    selectTab,
+  } = useEventWorkspace();
+  const openTabsRef = useRef(openTabs);
+  useEffect(() => {
+    openTabsRef.current = openTabs;
+  }, [openTabs]);
   const masterScopeId =
     (liveTournamentId && liveTournamentId.trim()) ||
     (workspaceTournamentId && workspaceTournamentId.trim()) ||
@@ -2270,6 +2279,42 @@ function PlayerEntryForm({
 
       await onSaved();
       flashSaveNotice("Profile saved");
+
+      /**
+       * v1.2.2 fix: explicitly push the just-saved player to the cloud
+       * NOW, while we know it is committed in SQLite (we awaited the
+       * `POST /api/players` response above). Previously we relied on the
+       * close-tab silent save to do this, but a follow-up bug report
+       * showed players still going missing on reopen with the v1.2.1
+       * race-drain in place — the user discovered that switching
+       * `SHOW TEAM` between save and close was the only thing that
+       * preserved the new row. Forcing a cloud push here removes any
+       * dependency on close-tab timing or what the user does next: by
+       * the time `submit()` returns, the cloud blob already has the
+       * player. Any subsequent close-tab save is a redundant no-op
+       * (`/api/cloud/events/push` short-circuits when the local sha
+       * matches `lastSyncedSha`).
+       *
+       * Best-effort — `await` so we know the request finished, but we
+       * intentionally do NOT throw on cloud failures. The UI has already
+       * flashed "Profile saved" because the local save succeeded; a
+       * cloud blip should not back-fail the form. The next save (or
+       * close-tab) will retry.
+       */
+      if (masterScopeId) {
+        try {
+          await matbeastSaveTabById(
+            queryClient,
+            selectTab,
+            () => openTabsRef.current,
+            masterScopeId,
+            { silent: true },
+          );
+        } catch {
+          /* swallow — local save already succeeded */
+        }
+      }
+
       if (!editingId) {
         clearForm(form.teamId);
       }

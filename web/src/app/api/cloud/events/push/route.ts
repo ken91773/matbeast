@@ -61,6 +61,38 @@ export async function POST(req: Request) {
   const bytes = Buffer.from(envelope, "utf8");
   const localSha = sha256Hex(bytes);
 
+  /**
+   * v1.2.2 diagnostic: parse the envelope and log per-team player
+   * counts so we can verify what the renderer actually pushed. Used to
+   * chase the "last-saved player vanishes on reopen" bug. If the team
+   * count here is N+1 but the cloud round-trip yields N, the masters
+   * server / blob storage is dropping the row. If the team count is
+   * already N, the renderer never built an envelope with the new row
+   * and the bug is upstream (in `buildRosterDocumentFromTeamsApi` or
+   * an earlier API read).
+   */
+  try {
+    const parsed = JSON.parse(envelope) as {
+      teams?: Array<{ id?: string; name?: string; players?: unknown[] }>;
+    };
+    const counts = (parsed.teams ?? []).map((t) => ({
+      teamId: t?.id ?? "?",
+      teamName: t?.name ?? "?",
+      playerCount: Array.isArray(t?.players) ? t.players.length : 0,
+    }));
+    console.log(
+      "[POST /api/cloud/events/push][v1.2.2] envelope team counts",
+      JSON.stringify({
+        tournamentId,
+        sha: localSha.slice(0, 12),
+        bytes: bytes.length,
+        teams: counts,
+      }),
+    );
+  } catch {
+    /* logging only; bad json should fall through to normal error path */
+  }
+
   const link = await getCloudEventLink(tournamentId);
   if (!link) {
     return NextResponse.json({ kind: "no-link" as const });

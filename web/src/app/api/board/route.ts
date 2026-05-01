@@ -925,6 +925,15 @@ export async function PATCH(req: Request) {
         if (!isOtRoundLabelFromDropdown(next.roundLabel)) break;
         if (next.timerRunning) break;
         markPersistOtRoundSecondaryClock();
+        /**
+         * v1.2.6: the OT "transfer ELAPSED → main clock" left-arrow
+         * button is functionally a "start the next OT sub-round" so
+         * we treat it the same as `reset_timer_regulation` for the
+         * winner-name green highlight: dim the highlight if a final
+         * is saved, so the overlay stops painting the previous round's
+         * winner once the operator advances to the next sub-round.
+         */
+        dimWinnerGlowIfFinalSaved();
         if (next.otRoundTransferConsumed) {
           const backMain = next.otRoundTransferUndoMainSeconds;
           const backElapsed = next.otRoundTransferUndoElapsedTotal;
@@ -1126,6 +1135,17 @@ export async function PATCH(req: Request) {
             newLeftElim = Math.min(5, newLeftElim + 1);
           } else if (lose === "right") {
             newRightElim = Math.min(5, newRightElim + 1);
+          } else if (rt === "DRAW") {
+            /**
+             * v1.2.6: regulation-round draw eliminates a player from
+             * BOTH teams (each side fields a fresh fighter for the
+             * next round), so paint a red X on both health bars.
+             * Skipped during OT (matches the existing OT exemption
+             * above) because OT is sudden-death — a draw there does
+             * not consume bodies from the quintet.
+             */
+            newLeftElim = Math.min(5, newLeftElim + 1);
+            newRightElim = Math.min(5, newRightElim + 1);
           }
         }
 
@@ -1155,7 +1175,21 @@ export async function PATCH(req: Request) {
 
         const created = insertResult;
         const isMatchComplete = newLeftElim >= 5 || newRightElim >= 5;
-        const matchWinnerSide = newLeftElim >= 5 ? "right" : newRightElim >= 5 ? "left" : null;
+        /**
+         * v1.2.6: a regulation draw that takes BOTH teams to 5 elims
+         * at the same time leaves the bracket winner ambiguous; do not
+         * auto-pick a side (the operator must resolve manually). The
+         * pre-existing "first to 5 alone" logic still drives normal
+         * auto-advance.
+         */
+        const matchWinnerSide =
+          newLeftElim >= 5 && newRightElim >= 5
+            ? null
+            : newLeftElim >= 5
+              ? "right"
+              : newRightElim >= 5
+                ? "left"
+                : null;
         const matchWinnerTeam =
           matchWinnerSide === "left"
             ? leftTeamName.trim()

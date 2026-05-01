@@ -138,6 +138,8 @@ export function parseMatBeastEventFileJson(
   };
   audioVolumePercent?: number;
   trainingMode?: boolean;
+  /** v1.2.8: Results card rows persisted in the envelope. */
+  resultLogs?: import("@/lib/roster-file-types").RosterFileResultLog[];
 } {
   const obj = raw as Partial<MatBeastEventEnvelope> & Record<string, unknown>;
   if (obj && obj.kind === "matbeast-event" && obj.version === 1 && obj.roster) {
@@ -186,12 +188,80 @@ export function parseMatBeastEventFileJson(
     const audioVolumePercent = Number.isFinite(rawVol)
       ? Math.max(0, Math.min(100, Math.round(rawVol)))
       : undefined;
+    /**
+     * v1.2.8: Results card rows. Optional + lenient — pre-v1.2.8 files
+     * omit the field entirely, and any row whose required text is
+     * missing is dropped rather than failing the whole import.
+     */
+    const RESULT_TYPES = new Set([
+      "LEFT",
+      "RIGHT",
+      "DRAW",
+      "NO_CONTEST",
+      "SUBMISSION_LEFT",
+      "SUBMISSION_RIGHT",
+      "ESCAPE_LEFT",
+      "ESCAPE_RIGHT",
+      "DQ_LEFT",
+      "DQ_RIGHT",
+      "MANUAL",
+    ]);
+    const resultLogsRaw = obj.resultLogs as unknown;
+    const resultLogs = Array.isArray(resultLogsRaw)
+      ? (resultLogsRaw as Array<Record<string, unknown>>)
+          .filter(
+            (r) =>
+              r &&
+              typeof r === "object" &&
+              typeof r.createdAt === "string" &&
+              (r.createdAt as string).trim() !== "" &&
+              typeof r.resultType === "string" &&
+              RESULT_TYPES.has(r.resultType as string),
+          )
+          .map((r) => ({
+            rosterFileName:
+              typeof r.rosterFileName === "string" && (r.rosterFileName as string).trim()
+                ? (r.rosterFileName as string)
+                : "UNTITLED",
+            roundLabel:
+              typeof r.roundLabel === "string" ? (r.roundLabel as string) : "",
+            leftName:
+              typeof r.leftName === "string" ? (r.leftName as string) : "",
+            rightName:
+              typeof r.rightName === "string" ? (r.rightName as string) : "",
+            leftTeamName:
+              typeof r.leftTeamName === "string"
+                ? (r.leftTeamName as string)
+                : null,
+            rightTeamName:
+              typeof r.rightTeamName === "string"
+                ? (r.rightTeamName as string)
+                : null,
+            resultType: r.resultType as
+              import("@/lib/roster-file-types").RosterFileResultLog["resultType"],
+            winnerName:
+              typeof r.winnerName === "string"
+                ? (r.winnerName as string)
+                : null,
+            createdAt: r.createdAt as string,
+            isManual: Boolean(r.isManual),
+            manualDate:
+              typeof r.manualDate === "string" ? (r.manualDate as string) : null,
+            manualTime:
+              typeof r.manualTime === "string" ? (r.manualTime as string) : null,
+            finalSummaryLine:
+              typeof r.finalSummaryLine === "string"
+                ? (r.finalSummaryLine as string)
+                : null,
+          }))
+      : undefined;
     return {
       eventName: name,
       document: parseRosterDocument(obj.roster),
       bracket,
       audioVolumePercent,
       trainingMode: obj.trainingMode === true,
+      resultLogs,
     };
   }
   return {

@@ -190,6 +190,30 @@ export async function POST(req: Request) {
       await normalizeTeamLineup(tx, p.teamId);
       return created;
     });
+    /**
+     * v1.2.2 diagnostic: log each successful player create so the
+     * bundled-server.log captures exactly what was committed and how
+     * many players the team has after normalization. Used to chase the
+     * "last-saved player vanishes on reopen" bug. Cheap (one extra
+     * count() per save) and keyed by player+team so the user's log can
+     * be matched back to a specific repro.
+     */
+    try {
+      const teamCount = await prisma.player.count({ where: { teamId: p.teamId } });
+      console.log(
+        "[POST /api/players][v1.2.2] created player",
+        JSON.stringify({
+          playerId: player.id,
+          teamId: player.teamId,
+          firstName: player.firstName,
+          lastName: player.lastName,
+          lineupOrder: player.lineupOrder,
+          teamPlayerCountAfter: teamCount,
+        }),
+      );
+    } catch {
+      /* logging only */
+    }
     await upsertGlobalMasterPlayerFromRosterPlayer(
       {
         firstName: player.firstName,

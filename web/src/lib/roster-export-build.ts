@@ -1,5 +1,9 @@
 import { normalizeEventFileKey } from "@/lib/event-file-key";
-import type { RosterEventKind, RosterFileDocument } from "@/lib/roster-file-types";
+import type {
+  RosterEventKind,
+  RosterFileDocument,
+  RosterFileResultLog,
+} from "@/lib/roster-file-types";
 
 type TeamRow = {
   name: string;
@@ -83,6 +87,8 @@ export function wrapMatBeastEventFile(
   /** Board / on-disk file label; when set, `eventFileKey` in JSON follows this, not `eventName`. */
   eventFileKeySource?: string | null,
   trainingMode?: boolean,
+  /** v1.2.8: Results card rows; persisted in the envelope so they survive reopen. */
+  resultLogs?: RosterFileResultLog[] | null,
 ) {
   const key = normalizeEventFileKey(eventFileKeySource ?? eventName);
   return {
@@ -96,5 +102,8 @@ export function wrapMatBeastEventFile(
     ...(typeof audioVolumePercent === "number" ? { audioVolumePercent } : {}),
     /** Always present so .matb files clearly state live vs training (home list also uses DB merge). */
     trainingMode: Boolean(trainingMode),
+    ...(Array.isArray(resultLogs) && resultLogs.length > 0
+      ? { resultLogs }
+      : {}),
   };
 }

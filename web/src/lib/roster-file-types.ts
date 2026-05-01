@@ -2,6 +2,42 @@ import type { BeltRank } from "@prisma/client";
 
 export type RosterEventKind = "BLUE_BELT" | "PURPLE_BROWN";
 
+/**
+ * One row from the Results card, persisted in the saved event file
+ * (`.matb` envelope and the cloud blob). v1.2.8 introduces this so
+ * results survive close + reopen — previously they lived only in the
+ * local `ResultLog` SQLite table and were silently dropped on next
+ * load. Shape mirrors `ResultLogEntry` (in `types/board.ts`) minus the
+ * `id` field, which is regenerated on import.
+ */
+export type RosterFileResultLog = {
+  rosterFileName: string;
+  roundLabel: string;
+  leftName: string;
+  rightName: string;
+  leftTeamName: string | null;
+  rightTeamName: string | null;
+  resultType:
+    | "LEFT"
+    | "RIGHT"
+    | "DRAW"
+    | "NO_CONTEST"
+    | "SUBMISSION_LEFT"
+    | "SUBMISSION_RIGHT"
+    | "ESCAPE_LEFT"
+    | "ESCAPE_RIGHT"
+    | "DQ_LEFT"
+    | "DQ_RIGHT"
+    | "MANUAL";
+  winnerName: string | null;
+  /** ISO8601 timestamp; preserves chronological ordering on reopen. */
+  createdAt: string;
+  isManual: boolean;
+  manualDate: string | null;
+  manualTime: string | null;
+  finalSummaryLine: string | null;
+};
+
 export type RosterFilePlayer = {
   firstName: string;
   lastName: string;
@@ -67,4 +103,10 @@ export type MatBeastEventEnvelope = {
   audioVolumePercent?: number;
   /** When true, this file was created as a training event (separate master lists). */
   trainingMode?: boolean;
+  /**
+   * Result-log rows for this event (Results card). Optional for
+   * backward compatibility with pre-v1.2.8 envelopes that omitted
+   * the field; missing/empty arrays import as no logs.
+   */
+  resultLogs?: RosterFileResultLog[];
 };

@@ -1,7 +1,11 @@
 "use client";
 
 import { matbeastDebugLog } from "@/lib/matbeast-debug-log";
-import { getMatBeastTournamentId, matbeastFetch } from "@/lib/matbeast-fetch";
+import {
+  awaitPendingMatbeastMutations,
+  getMatBeastTournamentId,
+  matbeastFetch,
+} from "@/lib/matbeast-fetch";
 import {
   buildRosterDocumentFromTeamsApi,
   wrapMatBeastEventFile,
@@ -296,11 +300,56 @@ export async function buildEnvelopeText(args: {
     // Keep save robust if bracket read fails.
   }
   let trainingMode = false;
+  /**
+   * v1.2.8: capture the Results card rows in the saved envelope so
+   * they survive close + reopen. The board endpoint already filters
+   * by tournament + roster file (see `getResultLogsCompat`), so the
+   * shape we get here is exactly the rows the Results card showed.
+   */
+  let resultLogsForEnvelope: import("@/lib/roster-file-types").RosterFileResultLog[] = [];
   try {
     const boardRes = await matbeastFetch("/api/board");
     if (boardRes.ok) {
-      const b = (await boardRes.json()) as { trainingMode?: boolean };
+      const b = (await boardRes.json()) as {
+        trainingMode?: boolean;
+        resultsLog?: Array<{
+          rosterFileName?: string;
+          roundLabel?: string;
+          leftName?: string;
+          rightName?: string;
+          leftTeamName?: string | null;
+          rightTeamName?: string | null;
+          resultType?: string;
+          winnerName?: string | null;
+          createdAt?: string;
+          isManual?: boolean;
+          manualDate?: string | null;
+          manualTime?: string | null;
+          finalSummaryLine?: string | null;
+        }>;
+      };
       trainingMode = Boolean(b.trainingMode);
+      if (Array.isArray(b.resultsLog)) {
+        resultLogsForEnvelope = b.resultsLog
+          .filter((r) => r && typeof r.createdAt === "string")
+          .map((r) => ({
+            rosterFileName: r.rosterFileName ?? "UNTITLED",
+            roundLabel: r.roundLabel ?? "",
+            leftName: r.leftName ?? "",
+            rightName: r.rightName ?? "",
+            leftTeamName: r.leftTeamName ?? null,
+            rightTeamName: r.rightTeamName ?? null,
+            resultType:
+              (r.resultType as import("@/lib/roster-file-types").RosterFileResultLog["resultType"]) ??
+              "MANUAL",
+            winnerName: r.winnerName ?? null,
+            createdAt: r.createdAt!,
+            isManual: Boolean(r.isManual),
+            manualDate: r.manualDate ?? null,
+            manualTime: r.manualTime ?? null,
+            finalSummaryLine: r.finalSummaryLine ?? null,
+          }));
+      }
     }
   } catch {
     /* ignore */
@@ -312,6 +361,7 @@ export async function buildEnvelopeText(args: {
     getAudioVolumePercent(),
     rosterFileLabel,
     trainingMode,
+    resultLogsForEnvelope,
   );
   return {
     text: JSON.stringify(envelope, null, 2),
@@ -357,13 +407,80 @@ export async function buildEnvelopeTextForActiveTab(
  */
 let cloudNotConfiguredWarnedThisSession = false;
 
+/**
+ * v1.2.3 fix: per-tab save mutex.
+ *
+ * Multiple subsystems can race to push the same tab to the cloud at
+ * the same time:
+ *   - PlayerEntryForm's post-save safety-net push (added in v1.2.2)
+ *   - AppChrome's `subscribeDocumentDirty` autosave runner
+ *   - requestCloseTab's close-tab silent save
+ *   - QuitSaveBridge's `__MATBEAST_SAVE_BEFORE_QUIT__`
+ *   - Manual File ▸ Save
+ *
+ * Without serialization, concurrent calls each read the same
+ * `CloudEventLink.baseVersion`, both PUT `/api/events/:id/blob` with
+ * `X-Expected-Version=<that version>`, the masters server accepts
+ * the first PUT (bumps version to N+1) and rejects the second with
+ * 409. The 409 fires `matbeast-cloud-conflict` which opens the
+ * cloud-conflict dialog on every save — the v1.2.2 regression report
+ * ("a dialog box opens on every change asking if I want to push to
+ * the cloud").
+ *
+ * The mutex serializes all `matbeastSaveTabById(tabId, …)` calls for
+ * a given tab. A concurrent caller awaits the in-flight save first;
+ * once that resolves, the caller runs its own save against the
+ * just-updated `link.baseVersion`, which either:
+ *   (a) finds no new local changes (sha === lastSyncedSha) and the
+ *       push endpoint short-circuits with `kind: "no-op"` — cheap, and
+ *   (b) finds new changes, pushes with the fresh expected version, and
+ *       the cloud accepts.
+ * Either way, no 409, no dialog.
+ */
+const matbeastSaveInflight = new Map<string, Promise<boolean>>();
+
 export async function matbeastSaveTabById(
   queryClient: QueryClient,
   selectTab: (id: string) => void,
   getOpenTabs: () => EventTab[],
   tabId: string,
   opts?: { silent?: boolean; allowPrompt?: boolean },
-) {
+): Promise<boolean> {
+  // Wait for any in-flight save of the same tab to finish first, so
+  // we never have two concurrent pushes racing on the same baseVersion.
+  // We loop because additional callers could have queued behind us
+  // while we were waiting for the prior in-flight save.
+  while (matbeastSaveInflight.has(tabId)) {
+    try {
+      await matbeastSaveInflight.get(tabId);
+    } catch {
+      /* swallow — we still run our own save below */
+    }
+  }
+  const job = matbeastSaveTabByIdInner(
+    queryClient,
+    selectTab,
+    getOpenTabs,
+    tabId,
+    opts,
+  );
+  matbeastSaveInflight.set(tabId, job);
+  try {
+    return await job;
+  } finally {
+    if (matbeastSaveInflight.get(tabId) === job) {
+      matbeastSaveInflight.delete(tabId);
+    }
+  }
+}
+
+async function matbeastSaveTabByIdInner(
+  queryClient: QueryClient,
+  selectTab: (id: string) => void,
+  getOpenTabs: () => EventTab[],
+  tabId: string,
+  opts?: { silent?: boolean; allowPrompt?: boolean },
+): Promise<boolean> {
   void allowPrompt_deprecated(opts?.allowPrompt);
   const silent = Boolean(opts?.silent);
   emitSaveStatus("start", tabId, { silent });
@@ -403,6 +520,20 @@ export async function matbeastSaveTabById(
     });
     return true;
   }
+
+  /**
+   * v1.2.1 fix: drain any in-flight mutations (POST /api/players, etc.)
+   * before reading server state to build the envelope. Without this, a
+   * fast "Save then Close" sequence in the roster card races: the close
+   * tab silent save kicks off `matbeastSaveTabById` while the player
+   * POST is still in flight, the `/api/teams` GET sees the pre-commit
+   * SQLite WAL snapshot, and the cloud blob is uploaded missing the
+   * just-saved player. On reopen the cloud blob (now source of truth)
+   * has only N-1 players. Switching SHOW TEAM between save and close
+   * masked the bug because the dropdown click delay let the POST commit
+   * before close fired the silent save.
+   */
+  await awaitPendingMatbeastMutations();
 
   let rosterFileName = "UNTITLED";
   try {
@@ -1308,6 +1439,7 @@ export async function matbeastImportOpenedEventFile(opts: {
     bracket,
     audioVolumePercent,
     trainingMode: fileTrainingMode,
+    resultLogs,
   } = parseMatBeastEventFileJson(parsed, fallbackName);
   /**
    * v0.9.36 defensive: when the caller passes `displayNameOverride`
@@ -1389,7 +1521,7 @@ export async function matbeastImportOpenedEventFile(opts: {
       "Content-Type": "application/json",
       "x-matbeast-skip-undo": "1",
     },
-    body: JSON.stringify({ document, bracket }),
+    body: JSON.stringify({ document, bracket, resultLogs }),
   });
   if (!imp.ok) {
     const ij = (await imp.json()) as { error?: string };
@@ -1582,7 +1714,7 @@ export async function matbeastRestoreFromDiskToCloud(opts: {
   const stem =
     pick.filePath.split(/[/\\]/).pop()?.replace(EVENT_FILENAME_EXT_RE, "") ??
     "Restored event";
-  const { eventName, document, bracket, audioVolumePercent } =
+  const { eventName, document, bracket, audioVolumePercent, resultLogs } =
     parseMatBeastEventFileJson(parsed, stem);
 
   // Create a brand-new tournament so the restored copy does not
@@ -1605,7 +1737,7 @@ export async function matbeastRestoreFromDiskToCloud(opts: {
       "Content-Type": "application/json",
       "x-matbeast-skip-undo": "1",
     },
-    body: JSON.stringify({ document, bracket }),
+    body: JSON.stringify({ document, bracket, resultLogs }),
   });
   if (!imp.ok) {
     const ij = (await imp.json().catch(() => ({}))) as { error?: string };

@@ -305,29 +305,37 @@ function MatchCard({
   const homeHex = teamOverlayColor?.(m.homeTeam.id) ?? null;
   const awayHex = teamOverlayColor?.(m.awayTeam.id) ?? null;
 
-  function handleCardBorderClick(e: MouseEvent<HTMLDivElement>) {
-    const r = e.currentTarget.getBoundingClientRect();
-    const x = e.clientX - r.left;
-    const y = e.clientY - r.top;
-    const borderPx = 10;
-    const w = r.width;
-    const h = r.height;
-    const onBorder =
-      x < borderPx || x > w - borderPx || y < borderPx || y > h - borderPx;
-    if (!onBorder) return;
+  /**
+   * v1.2.7: clicking ANYWHERE in the card background toggles whether
+   * this match is the "current" one (shown on the bracket overlay).
+   * Previously the toggle was gated to a 10 px border ring so clicks
+   * on the home/away winner buttons didn't double-fire as a select.
+   * That ring was too slim — the user had to aim precisely at the
+   * border. Instead, we now ignore clicks whose target is (or descends
+   * from) any interactive child — `button`, `select`, `input`,
+   * `textarea`, `label`, `a` — which covers every clickable element
+   * inside the card (winner picks, VS toggle, edit-teams icon, the
+   * edit form's selects + Apply/Cancel buttons). Anything else (the
+   * outer `<div>` itself, the inner row wrappers' padding/gaps) still
+   * counts as "background" and toggles the selection.
+   */
+  function handleCardBackgroundClick(e: MouseEvent<HTMLDivElement>) {
+    const target = e.target as HTMLElement | null;
+    if (!target) return;
+    if (target.closest("button, select, input, textarea, label, a")) return;
     onSelect(isSelected ? null : m.id);
   }
 
   return (
     <div
-      title="Click the card edge to set the current match (shown on the bracket overlay)"
+      title="Click anywhere in the card background to set the current match (shown on the bracket overlay)"
       className={[
-        "w-full min-w-0 rounded-md border px-1.5 py-1 shadow-inner transition",
+        "w-full min-w-0 cursor-pointer rounded-md border px-1.5 py-1 shadow-inner transition",
         isSelected
           ? "border-amber-400/90 bg-amber-400/10 ring-1 ring-amber-300/60"
           : "border-zinc-600/90 bg-[#1e1e1e]",
       ].join(" ")}
-      onClick={handleCardBorderClick}
+      onClick={handleCardBackgroundClick}
     >
       <div className="flex flex-col gap-0.5">
         {editingTeams ? (
@@ -505,16 +513,15 @@ function MatchCard({
                 <TeamEditIcon className="h-2.5 w-2.5" />
               </button>
             </div>
-            {m.winnerTeamId && !placeholder ? (
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() => void onPickWinner(m.id, null)}
-                className="mt-0.5 w-full rounded border border-zinc-600 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-300 hover:border-zinc-500 hover:bg-zinc-800/80 disabled:opacity-40"
-              >
-                Clear winner
-              </button>
-            ) : null}
+            {/*
+             * v1.2.4: explicit "Clear winner" button removed. The
+             * winner toggle already handles unset — clicking the
+             * currently highlighted winner button (home or away) calls
+             * `onPickWinner(m.id, homeWon ? null : m.homeTeam.id)` /
+             * `awayWon ? null : m.awayTeam.id`, which passes null and
+             * clears the pick. The button was redundant and visually
+             * busy.
+             */}
           </>
         ) : null}
       </div>

@@ -24,6 +24,57 @@ let inMemoryTournamentId: string | null = null;
 /** Mirrors active tab training flag for the same renderer tick as `matbeastFetch` (LS is for overlays). */
 let inMemoryClientTrainingMasters: "0" | "1" | null = null;
 
+/**
+ * In-flight mutation tracker.
+ *
+ * v1.2.1 fix: when the user clicks the close-tab "x" right after pressing the
+ * roster card's Save icon, the silent close-tab save races with the still in
+ * flight `POST /api/players`. Because SQLite (WAL) readers only see committed
+ * data, the silent save's `/api/teams` read can return the snapshot from
+ * BEFORE the player commit, upload an envelope missing the just-saved
+ * player, and on reopen the cloud blob (now the source of truth) drops it.
+ *
+ * The symptom the user reported is exactly this race: only the LAST player
+ * saved on the most-recently-focused team disappears on reopen. Switching
+ * `SHOW TEAM` between save and close happens to fix it because the dropdown
+ * click gives the POST enough time to commit before close fires.
+ *
+ * The fix is for `matbeastSaveTabById` (and any other "build envelope from
+ * server state" path) to await {@link awaitPendingMatbeastMutations} before
+ * reading `/api/teams`, so the snapshot reflects every committed write.
+ */
+let inFlightMatbeastMutations = 0;
+const mutationDrainListeners = new Set<() => void>();
+
+function isMutationMethod(method: string): boolean {
+  const m = method.toUpperCase();
+  return m === "POST" || m === "PUT" || m === "PATCH" || m === "DELETE";
+}
+
+/**
+ * Resolves once every matbeast-tracked mutation that was in flight at call
+ * time has either resolved or rejected. New mutations started AFTER this is
+ * called are not waited for — the close-tab save only needs to make sure it
+ * does not race with the user's most recent click.
+ */
+export function awaitPendingMatbeastMutations(): Promise<void> {
+  if (inFlightMatbeastMutations === 0) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const fn = () => {
+      if (inFlightMatbeastMutations === 0) {
+        mutationDrainListeners.delete(fn);
+        resolve();
+      }
+    };
+    mutationDrainListeners.add(fn);
+  });
+}
+
+function notifyMutationDrainListeners(): void {
+  if (inFlightMatbeastMutations !== 0) return;
+  for (const fn of mutationDrainListeners) fn();
+}
+
 export function setMatBeastTournamentId(id: string | null) {
   inMemoryTournamentId = id;
   if (typeof window === "undefined") return;
@@ -144,6 +195,20 @@ export function matbeastFetch(
       hydrateClientTrainingMastersFromLocalStorage();
     }
     appendClientTrainingMastersHeader(headers);
-    return fetch(input, { ...init, headers });
+    /**
+     * Track mutations so the close-tab silent save can wait for an in-flight
+     * `POST /api/players` (etc.) to commit before reading `/api/teams`. See
+     * the long comment above {@link awaitPendingMatbeastMutations}.
+     */
+    const tracksMutation = isMutationMethod(init?.method ?? "GET");
+    if (tracksMutation) inFlightMatbeastMutations += 1;
+    try {
+      return await fetch(input, { ...init, headers });
+    } finally {
+      if (tracksMutation) {
+        inFlightMatbeastMutations = Math.max(0, inFlightMatbeastMutations - 1);
+        notifyMutationDrainListeners();
+      }
+    }
   })();
 }

@@ -2,6 +2,21 @@ import { NextResponse } from "next/server";
 import { resolveTournamentIdFromRequest } from "@/lib/active-tournament-server";
 import { importRosterDocumentForTournament } from "@/lib/import-roster-server";
 import { parseRosterDocument } from "@/lib/roster-file-parse";
+import type { RosterFileResultLog } from "@/lib/roster-file-types";
+
+const RESULT_TYPES = new Set([
+  "LEFT",
+  "RIGHT",
+  "DRAW",
+  "NO_CONTEST",
+  "SUBMISSION_LEFT",
+  "SUBMISSION_RIGHT",
+  "ESCAPE_LEFT",
+  "ESCAPE_RIGHT",
+  "DQ_LEFT",
+  "DQ_RIGHT",
+  "MANUAL",
+]);
 
 export async function POST(req: Request) {
   try {
@@ -12,11 +27,31 @@ export async function POST(req: Request) {
         version?: unknown;
         matches?: unknown;
       };
+      resultLogs?: unknown;
     };
     if (!body || body.document === undefined) {
       return NextResponse.json({ error: "document is required" }, { status: 400 });
     }
     const document = parseRosterDocument(body.document);
+    /**
+     * v1.2.2 diagnostic: log per-team player counts on import so we can
+     * compare against the push log. If push had N players for a team
+     * but import sees N-1, the cloud round-trip dropped a row. If
+     * import sees N but the user sees N-1 in the lineup, the loss is
+     * downstream (lineupOrder coercion, slotsForTeam filter, etc.).
+     */
+    try {
+      const counts = (document.teams ?? []).map((t) => ({
+        teamName: t.name,
+        playerCount: Array.isArray(t.players) ? t.players.length : 0,
+      }));
+      console.log(
+        "[POST /api/tournament/import-roster][v1.2.2] document team counts",
+        JSON.stringify({ tournamentId, teams: counts }),
+      );
+    } catch {
+      /* logging only */
+    }
     const bracket =
       body.bracket &&
       body.bracket.version === 1 &&
@@ -48,7 +83,52 @@ export async function POST(req: Request) {
               })),
           }
         : undefined;
-    await importRosterDocumentForTournament(tournamentId, document, bracket);
+    /**
+     * v1.2.8: results card rows. Optional + lenient: pre-v1.2.8
+     * envelopes omit the field entirely (so live results stay
+     * intact); newer envelopes include the array (which causes
+     * `importRosterDocumentForTournament` to wipe + reinsert).
+     */
+    const resultLogs: RosterFileResultLog[] | undefined = Array.isArray(
+      body.resultLogs,
+    )
+      ? (body.resultLogs as Array<Record<string, unknown>>)
+          .filter(
+            (r) =>
+              r &&
+              typeof r === "object" &&
+              typeof r.createdAt === "string" &&
+              typeof r.resultType === "string" &&
+              RESULT_TYPES.has(r.resultType as string),
+          )
+          .map((r) => ({
+            rosterFileName:
+              typeof r.rosterFileName === "string" && (r.rosterFileName as string).trim()
+                ? (r.rosterFileName as string)
+                : "UNTITLED",
+            roundLabel: typeof r.roundLabel === "string" ? (r.roundLabel as string) : "",
+            leftName: typeof r.leftName === "string" ? (r.leftName as string) : "",
+            rightName: typeof r.rightName === "string" ? (r.rightName as string) : "",
+            leftTeamName:
+              typeof r.leftTeamName === "string" ? (r.leftTeamName as string) : null,
+            rightTeamName:
+              typeof r.rightTeamName === "string" ? (r.rightTeamName as string) : null,
+            resultType: r.resultType as RosterFileResultLog["resultType"],
+            winnerName:
+              typeof r.winnerName === "string" ? (r.winnerName as string) : null,
+            createdAt: r.createdAt as string,
+            isManual: Boolean(r.isManual),
+            manualDate:
+              typeof r.manualDate === "string" ? (r.manualDate as string) : null,
+            manualTime:
+              typeof r.manualTime === "string" ? (r.manualTime as string) : null,
+            finalSummaryLine:
+              typeof r.finalSummaryLine === "string"
+                ? (r.finalSummaryLine as string)
+                : null,
+          }))
+      : undefined;
+    await importRosterDocumentForTournament(tournamentId, document, bracket, resultLogs);
     return NextResponse.json({ ok: true });
   } catch (e) {
     console.error("[POST /api/tournament/import-roster]", e);
