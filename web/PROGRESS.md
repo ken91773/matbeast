@@ -1,6 +1,20 @@
 # Progress Log
 
 ## Current Build Status
+- **v1.2.14 (2026-05-23)** — desktop startup status window.
+  - **Immediate launch feedback.** Packaged desktop launches now show a
+    small native startup status window as soon as Electron is ready, so
+    operators get confirmation that a desktop-icon double-click worked.
+    The window streams timed startup milestones while Mat Beast prepares
+    the Windows shell environment, applies saved NDI binding, checks the
+    local database schema, starts the bundled dashboard server, verifies
+    localhost/HTTP readiness, and loads the dashboard.
+  - **Automatic handoff to dashboard.** The startup status window is
+    intentionally non-closable during boot and closes itself as soon as
+    the main dashboard finishes loading. Development runs stay unchanged
+    unless `MATBEAST_STARTUP_STATUS=1` is set.
+  - Bumped `web/package.json` to `1.2.14`.
+
 - **v1.2.13 (2026-05-23)** — OT round half labels and bracket-driven
   scoreboard round defaults.
   - **OT round top/bottom labels.** The round dropdown now splits each

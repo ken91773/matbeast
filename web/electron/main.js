@@ -62,6 +62,195 @@ const appIconPath = app.isPackaged
   ? path.join(process.resourcesPath, "icon.ico")
   : path.join(__dirname, "..", "build", "icon.ico");
 
+const startupStartedAt = Date.now();
+let startupStatusWindow = null;
+let startupStatusLoaded = false;
+let startupStatusAllowClose = false;
+const startupStatusLines = [];
+const STARTUP_STATUS_MAX_LINES = 80;
+
+function shouldShowStartupStatusWindow() {
+  if (process.env.MATBEAST_HIDE_STARTUP_STATUS === "1") return false;
+  return app.isPackaged || process.env.MATBEAST_STARTUP_STATUS === "1";
+}
+
+function startupStatusHtml() {
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';" />
+  <title>Mat Beast Scoreboard Loading</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #111827;
+      color: #e5e7eb;
+      font-family: "Segoe UI", Arial, sans-serif;
+    }
+    body {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      padding: 22px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .mark {
+      width: 44px;
+      height: 44px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, #facc15, #f97316);
+      box-shadow: 0 0 28px rgba(250, 204, 21, 0.28);
+    }
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.2;
+    }
+    .sub {
+      margin-top: 4px;
+      color: #9ca3af;
+      font-size: 12px;
+    }
+    .pulse {
+      height: 4px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: #1f2937;
+    }
+    .pulse::before {
+      content: "";
+      display: block;
+      width: 38%;
+      height: 100%;
+      border-radius: inherit;
+      background: #facc15;
+      animation: slide 1.25s ease-in-out infinite;
+    }
+    @keyframes slide {
+      0% { transform: translateX(-105%); }
+      100% { transform: translateX(285%); }
+    }
+    #log {
+      flex: 1;
+      margin: 0;
+      padding: 14px;
+      border: 1px solid #374151;
+      border-radius: 12px;
+      overflow: hidden;
+      background: rgba(3, 7, 18, 0.5);
+      color: #d1d5db;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="mark" aria-hidden="true"></div>
+    <div>
+      <h1>Opening Mat Beast Scoreboard</h1>
+      <div class="sub">Startup status - this window will close when the dashboard is ready.</div>
+    </div>
+  </div>
+  <div class="pulse" aria-hidden="true"></div>
+  <pre id="log"></pre>
+  <script>
+    window.matbeastSetStartupLines = function(lines) {
+      const log = document.getElementById("log");
+      log.textContent = Array.isArray(lines) ? lines.join("\\n") : "";
+    };
+  </script>
+</body>
+</html>`;
+}
+
+function renderStartupStatusWindow() {
+  if (!startupStatusWindow || startupStatusWindow.isDestroyed() || !startupStatusLoaded) return;
+  const linesJson = JSON.stringify(startupStatusLines);
+  startupStatusWindow.webContents
+    .executeJavaScript(`window.matbeastSetStartupLines(${linesJson})`, true)
+    .catch(() => {
+      /* ignore; startup status is best-effort */
+    });
+}
+
+function createStartupStatusWindow() {
+  if (!shouldShowStartupStatusWindow()) return;
+  if (startupStatusWindow && !startupStatusWindow.isDestroyed()) return;
+  startupStatusWindow = new BrowserWindow({
+    title: "Opening Mat Beast Scoreboard",
+    icon: appIconPath,
+    width: 560,
+    height: 390,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    autoHideMenuBar: true,
+    backgroundColor: "#111827",
+    show: false,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      backgroundThrottling: false,
+    },
+  });
+  startupStatusWindow.removeMenu();
+  startupStatusAllowClose = false;
+  startupStatusWindow.on("close", (event) => {
+    if (startupStatusAllowClose) return;
+    event.preventDefault();
+  });
+  startupStatusWindow.on("closed", () => {
+    startupStatusWindow = null;
+    startupStatusLoaded = false;
+    startupStatusAllowClose = false;
+  });
+  startupStatusWindow.webContents.once("did-finish-load", () => {
+    startupStatusLoaded = true;
+    renderStartupStatusWindow();
+    if (startupStatusWindow && !startupStatusWindow.isDestroyed()) {
+      startupStatusWindow.show();
+    }
+  });
+  startupStatusWindow.loadURL(
+    `data:text/html;charset=utf-8,${encodeURIComponent(startupStatusHtml())}`,
+  );
+}
+
+function updateStartupStatus(message) {
+  if (!message) return;
+  const elapsed = Math.max(0, Date.now() - startupStartedAt);
+  const seconds = (elapsed / 1000).toFixed(1).padStart(5, " ");
+  startupStatusLines.push(`[+${seconds}s] ${message}`);
+  while (startupStatusLines.length > STARTUP_STATUS_MAX_LINES) {
+    startupStatusLines.shift();
+  }
+  renderStartupStatusWindow();
+}
+
+function closeStartupStatusWindow() {
+  if (!startupStatusWindow || startupStatusWindow.isDestroyed()) return;
+  try {
+    startupStatusAllowClose = true;
+    startupStatusWindow.close();
+  } catch {
+    /* ignore */
+  }
+}
+
 /** Default release repo (overridable via MAT_BEAST_GH_OWNER / MAT_BEAST_GH_REPO). */
 const DEFAULT_GH_OWNER = "ken91773";
 const DEFAULT_GH_REPO = "matbeast";
@@ -1568,17 +1757,21 @@ async function waitForHttpOk(url, timeoutMs = 15000, child = null) {
 }
 
 async function startBundledNextServer() {
+  updateStartupStatus("Preparing bundled Next.js server.");
   const standaloneRoot = path.join(process.resourcesPath, "standalone");
   const standaloneServerScript = path.join(standaloneRoot, "server.js");
   /** Bind all interfaces so Windows loopback is reliable; UI still uses 127.0.0.1. */
   const bindHost = "0.0.0.0";
   const loopbackHost = "127.0.0.1";
+  updateStartupStatus("Finding an available local server port.");
   const port =
     process.env.MAT_BEAST_PORT && /^\d+$/.test(String(process.env.MAT_BEAST_PORT).trim())
       ? parseInt(String(process.env.MAT_BEAST_PORT).trim(), 10)
       : await getFreeIpv4Port();
   appUrl = `http://${loopbackHost}:${port}`;
+  updateStartupStatus(`Local dashboard URL reserved: ${appUrl}.`);
 
+  updateStartupStatus("Preparing local data folder and database.");
   const userDbPath = ensureUserDatabaseFile();
   /** ASCII-only path: forward slashes, no encoding needed for Prisma/SQLite. */
   const databaseUrl = "file:" + userDbPath.replace(/\\/g, "/");
@@ -1602,7 +1795,9 @@ async function startBundledNextServer() {
       ? preferredNodePath
       : "node";
 
+  updateStartupStatus("Checking local database schema.");
   await patchUserDatabaseSchemaAdditive(userDbPath, nodeCommand);
+  updateStartupStatus("Local database schema is ready.");
 
   // Let any ephemeral port from getFreeIpv4Port() leave TIME_WAIT before the child binds.
   await new Promise((resolve) => setTimeout(resolve, 400));
@@ -1612,6 +1807,7 @@ async function startBundledNextServer() {
   const matbeastDebugMasterScope =
     masterScopeDebugRaw === "0" || masterScopeDebugRaw === "false" ? "0" : "1";
 
+  updateStartupStatus("Starting bundled dashboard server process.");
   bundledServerProcess = await new Promise((resolve, reject) => {
     const child = spawn(nodeCommand, [standaloneServerScript], {
       cwd: standaloneRoot,
@@ -1646,7 +1842,10 @@ async function startBundledNextServer() {
     };
     child.stdout.on("data", logChunk);
     child.stderr.on("data", logChunk);
-    child.once("spawn", () => resolve(child));
+    child.once("spawn", () => {
+      updateStartupStatus("Bundled dashboard server process started.");
+      resolve(child);
+    });
   });
 
   bundledServerProcess.on("exit", (code, signal) => {
@@ -1663,9 +1862,14 @@ async function startBundledNextServer() {
   });
 
   try {
+    updateStartupStatus("Waiting for local dashboard server port.");
     await waitForLocalPortOpen(port, loopbackHost, 90000, bundledServerProcess);
+    updateStartupStatus("Local dashboard server port is open.");
+    updateStartupStatus("Checking dashboard HTTP response.");
     await waitForHttpOk(`${appUrl}/`, 20000, bundledServerProcess);
+    updateStartupStatus("Dashboard server is ready.");
   } catch (error) {
+    updateStartupStatus(`Dashboard server startup failed: ${error?.message || error}`);
     appendBundledServerLog(`${nowIso()}  startBundledNextServer failed: ${error?.message || error}\n`);
     const tail = readBundledServerLogTail();
     throw new Error(
@@ -1761,6 +1965,7 @@ function forceMainWebContentsKeyboardFocus() {
 }
 
 function createMainWindow() {
+  updateStartupStatus("Creating dashboard window.");
   const titleWithVersion = `Mat Beast Scoreboard v${app.getVersion()}`;
   mainWindow = new BrowserWindow({
     title: titleWithVersion,
@@ -1799,6 +2004,14 @@ function createMainWindow() {
   mainWindow.on("move", scheduleRepositionOverlayOutputs);
   mainWindow.on("resize", scheduleRepositionOverlayOutputs);
 
+  mainWindow.webContents.once("did-finish-load", () => {
+    updateStartupStatus("Dashboard loaded. Closing startup status.");
+    closeStartupStatusWindow();
+  });
+  mainWindow.webContents.once("did-fail-load", (_event, errorCode, errorDescription) => {
+    updateStartupStatus(`Dashboard load failed (${errorCode}): ${errorDescription}`);
+  });
+  updateStartupStatus(`Loading dashboard from ${appUrl}.`);
   mainWindow.loadURL(appUrl);
   attachMainWindowCloseConfirm(mainWindow);
   mainWindow.on("closed", () => {
@@ -2775,7 +2988,11 @@ if (!gotSingleInstanceLock) {
   });
 
   app.whenReady().then(() => {
+  createStartupStatusWindow();
+  updateStartupStatus(`Electron ready. Starting Mat Beast Scoreboard v${app.getVersion()}.`);
+  updateStartupStatus("Preparing Windows shell environment.");
   ensureWindowsShellEnvironment();
+  updateStartupStatus("Loading desktop preferences.");
   loadDesktopPreferences();
   /**
    * Apply the operator's saved NDI binding BEFORE anything triggers
@@ -2786,6 +3003,7 @@ if (!gotSingleInstanceLock) {
    * the NDI > Network adapter menu shows a "Restart required" prompt.
    */
   try {
+    updateStartupStatus("Applying saved NDI network binding.");
     const apply = applySavedNdiBinding();
     appendUpdaterLog(
       `${nowIso()}  ndi-bootstrap: applied binding ${JSON.stringify({
@@ -2798,10 +3016,12 @@ if (!gotSingleInstanceLock) {
           : null,
       })}\n`,
     );
+    updateStartupStatus("NDI network binding ready.");
   } catch (err) {
     appendUpdaterLog(
       `${nowIso()}  ndi-bootstrap: failed ${String(err?.message || err)}\n`,
     );
+    updateStartupStatus(`NDI network binding warning: ${String(err?.message || err)}`);
   }
   const launchEventFile = findEventFileInArgv(process.argv);
   let startupWarning = "";
@@ -2815,8 +3035,11 @@ if (!gotSingleInstanceLock) {
     : Promise.resolve();
 
   boot.finally(async () => {
+  updateStartupStatus("Running final startup checks.");
   await maybeClearStaleRendererCachesOnUpgrade();
+  updateStartupStatus("Renderer cache check complete.");
   pruneStaleUserDataArtifacts();
+  updateStartupStatus("Registering desktop integrations.");
   configureAutoUpdater();
 
   ipcMain.handle("overlay:open", () => {
@@ -3468,6 +3691,7 @@ if (!gotSingleInstanceLock) {
   if (launchEventFile) enqueueOpenEventFile(launchEventFile);
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.once("did-finish-load", () => {
+      updateStartupStatus("Starting overlay output windows.");
       sendOptionsMenuAction("autosave-5m", {
         enabled: desktopPreferences.autoSaveEvery5Minutes,
       });
@@ -3477,8 +3701,10 @@ if (!gotSingleInstanceLock) {
        * overlays were created synchronously with the main window).
        */
       createOverlayWindows();
+      updateStartupStatus("Overlay output windows ready.");
     });
   } else {
+    updateStartupStatus("Dashboard window unavailable; starting overlay output windows.");
     createOverlayWindows();
   }
   if (startupWarning) {
