@@ -1,4 +1,5 @@
 import type { BoardPayload } from "@/types/board";
+import { otRoundLabelParts } from "@/lib/ot-round-label";
 
 /** Wall-clock seconds shown on scoreboard (count-down except OT count-up minute). */
 export function scoreboardDisplayedWallSeconds(
@@ -62,7 +63,9 @@ export function scoreboardSubclockRoundLabelFromBoard(
 ): string {
   if (!board) return "";
   if (board.timerRestMode) return "REST PERIOD";
-  if (board.timerOtRoundMode) return board.roundLabel ?? "";
+  if (board.timerOtRoundMode) {
+    return otRoundLabelParts(board.roundLabel)?.baseLabel ?? board.roundLabel ?? "";
+  }
   if (
     board.timerOtCountUpMode ||
     board.timerOtArmedMode ||

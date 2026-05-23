@@ -56,6 +56,14 @@ function bracketDropdownRows(teamOptions: TeamRef[]): BracketOptionRow[] {
   return rows;
 }
 
+function roundLabelForBracketMatchRound(round: string | null | undefined): string | null {
+  const normalized = (round ?? "").trim().toUpperCase();
+  if (normalized === "QUARTER_FINAL") return "Quarter Finals";
+  if (normalized === "SEMI_FINAL") return "Semi Finals";
+  if (normalized === "GRAND_FINAL") return "Grand Final";
+  return null;
+}
+
 function resolveBracketMatchTeamIds(
   homePick: string,
   awayPick: string,
@@ -713,24 +721,25 @@ export default function BracketPanel({ embed = false }: { embed?: boolean }) {
     [data, teamOptions],
   );
   const selectedMatch = useMemo(() => {
-    if (!data || !selectedMatchId) return null;
+    if (!selectedMatchId) return null;
     const allMatches = [
-      ...data.quarterFinals,
-      ...data.semiFinals,
-      ...(data.grandFinal ? [data.grandFinal] : []),
+      ...quarterSlots,
+      ...semiSlots,
+      ...(grandFinalSlot ? [grandFinalSlot] : []),
     ];
     return allMatches.find((m) => m.id === selectedMatchId) ?? null;
-  }, [data, selectedMatchId]);
+  }, [grandFinalSlot, quarterSlots, selectedMatchId, semiSlots]);
 
   useEffect(() => {
     const teamIds = selectedMatch
       ? Array.from(new Set([selectedMatch.homeTeam.id, selectedMatch.awayTeam.id]))
       : null;
     const matchId = selectedMatch?.id ?? null;
+    const roundLabel = roundLabelForBracketMatchRound(selectedMatch?.round);
     postOverlayBracketCurrentMatch(tournamentId ?? null, matchId);
     window.dispatchEvent(
       new CustomEvent("matbeast-bracket-selection", {
-        detail: { tournamentId, teamIds, matchId },
+        detail: { tournamentId, teamIds, matchId, roundLabel },
       }),
     );
     return () => {

@@ -1,26 +1,46 @@
 /** Round labels that enable OT round mode (dual timer, elapsed on final save). */
+type OtRoundBaseLabel = "OT ROUND1" | "OT ROUND 2" | "OT ROUND 3";
+
 export const OT_ROUND_DROPDOWN_LABELS = [
-  "OT ROUND1",
-  "OT ROUND 2",
-  "OT ROUND 3",
+  "OT ROUND1 ↑",
+  "OT ROUND1 ↓",
+  "OT ROUND 2 ↑",
+  "OT ROUND 2 ↓",
+  "OT ROUND 3 ↑",
+  "OT ROUND 3 ↓",
 ] as const;
 
 export type OtRoundDropdownLabel = (typeof OT_ROUND_DROPDOWN_LABELS)[number];
+export type OtRoundHalf = "top" | "bottom";
+
+export function otRoundLabelParts(label: string | null | undefined):
+  | {
+      baseLabel: OtRoundBaseLabel;
+      index: 1 | 2 | 3;
+      half: OtRoundHalf | null;
+    }
+  | null {
+  if (!label) return null;
+  const t = label.trim();
+  const half: OtRoundHalf | null = t.endsWith("↑")
+    ? "top"
+    : t.endsWith("↓")
+      ? "bottom"
+      : null;
+  const base = (half ? t.slice(0, -1) : t).trim();
+  if (base === "OT ROUND1") return { baseLabel: "OT ROUND1", index: 1, half };
+  if (base === "OT ROUND 2") return { baseLabel: "OT ROUND 2", index: 2, half };
+  if (base === "OT ROUND 3") return { baseLabel: "OT ROUND 3", index: 3, half };
+  return null;
+}
 
 export function isOtRoundLabelFromDropdown(label: string | null | undefined): boolean {
-  if (!label) return false;
-  const t = label.trim();
-  return (OT_ROUND_DROPDOWN_LABELS as readonly string[]).includes(t);
+  return otRoundLabelParts(label) !== null;
 }
 
 /** Map applied round label to positive overtimeIndex (1–3) for legacy fields / payloads. */
 export function otRoundIndexFromLabel(label: string | null | undefined): 1 | 2 | 3 | null {
-  if (!label) return null;
-  const t = label.trim();
-  if (t === "OT ROUND1") return 1;
-  if (t === "OT ROUND 2") return 2;
-  if (t === "OT ROUND 3") return 3;
-  return null;
+  return otRoundLabelParts(label)?.index ?? null;
 }
 
 /** Elapsed secondary clock for OT round mode (synced with main timer running/paused). */

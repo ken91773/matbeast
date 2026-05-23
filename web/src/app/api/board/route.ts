@@ -536,7 +536,7 @@ type Command =
       selectedBracketMatchId?: string | null;
     }
   | { type: "final_unsave" }
-  | { type: "clear_fields" }
+  | { type: "clear_fields"; roundLabel?: string | null }
   | { type: "result_log_delete"; resultLogId: string }
   | {
       type: "result_log_manual_add";
@@ -1022,7 +1022,10 @@ export async function PATCH(req: Request) {
         next.customRightName = null;
         next.customRightTeamName = null;
         const prevRlClear = next.roundLabel;
-        next.roundLabel = "Quarter Finals";
+        next.roundLabel =
+          typeof cmd.roundLabel === "string" && cmd.roundLabel.trim()
+            ? cmd.roundLabel.trim()
+            : "Quarter Finals";
         reconcileBoardStateForRoundLabelChange(prevRlClear, next);
         next.leftEliminatedCount = 0;
         next.rightEliminatedCount = 0;

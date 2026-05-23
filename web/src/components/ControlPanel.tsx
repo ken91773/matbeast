@@ -133,7 +133,11 @@ export default function ControlPanel({
   const [selectedBracketMatchId, setSelectedBracketMatchId] = useState<string | null>(
     null,
   );
+  const [selectedBracketRoundLabel, setSelectedBracketRoundLabel] = useState<string | null>(
+    null,
+  );
   const firstBoardLoad = useRef(true);
+  const selectedBracketMatchIdRef = useRef<string | null>(null);
   const patchRef = useRef<
     (body: Record<string, unknown>) => Promise<BoardPayload | null>
   >(async () => null);
@@ -165,6 +169,8 @@ export default function ControlPanel({
   useEffect(() => {
     setSelectedBracketTeamIds(null);
     setSelectedBracketMatchId(null);
+    setSelectedBracketRoundLabel(null);
+    selectedBracketMatchIdRef.current = null;
   }, [tournamentId]);
 
   useEffect(() => {
@@ -220,6 +226,7 @@ export default function ControlPanel({
           tournamentId?: string | null;
           teamIds?: string[] | null;
           matchId?: string | null;
+          roundLabel?: string | null;
         }>
       ).detail;
       if (!detail?.tournamentId || detail.tournamentId !== tournamentId) return;
@@ -227,11 +234,21 @@ export default function ControlPanel({
         ? detail.teamIds.filter((id): id is string => typeof id === "string" && id.length > 0)
         : [];
       setSelectedBracketTeamIds(ids.length > 0 ? ids : null);
-      setSelectedBracketMatchId(
+      const matchId =
         typeof detail.matchId === "string" && detail.matchId.trim()
           ? detail.matchId
-          : null,
-      );
+          : null;
+      const bracketRoundLabel =
+        typeof detail.roundLabel === "string" && detail.roundLabel.trim()
+          ? detail.roundLabel.trim()
+          : null;
+      setSelectedBracketMatchId(matchId);
+      setSelectedBracketRoundLabel(bracketRoundLabel);
+      if (matchId && matchId !== selectedBracketMatchIdRef.current && bracketRoundLabel) {
+        setRoundLabel(bracketRoundLabel);
+        setRoundDirty(true);
+        selectedBracketMatchIdRef.current = matchId;
+      }
     };
     window.addEventListener("matbeast-bracket-selection", onBracketSelection);
     return () => {
@@ -745,9 +762,12 @@ export default function ControlPanel({
                 <option value="Quarter Finals">Quarter Finals</option>
                 <option value="Semi Finals">Semi Finals</option>
                 <option value="Grand Final">Grand Final</option>
-                <option value="OT ROUND1">OT ROUND1</option>
-                <option value="OT ROUND 2">OT ROUND 2</option>
-                <option value="OT ROUND 3">OT ROUND 3</option>
+                <option value="OT ROUND1 ↑">OT ROUND1 ↑</option>
+                <option value="OT ROUND1 ↓">OT ROUND1 ↓</option>
+                <option value="OT ROUND 2 ↑">OT ROUND 2 ↑</option>
+                <option value="OT ROUND 2 ↓">OT ROUND 2 ↓</option>
+                <option value="OT ROUND 3 ↑">OT ROUND 3 ↑</option>
+                <option value="OT ROUND 3 ↓">OT ROUND 3 ↓</option>
                 <option value={CUSTOM_PRESET}>CUSTOM</option>
               </select>
               <input
@@ -781,16 +801,19 @@ export default function ControlPanel({
               type="button"
               className={`${actionBtn} bg-zinc-700 text-white hover:bg-zinc-600`}
               onClick={() => {
+                const resetRoundLabel = selectedBracketRoundLabel ?? "Quarter Finals";
                 setLeftId("");
                 setRightId("");
                 setLeftCustomName("");
                 setLeftCustomTeamName("");
                 setRightCustomName("");
                 setRightCustomTeamName("");
-                setRoundLabel("Quarter Finals");
+                setRoundLabel(resetRoundLabel);
                 setRoundDirty(false);
                 setShowFinalPanel(false);
-                void patch({ command: { type: "clear_fields" } });
+                void patch({
+                  command: { type: "clear_fields", roundLabel: resetRoundLabel },
+                });
               }}
             >
               CLEAR

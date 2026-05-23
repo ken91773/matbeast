@@ -29,6 +29,7 @@ import {
   scoreboardSubclockRoundLabelFromBoard,
   scoreboardTimerLineFromBoard,
 } from "@/lib/scoreboard-timer-display";
+import { otRoundLabelParts } from "@/lib/ot-round-label";
 import {
   CENTER_OT_STRIP,
   CENTER_TIMER,
@@ -983,6 +984,7 @@ export default function OverlayClient() {
 
   const scoreboardTimerLine = scoreboardTimerLineFromBoard(board ?? undefined);
   const scoreboardRoundLine = scoreboardSubclockRoundLabelFromBoard(board ?? undefined);
+  const scoreboardOtRoundParts = otRoundLabelParts(board?.roundLabel);
   /**
    * Scoreboard DOM text: previously gated on `currentRosterFileName !== "UNTITLED"`
    * as a first-launch convenience. That gate was too aggressive — it also
@@ -1236,7 +1238,25 @@ export default function OverlayClient() {
                       : "#d9d9d9",
                 }}
               >
-                {scoreboardRoundLine}
+                {scoreboardOtRoundParts?.half ? (
+                  <span className="inline-flex items-center justify-center gap-[0.16em]">
+                    <span>{scoreboardRoundLine}</span>
+                    <span
+                      aria-hidden
+                      style={{
+                        width: 0,
+                        height: 0,
+                        borderLeft: "0.18em solid transparent",
+                        borderRight: "0.18em solid transparent",
+                        ...(scoreboardOtRoundParts.half === "top"
+                          ? { borderBottom: "0.32em solid #facc15" }
+                          : { borderTop: "0.32em solid #facc15" }),
+                      }}
+                    />
+                  </span>
+                ) : (
+                  scoreboardRoundLine
+                )}
               </span>
             </div>
 

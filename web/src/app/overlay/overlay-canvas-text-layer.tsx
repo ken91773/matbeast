@@ -21,6 +21,7 @@ import {
   scoreboardSubclockRoundLabelFromBoard,
   scoreboardTimerLineFromBoard,
 } from "@/lib/scoreboard-timer-display";
+import { otRoundLabelParts } from "@/lib/ot-round-label";
 import { finalWinnerIsLeft, finalWinnerIsRight } from "@/lib/board-final-display";
 import { useEffect, useRef } from "react";
 
@@ -226,11 +227,46 @@ export function OverlayCanvasTextLayer({
 
     ctx.font = `600 38px ${OVERLAY_FONT_STACK}`;
     ctx.fillStyle = roundColor;
+    const otRoundParts = otRoundLabelParts(board?.roundLabel);
     const roundText =
       roundLine.trim().length > 0
         ? roundLine
         : scoreboardSubclockRoundLabelFromBoard(board ?? undefined);
-    ctx.fillText(roundText, timerR.x + timerR.w / 2, timerR.y + timerR.h * 0.78, timerR.w - 16);
+    const roundX = timerR.x + timerR.w / 2;
+    const roundY = timerR.y + timerR.h * 0.78;
+    if (otRoundParts?.half) {
+      const triangleW = 18;
+      const triangleH = 16;
+      const gap = 10;
+      const textWidth = ctx.measureText(roundText).width;
+      const totalW = triangleW + gap + textWidth;
+      const startX = roundX - totalW / 2;
+      const textCx = startX + textWidth / 2;
+      const triCx = startX + textWidth + gap + triangleW / 2;
+      ctx.save();
+      ctx.fillStyle = "#facc15";
+      ctx.beginPath();
+      if (otRoundParts.half === "top") {
+        ctx.moveTo(triCx, roundY - triangleH / 2);
+        ctx.lineTo(triCx - triangleW / 2, roundY + triangleH / 2);
+        ctx.lineTo(triCx + triangleW / 2, roundY + triangleH / 2);
+      } else {
+        ctx.moveTo(triCx, roundY + triangleH / 2);
+        ctx.lineTo(triCx - triangleW / 2, roundY - triangleH / 2);
+        ctx.lineTo(triCx + triangleW / 2, roundY - triangleH / 2);
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+      ctx.fillText(
+        roundText,
+        textCx,
+        roundY,
+        timerR.w - 16 - triangleW - gap,
+      );
+    } else {
+      ctx.fillText(roundText, roundX, roundY, timerR.w - 16);
+    }
     ctx.restore();
 
     if (board && board.timerPhase === "OVERTIME") {

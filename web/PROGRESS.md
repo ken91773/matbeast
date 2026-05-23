@@ -1,6 +1,26 @@
 # Progress Log
 
 ## Current Build Status
+- **v1.2.13 (2026-05-23)** — OT round half labels and bracket-driven
+  scoreboard round defaults.
+  - **OT round top/bottom labels.** The round dropdown now splits each
+    OT round into top/bottom choices (`OT ROUND1 ↑`, `OT ROUND1 ↓`,
+    `OT ROUND 2 ↑`, `OT ROUND 2 ↓`, `OT ROUND 3 ↑`, `OT ROUND 3 ↓`).
+    The underlying OT-mode helpers still recognize the legacy labels,
+    so existing saved boards continue to behave as OT rounds. The
+    scoreboard overlay strips the arrow from the text label and renders
+    a separate small yellow triangle, matching baseball-style broadcast
+    graphics: upright for top, inverted for bottom.
+  - **Bracket active-match round defaults.** The Bracket card now sends
+    the selected match's bracket level with the active-match event.
+    The Scoreboard card uses that to auto-select `Quarter Finals`,
+    `Semi Finals`, or `Grand Final` when a new active match is picked.
+    Operator overrides (for example switching to an OT round) stay in
+    place until a different active match is selected or CLEAR is
+    pressed. CLEAR now resets to the active match's bracket level
+    instead of always falling back to Quarter Finals.
+  - Bumped `web/package.json` to `1.2.13`.
+
 - **v1.2.12 (2026-05-23)** — input recovery, faster roster saves, and
   configurable timer warning cues.
   - **Player profile input recovery.** The previous Windows keyboard
