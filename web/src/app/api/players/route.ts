@@ -190,7 +190,7 @@ export async function POST(req: Request) {
       await normalizeTeamLineup(tx, p.teamId);
       return created;
     });
-    await upsertGlobalMasterPlayerFromRosterPlayer(
+    void upsertGlobalMasterPlayerFromRosterPlayer(
       {
         firstName: player.firstName,
         lastName: player.lastName,
@@ -206,7 +206,7 @@ export async function POST(req: Request) {
       },
       useTrainingMasters,
     ).catch(() => {
-      /* master / cloud optional — roster row still created */
+      /* Master / cloud mirror is optional; do not hold the local roster response. */
     });
     return NextResponse.json(player);
   } catch (e) {

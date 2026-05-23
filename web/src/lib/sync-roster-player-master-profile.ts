@@ -114,3 +114,36 @@ export async function upsertGlobalMasterPlayerFromRosterPlayer(
   }
   await queueProfileUpsertForCloud(row);
 }
+
+export async function syncTournamentRosterPlayersToMasterProfiles(
+  tournamentId: string,
+  useTrainingMasters: boolean,
+): Promise<void> {
+  const tid = tournamentId.trim();
+  if (!tid) return;
+  const players = await prisma.player.findMany({
+    where: {
+      team: {
+        event: {
+          tournamentId: tid,
+        },
+      },
+    },
+    select: {
+      firstName: true,
+      lastName: true,
+      nickname: true,
+      academyName: true,
+      unofficialWeight: true,
+      heightFeet: true,
+      heightInches: true,
+      age: true,
+      beltRank: true,
+      profilePhotoUrl: true,
+      headShotUrl: true,
+    },
+  });
+  for (const player of players) {
+    await upsertGlobalMasterPlayerFromRosterPlayer(player, useTrainingMasters);
+  }
+}

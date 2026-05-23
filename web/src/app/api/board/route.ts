@@ -521,6 +521,7 @@ type Command =
   | { type: "ot_round_win_left" }
   | { type: "ot_round_win_right" }
   | { type: "set_sound_10_enabled"; enabled: boolean }
+  | { type: "set_sound_warning"; enabled: boolean; seconds?: number }
   | { type: "set_sound_0_enabled"; enabled: boolean }
   | { type: "play_sound_10_now" }
   | { type: "play_sound_0_now" }
@@ -907,6 +908,13 @@ export async function PATCH(req: Request) {
       }
       case "set_sound_10_enabled": {
         next.sound10Enabled = Boolean(cmd.enabled);
+        break;
+      }
+      case "set_sound_warning": {
+        next.sound10Enabled = Boolean(cmd.enabled);
+        if (typeof cmd.seconds === "number" && Number.isFinite(cmd.seconds)) {
+          next.soundWarningSeconds = Math.max(1, Math.min(99, Math.trunc(cmd.seconds)));
+        }
         break;
       }
       case "set_sound_0_enabled": {
@@ -1461,6 +1469,7 @@ export async function PATCH(req: Request) {
       leftEliminatedCount: next.leftEliminatedCount,
       rightEliminatedCount: next.rightEliminatedCount,
       sound10Enabled: next.sound10Enabled,
+      soundWarningSeconds: next.soundWarningSeconds,
       sound0Enabled: next.sound0Enabled,
       sound10PlayNonce: next.sound10PlayNonce,
       sound0PlayNonce: next.sound0PlayNonce,

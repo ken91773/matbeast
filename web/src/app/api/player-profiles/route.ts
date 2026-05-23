@@ -10,6 +10,7 @@ import {
 import { queueProfileUpsertForCloud } from "@/lib/master-profile-outbox";
 import { jsonProfilePayload } from "@/lib/player-profile-master-response";
 import { syncProfiles } from "@/lib/cloud-sync";
+import { syncTournamentRosterPlayersToMasterProfiles } from "@/lib/sync-roster-player-master-profile";
 
 const BELTS: readonly BeltRank[] = [
   "WHITE",
@@ -50,6 +51,13 @@ export async function GET(req: Request) {
       ...(useTrainingHint !== undefined ? { useTrainingMasters: useTrainingHint } : {}),
     });
     if (training) {
+      if (tournamentIdHint?.trim()) {
+        await syncTournamentRosterPlayersToMasterProfiles(tournamentIdHint, true).catch(
+          () => {
+            /* roster backfill is best-effort; list existing profiles either way */
+          },
+        );
+      }
       const profiles = await prisma.trainingMasterPlayerProfile.findMany({
         orderBy: [{ lastName: "asc" }, { firstName: "asc" }],
       });
@@ -60,6 +68,13 @@ export async function GET(req: Request) {
     await syncProfiles().catch(() => {
       /* offline / cloud error - fall back to local cache */
     });
+    if (tournamentIdHint?.trim()) {
+      await syncTournamentRosterPlayersToMasterProfiles(tournamentIdHint, false).catch(
+        () => {
+          /* roster backfill is best-effort; list existing profiles either way */
+        },
+      );
+    }
     const profiles = await prisma.masterPlayerProfile.findMany({
       orderBy: [{ lastName: "asc" }, { firstName: "asc" }],
     });

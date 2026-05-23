@@ -1,6 +1,56 @@
 # Progress Log
 
 ## Current Build Status
+- **v1.2.12 (2026-05-23)** — input recovery, faster roster saves, and
+  configurable timer warning cues.
+  - **Player profile input recovery.** The previous Windows keyboard
+    routing rescue in `src/lib/matbeast-panel-pointer-recovery.ts`
+    could detect the "clicked input looks focused, but the typed key
+    lands on `document`/`body`" failure and refocus the last clicked
+    field, but the original printable key was still lost because that
+    `keydown` had already missed the input. The rescue now refocuses
+    the intended editable, stops the stray event, and replays that
+    single printable character through the input's normal `input`
+    event path. This keeps React-controlled player profile fields in
+    sync instead of forcing the operator to Alt-Tab or retype the
+    swallowed character.
+  - **Roster add latency.** Adding a player was waiting behind
+    secondary master-profile / master-team cloud bookkeeping before
+    the roster panel refreshed, and `/api/players` also waited for
+    optional master-profile mirroring before returning. The local
+    SQLite roster write is the thing the operator needs to see
+    immediately, so `/api/players` now returns after that committed
+    row and lets master/cloud mirroring continue best-effort. The
+    player-entry form refreshes the roster right after the local save,
+    then performs master-list sync and the existing event cloud push
+    afterward so persistence is preserved without hiding the new name
+    for several seconds.
+  - **Master profile/table compatibility.** Master team names and
+    master player profiles now backfill the `cloudId` column into
+    legacy SQLite user DBs that already had those tables but predated
+    the cloud id fields. Opening/importing roster documents and
+    fetching `/api/player-profiles` also best-effort sync roster
+    players into the correct live/training master-profile table, so
+    the picker recovers profiles even when a file was created before
+    the split master table flow existed.
+  - **Team card name editing.** The dashboard Teams card now supports
+    double-click inline editing of existing team names, focusing and
+    selecting the input immediately and disabling drag on that row
+    while the edit is active. Enter/blur saves, Escape cancels, and
+    reserved team-name validation remains in the same mutation path as
+    other team edits.
+  - **Timer warning selector.** The timer card's hardcoded "10S
+    WARNING" toggle is now `WARN` with `30`, `10`, `OFF`, and `CUS`.
+    Default is 30 seconds. `OFF` disables the warning cue; `CUS`
+    exposes a two-digit custom seconds field and persists the chosen
+    threshold as `soundWarningSeconds` on `LiveScoreboardState`
+    (including a SQLite backfill for existing installs). The timer
+    audio hook and NDI scoreboard audio path now use the persisted
+    threshold instead of a hardcoded 10-second boundary. The manual
+    test button now reads `PLAY WARN`, and `AIR HORN` is shortened to
+    `HORN`.
+  - Bumped `web/package.json` to `1.2.12`.
+
 - **v1.2.10 (2026-05-01)** — mandatory update on launch. When the
   startup auto-update check finds a newer GitHub release, the
   dashboard is now blocked by a full-screen overlay until the user

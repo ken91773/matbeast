@@ -396,6 +396,7 @@ export default function OverlayClient() {
     board?.secondsRemaining,
     ndiTimerAudioResetKey,
     board?.sound10Enabled,
+    board?.soundWarningSeconds,
     board?.sound0Enabled,
     board?.timerRestMode,
     board?.sound10PlayNonce,

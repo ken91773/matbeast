@@ -458,6 +458,7 @@ export function useTimerAlertSounds(
   secondsRemaining: number | undefined,
   resetKey: string | undefined,
   is10SecondEnabled: boolean | undefined,
+  warningSeconds: number | undefined,
   isZeroEnabled: boolean | undefined,
   isRestMode: boolean | undefined,
   play10NowNonce: number | undefined,
@@ -568,19 +569,23 @@ export function useTimerAlertSounds(
     if (secondsRemaining === undefined) return;
     const curr = secondsRemaining;
     const prev = prevSecondsRef.current;
+    const warnAt =
+      typeof warningSeconds === "number" && Number.isFinite(warningSeconds)
+        ? Math.max(1, Math.min(99, Math.trunc(warningSeconds)))
+        : 30;
 
     if (prev !== null) {
       if (
         !(isRestMode ?? false) &&
         !suppressTenSecondWarning &&
         (is10SecondEnabled ?? true) &&
-        prev > 10 &&
-        curr <= 10
+        prev > warnAt &&
+        curr <= warnAt
       ) {
         gateAndPlayCue(
           tapPcmForNdi,
           instanceIdRef.current,
-          `auto10:${resetKey ?? "none"}:${curr}`,
+          `auto${warnAt}:${resetKey ?? "none"}:${curr}`,
           audioKitRef.current,
           audio10BufferRef.current,
         );
@@ -613,6 +618,7 @@ export function useTimerAlertSounds(
   }, [
     secondsRemaining,
     is10SecondEnabled,
+    warningSeconds,
     isZeroEnabled,
     isRestMode,
     suppressTenSecondWarning,

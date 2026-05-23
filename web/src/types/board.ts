@@ -62,6 +62,7 @@ export type BoardPayload = {
   leftEliminatedCount: number;
   rightEliminatedCount: number;
   sound10Enabled: boolean;
+  soundWarningSeconds: number;
   sound0Enabled: boolean;
   sound10PlayNonce: number;
   sound0PlayNonce: number;

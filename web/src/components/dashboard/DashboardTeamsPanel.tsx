@@ -229,8 +229,11 @@ export function DashboardTeamsPanel() {
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [dragLocked, setDragLocked] = useState(false);
   const [overlayColorTeamId, setOverlayColorTeamId] = useState<string | null>(null);
+  const [editingTeamId, setEditingTeamId] = useState<string | null>(null);
+  const [editingTeamNameDraft, setEditingTeamNameDraft] = useState("");
   const newTeamNameInputRef = useRef<HTMLInputElement>(null);
   const addTeamSelectRef = useRef<HTMLSelectElement>(null);
+  const editTeamNameInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!newTeamDialogOpen) return;
@@ -256,6 +259,19 @@ export function DashboardTeamsPanel() {
       if (toastTimeoutRef.current) window.clearTimeout(toastTimeoutRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    if (!editingTeamId) return;
+    let cancelled = false;
+    window.requestAnimationFrame(() => {
+      if (cancelled) return;
+      editTeamNameInputRef.current?.focus({ preventScroll: true });
+      editTeamNameInputRef.current?.select();
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [editingTeamId]);
 
   const flashToast = useCallback((message: string) => {
     setToastMessage(message);
@@ -461,6 +477,47 @@ export function DashboardTeamsPanel() {
     },
     [patchTeam],
   );
+
+  const beginEditTeamName = useCallback((team: TeamRow) => {
+    setEditingTeamId(team.id);
+    setEditingTeamNameDraft(displayName(team.name));
+  }, []);
+
+  const cancelEditTeamName = useCallback(() => {
+    setEditingTeamId(null);
+    setEditingTeamNameDraft("");
+  }, []);
+
+  const commitEditTeamName = useCallback(async () => {
+    if (!editingTeamId) return;
+    const team = teamsSorted.find((t) => t.id === editingTeamId);
+    if (!team) {
+      cancelEditTeamName();
+      return;
+    }
+    const current = displayName(team.name).trim().toUpperCase();
+    const next = editingTeamNameDraft.trim().toUpperCase();
+    if (next === current) {
+      cancelEditTeamName();
+      return;
+    }
+    if (next && isForbiddenUserChosenTeamName(next)) {
+      window.alert(forbiddenUserChosenTeamNameMessage());
+      return;
+    }
+    try {
+      await patchTeam.mutateAsync({ id: editingTeamId, name: next });
+      cancelEditTeamName();
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : "Save failed");
+    }
+  }, [
+    cancelEditTeamName,
+    editingTeamId,
+    editingTeamNameDraft,
+    patchTeam,
+    teamsSorted,
+  ]);
 
   const confirmRemoveDropdownSelection = useCallback(async () => {
     const name = selectedMasterTeam.trim().toUpperCase();
@@ -727,7 +784,7 @@ export function DashboardTeamsPanel() {
               {teamsSorted.map((team, index) => (
                 <li
                   key={team.id}
-                  draggable={!dragLocked}
+                  draggable={!dragLocked && editingTeamId !== team.id}
                   onDragStart={() => !dragLocked && onDragStart(index)}
                   onDragEnd={() => setDragIndex(null)}
                   onDragOver={(e) => !dragLocked && onDragOver(e)}
@@ -744,11 +801,39 @@ export function DashboardTeamsPanel() {
                   <span className="w-5 shrink-0 text-center font-bold text-teal-600/90">
                     {index + 1}
                   </span>
-                  <span className="min-w-0 flex-1 font-medium text-zinc-200">
-                    {displayName(team.name) || (
-                      <span className="text-zinc-600">&nbsp;</span>
-                    )}
-                  </span>
+                  {editingTeamId === team.id ? (
+                    <input
+                      ref={editTeamNameInputRef}
+                      type="text"
+                      value={editingTeamNameDraft}
+                      onChange={(e) => setEditingTeamNameDraft(e.target.value.toUpperCase())}
+                      onBlur={() => void commitEditTeamName()}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          void commitEditTeamName();
+                        } else if (e.key === "Escape") {
+                          e.preventDefault();
+                          cancelEditTeamName();
+                        }
+                      }}
+                      disabled={patchTeam.isPending}
+                      className="min-w-0 flex-1 rounded border border-teal-700/60 bg-black/40 px-1 py-0.5 text-[11px] font-medium uppercase text-zinc-100 outline-none"
+                      maxLength={120}
+                      autoCapitalize="characters"
+                    />
+                  ) : (
+                    <button
+                      type="button"
+                      onDoubleClick={() => beginEditTeamName(team)}
+                      title="Double-click to edit team name"
+                      className="min-w-0 flex-1 truncate text-left font-medium text-zinc-200"
+                    >
+                      {displayName(team.name) || (
+                        <span className="text-zinc-600">&nbsp;</span>
+                      )}
+                    </button>
+                  )}
                   <button
                     type="button"
                     disabled={patchTeam.isPending}

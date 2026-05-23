@@ -2132,9 +2132,6 @@ function PlayerEntryForm({
 
     const teamRow = teamsEffective.find((t) => t.id === form.teamId);
     const teamNameForMaster = (teamRow?.name ?? "").trim().toUpperCase();
-    if (teamNameForMaster) {
-      await rememberMasterTeamName(teamNameForMaster);
-    }
 
     const rosterTeam = teamsEffective.find((t) => t.id === form.teamId);
     const fn = form.firstName.trim();
@@ -2228,49 +2225,6 @@ function PlayerEntryForm({
         }
       }
 
-      const masterUrl = masterPickId ? `/api/player-profiles/${masterPickId}` : "/api/player-profiles";
-      const masterMethod = masterPickId ? "PATCH" : "POST";
-      const masterRes = await matbeastFetch(
-        masterUrl,
-        mergeMasterScopeInInit({
-          method: masterMethod,
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            ...masterListBodyFields,
-            ...(masterScopeId ? { tournamentId: masterScopeId } : {}),
-            teamId: teamIdForMaster,
-            firstName: payload.firstName,
-            lastName: payload.lastName,
-            nickname: payload.nickname,
-            academyName: payload.academyName,
-            unofficialWeight: payload.unofficialWeight,
-            heightFeet: payload.heightFeet,
-            heightInches: payload.heightInches,
-            age: payload.age,
-            beltRank: payload.beltRank,
-            profilePhotoUrl: payload.profilePhotoUrl,
-            headShotUrl: payload.headShotUrl,
-          }),
-        }),
-      );
-      if (!masterRes.ok) {
-        let msg = `Master profile list could not be updated (${masterRes.status}).`;
-        try {
-          const j = (await masterRes.json()) as { error?: string };
-          if (j.error) msg = j.error;
-        } catch {
-          /* keep msg */
-        }
-        throw new Error(msg);
-      }
-      await queryClient.invalidateQueries({
-        queryKey: matbeastKeys.playerProfiles(
-          masterScopeId,
-          playerProfilesHintTeamId,
-          tournamentTrainingMode,
-        ),
-      });
-      await refetchMasterProfiles();
       if (masterScopeId) {
         await queryClient.invalidateQueries({
           queryKey: matbeastKeys.teams(masterScopeId),
@@ -2279,6 +2233,51 @@ function PlayerEntryForm({
 
       await onSaved();
       flashSaveNotice("Profile saved");
+
+      if (teamNameForMaster) {
+        void rememberMasterTeamName(teamNameForMaster);
+      }
+
+      try {
+        const masterUrl = masterPickId ? `/api/player-profiles/${masterPickId}` : "/api/player-profiles";
+        const masterMethod = masterPickId ? "PATCH" : "POST";
+        const masterRes = await matbeastFetch(
+          masterUrl,
+          mergeMasterScopeInInit({
+            method: masterMethod,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ...masterListBodyFields,
+              ...(masterScopeId ? { tournamentId: masterScopeId } : {}),
+              teamId: teamIdForMaster,
+              firstName: payload.firstName,
+              lastName: payload.lastName,
+              nickname: payload.nickname,
+              academyName: payload.academyName,
+              unofficialWeight: payload.unofficialWeight,
+              heightFeet: payload.heightFeet,
+              heightInches: payload.heightInches,
+              age: payload.age,
+              beltRank: payload.beltRank,
+              profilePhotoUrl: payload.profilePhotoUrl,
+              headShotUrl: payload.headShotUrl,
+            }),
+          }),
+        );
+        if (!masterRes.ok) {
+          throw new Error(`Master profile list could not be updated (${masterRes.status}).`);
+        }
+        await queryClient.invalidateQueries({
+          queryKey: matbeastKeys.playerProfiles(
+            masterScopeId,
+            playerProfilesHintTeamId,
+            tournamentTrainingMode,
+          ),
+        });
+        await refetchMasterProfiles();
+      } catch {
+        /* Master profile sync is secondary to showing the saved roster row. */
+      }
 
       /**
        * v1.2.2 fix: explicitly push the just-saved player to the cloud

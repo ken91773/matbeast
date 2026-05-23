@@ -69,6 +69,7 @@ async function recoverLegacyLiveScoreboardSchema() {
       "leftEliminatedCount" INTEGER NOT NULL DEFAULT 0,
       "rightEliminatedCount" INTEGER NOT NULL DEFAULT 0,
       "sound10Enabled" INTEGER NOT NULL DEFAULT 1,
+      "soundWarningSeconds" INTEGER NOT NULL DEFAULT 30,
       "sound0Enabled" INTEGER NOT NULL DEFAULT 1,
       "sound10PlayNonce" INTEGER NOT NULL DEFAULT 0,
       "sound0PlayNonce" INTEGER NOT NULL DEFAULT 0,
@@ -98,6 +99,21 @@ async function recoverLegacyLiveScoreboardSchema() {
   await prisma.$executeRawUnsafe(
     `CREATE UNIQUE INDEX IF NOT EXISTS "LiveScoreboardState_rightPlayerId_key" ON "LiveScoreboardState"("rightPlayerId")`
   );
+}
+
+async function ensureLiveScoreboardStateColumns() {
+  const rows = (await prisma.$queryRawUnsafe(
+    `PRAGMA table_info("LiveScoreboardState")`,
+  )) as Array<{ name?: unknown }>;
+  if (rows.length === 0) return;
+  const cols = new Set(
+    rows.map((row) => (typeof row.name === "string" ? row.name : "")).filter(Boolean),
+  );
+  if (!cols.has("soundWarningSeconds")) {
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE "LiveScoreboardState" ADD COLUMN "soundWarningSeconds" INTEGER NOT NULL DEFAULT 30`,
+    );
+  }
 }
 
 type ResultLogLike = Pick<
@@ -309,6 +325,7 @@ export function toBoardPayload(
     leftEliminatedCount: state.leftEliminatedCount,
     rightEliminatedCount: state.rightEliminatedCount,
     sound10Enabled: state.sound10Enabled,
+    soundWarningSeconds: state.soundWarningSeconds,
     sound0Enabled: state.sound0Enabled,
     sound10PlayNonce: state.sound10PlayNonce,
     sound0PlayNonce: state.sound0PlayNonce,
@@ -336,6 +353,7 @@ export function toBoardPayload(
 
 export async function ensureLiveScoreboardState(tournamentId: string) {
   try {
+    await ensureLiveScoreboardStateColumns();
     let state = await prisma.liveScoreboardState.findUnique({
       where: { tournamentId },
     });
@@ -350,6 +368,7 @@ export async function ensureLiveScoreboardState(tournamentId: string) {
       throw error;
     }
     await recoverLegacyLiveScoreboardSchema();
+    await ensureLiveScoreboardStateColumns();
     let state = await prisma.liveScoreboardState.findUnique({
       where: { tournamentId },
     });

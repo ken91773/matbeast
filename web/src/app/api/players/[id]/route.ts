@@ -153,7 +153,7 @@ export async function PATCH(req: Request, { params }: Params) {
             : {}),
         },
       );
-      await upsertGlobalMasterPlayerFromRosterPlayer(
+      void upsertGlobalMasterPlayerFromRosterPlayer(
         {
           firstName: player.firstName,
           lastName: player.lastName,
@@ -169,7 +169,7 @@ export async function PATCH(req: Request, { params }: Params) {
         },
         useTrainingMasters,
       ).catch(() => {
-        /* master / cloud optional */
+        /* Master / cloud mirror is optional; do not hold the local roster response. */
       });
     }
     return NextResponse.json(player);

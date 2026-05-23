@@ -3,6 +3,7 @@ import { syncDownstreamRounds } from "@/lib/bracket-engine";
 import { prisma } from "@/lib/prisma";
 import { normalizeRosterDocumentLineups } from "@/lib/roster-lineup-normalize";
 import { ensureEightTeamSlots } from "@/lib/teams-bootstrap";
+import { syncTournamentRosterPlayersToMasterProfiles } from "@/lib/sync-roster-player-master-profile";
 import type {
   RosterFileDocument,
   RosterFileResultLog,
@@ -106,6 +107,20 @@ export async function importRosterDocumentForTournament(
       }
     }
   });
+
+  const tournament = await prisma.tournament.findUnique({
+    where: { id: tournamentId },
+    select: { trainingMode: true },
+  });
+  const useTrainingMasters = Boolean(tournament?.trainingMode);
+  try {
+    await syncTournamentRosterPlayersToMasterProfiles(tournamentId, useTrainingMasters);
+  } catch (err) {
+    console.warn(
+      "[importRosterDocumentForTournament] master profile sync skipped",
+      err,
+    );
+  }
 
   if (bracket?.version === 1) {
     const teamsNow = await prisma.team.findMany({

@@ -357,6 +357,7 @@ model LiveScoreboardState {
   leftEliminatedCount  Int @default(0)
   rightEliminatedCount Int @default(0)
   sound10Enabled       Boolean @default(true)
+  soundWarningSeconds  Int @default(30)
   sound0Enabled        Boolean @default(true)
   sound10PlayNonce     Int @default(0)
   sound0PlayNonce      Int @default(0)

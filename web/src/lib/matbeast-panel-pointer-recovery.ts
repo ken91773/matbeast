@@ -145,6 +145,40 @@ function isTextEditableElement(el: Element | null): boolean {
   return el.isContentEditable;
 }
 
+function insertPrintableKeyIntoTextEditable(
+  target: HTMLElement,
+  key: string,
+): boolean {
+  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+    if (target.disabled || target.readOnly) return false;
+    const start = target.selectionStart ?? target.value.length;
+    const end = target.selectionEnd ?? start;
+    const nextValue = `${target.value.slice(0, start)}${key}${target.value.slice(end)}`;
+    if (target.maxLength >= 0 && nextValue.length > target.maxLength) {
+      return false;
+    }
+    target.setRangeText(key, start, end, "end");
+    target.dispatchEvent(
+      new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: key,
+      }),
+    );
+    return true;
+  }
+
+  if (target.isContentEditable) {
+    try {
+      return document.execCommand("insertText", false, key);
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
+}
+
 /**
  * v1.2.5 dead-key recovery.
  *
@@ -167,6 +201,11 @@ function isTextEditableElement(el: Element | null): boolean {
  *      input click visually focuses but the keys never arrive; firing
  *      a `webContents.focus()` after each interaction prevents the
  *      half-bound state from accumulating.
+ *
+ * Follow-up: the original rescue refocused the intended input but the
+ * keydown that exposed the bad route had already targeted `document` /
+ * `body`, so that character was still lost. Replay that single printable
+ * key through the input's normal `input` event path after refocusing.
  */
 let lastClickedEditable: WeakRef<HTMLElement> | null = null;
 
@@ -181,6 +220,7 @@ function rememberClickedEditable(target: EventTarget | null): void {
 function rescueDeadKeyboardKeystroke(e: KeyboardEvent): void {
   // Only rescue printable single-character keys (the user is trying to type).
   if (e.ctrlKey || e.altKey || e.metaKey) return;
+  if (e.isComposing) return;
   if (e.key.length !== 1) return;
   if (isTextEditableElement(document.activeElement)) return;
   const target = lastClickedEditable?.deref();
@@ -191,10 +231,13 @@ function rescueDeadKeyboardKeystroke(e: KeyboardEvent): void {
     rescuingTarget: `${target.tagName}${target.id ? `#${target.id}` : ""}`,
   });
   try {
-    target.focus();
+    target.focus({ preventScroll: true });
   } catch {
     /* ignore */
   }
+  e.preventDefault();
+  e.stopPropagation();
+  insertPrintableKeyIntoTextEditable(target, e.key);
   nudgeElectronWebContentsKeyboardRouting("dead-keystroke");
 }
 

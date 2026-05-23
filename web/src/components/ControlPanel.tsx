@@ -124,6 +124,8 @@ export default function ControlPanel({
   const [roundDirty, setRoundDirty] = useState(false);
   const [showFinalPanel, setShowFinalPanel] = useState(false);
   const [finalCorner, setFinalCorner] = useState<"LEFT" | "RIGHT" | null>(null);
+  const [warningSelectOverride, setWarningSelectOverride] = useState<"CUS" | null>(null);
+  const [customWarningDraft, setCustomWarningDraft] = useState("30");
   const [audioVolume, setAudioVolume] = useState(100);
   const [selectedBracketTeamIds, setSelectedBracketTeamIds] = useState<string[] | null>(
     null,
@@ -264,6 +266,32 @@ export default function ControlPanel({
   const boardErr =
     boardQueryError instanceof Error ? boardQueryError.message : null;
 
+  const warningSeconds =
+    typeof board?.soundWarningSeconds === "number" && Number.isFinite(board.soundWarningSeconds)
+      ? Math.max(1, Math.min(99, Math.trunc(board.soundWarningSeconds)))
+      : 30;
+  const warningSelectValue = warningSelectOverride
+    ? warningSelectOverride
+    : board?.sound10Enabled === false
+      ? "OFF"
+      : warningSeconds === 10
+        ? "10"
+        : warningSeconds === 30
+          ? "30"
+          : "CUS";
+
+  useEffect(() => {
+    if (!board) return;
+    if (warningSelectOverride !== "CUS") {
+      setCustomWarningDraft(String(warningSeconds).padStart(2, "0").slice(-2));
+    }
+    if (warningSeconds !== 10 && warningSeconds !== 30) {
+      setWarningSelectOverride("CUS");
+    } else if (warningSelectOverride !== "CUS") {
+      setWarningSelectOverride(null);
+    }
+  }, [board, warningSeconds, warningSelectOverride]);
+
   /**
    * Do not include `board.updatedAt` here: it changes on every board PATCH, which
    * resets `prevSecondsRef` in `useTimerAlertSounds` and **swallows boundary cues**.
@@ -281,6 +309,7 @@ export default function ControlPanel({
     board?.secondsRemaining,
     timerAudioResetKey,
     board?.sound10Enabled,
+    board?.soundWarningSeconds,
     board?.sound0Enabled,
     board?.timerRestMode,
     board?.sound10PlayNonce,
@@ -1173,44 +1202,97 @@ export default function ControlPanel({
           <div className="mt-2 flex flex-wrap gap-2">
             <div className="inline-flex items-center gap-1">
               <span className="text-[10px] font-semibold tracking-wide text-zinc-300">
-                10S WARNING:
+                WARN
               </span>
-              <button
-                type="button"
-                aria-label={board.sound10Enabled ? "Disable 10-second warning" : "Enable 10-second warning"}
-                className={[
-                  "relative inline-flex h-6 w-6 items-center justify-center rounded border transition",
-                  board.sound10Enabled
-                    ? "border-emerald-500 bg-emerald-700/25 text-emerald-300"
-                    : "border-zinc-600 bg-zinc-700/30 text-zinc-400",
-                ].join(" ")}
-                onClick={() =>
-                  patch({
+              <select
+                aria-label="Warning sound time"
+                className="h-6 rounded border border-zinc-600 bg-zinc-900 px-1 text-[10px] font-semibold text-zinc-100"
+                value={warningSelectValue}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  if (value === "OFF") {
+                    setWarningSelectOverride(null);
+                    void patch({
+                      command: {
+                        type: "set_sound_warning",
+                        enabled: false,
+                        seconds: warningSeconds,
+                      },
+                    });
+                    return;
+                  }
+                  if (value === "CUS") {
+                    setWarningSelectOverride("CUS");
+                    setCustomWarningDraft(
+                      String(warningSeconds).padStart(2, "0").slice(-2),
+                    );
+                    void patch({
+                      command: {
+                        type: "set_sound_warning",
+                        enabled: true,
+                        seconds: warningSeconds,
+                      },
+                    });
+                    return;
+                  }
+                  setWarningSelectOverride(null);
+                  const seconds = Number(value);
+                  setCustomWarningDraft(String(seconds).padStart(2, "0"));
+                  void patch({
                     command: {
-                      type: "set_sound_10_enabled",
-                      enabled: !board.sound10Enabled,
+                      type: "set_sound_warning",
+                      enabled: true,
+                      seconds,
                     },
-                  })
-                }
+                  });
+                }}
               >
-                <SoundIcon className="h-3.5 w-3.5" />
-                {!board.sound10Enabled ? (
-                  <svg
-                    className="pointer-events-none absolute inset-0 h-full w-full text-red-400"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2.5"
-                    aria-hidden
-                  >
-                    <path d="M5 5l14 14" />
-                  </svg>
-                ) : null}
-              </button>
+                <option value="30">30</option>
+                <option value="10">10</option>
+                <option value="OFF">OFF</option>
+                <option value="CUS">CUS</option>
+              </select>
+              {warningSelectValue === "CUS" ? (
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  pattern="^[0-9]{0,2}$"
+                  maxLength={2}
+                  aria-label="Custom warning seconds"
+                  className="h-6 w-9 rounded border border-zinc-600 bg-zinc-900 px-1 text-center text-[10px] font-semibold text-zinc-100"
+                  value={customWarningDraft}
+                  onChange={(e) => {
+                    const next = e.target.value.replace(/\D/g, "").slice(0, 2);
+                    setCustomWarningDraft(next);
+                    const seconds = Number(next);
+                    if (seconds > 0) {
+                      void patch({
+                        command: {
+                          type: "set_sound_warning",
+                          enabled: true,
+                          seconds,
+                        },
+                      });
+                    }
+                  }}
+                  onBlur={() => {
+                    const seconds = Math.max(1, Number(customWarningDraft) || 1);
+                    const normalized = String(seconds).padStart(2, "0").slice(-2);
+                    setCustomWarningDraft(normalized);
+                    void patch({
+                      command: {
+                        type: "set_sound_warning",
+                        enabled: true,
+                        seconds,
+                      },
+                    });
+                  }}
+                />
+              ) : null}
             </div>
             <div className="inline-flex items-center gap-1">
               <span className="text-[10px] font-semibold tracking-wide text-zinc-300">
-                AIR HORN:
+                HORN:
               </span>
               <button
                 type="button"
@@ -1256,7 +1338,7 @@ export default function ControlPanel({
                 );
               }}
             >
-              PLAY 10S
+              PLAY WARN
             </button>
             <button
               type="button"
