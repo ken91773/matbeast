@@ -7,14 +7,13 @@ import { useLayoutEffect, useMemo, useRef, useState } from "react";
  * Sits in a fixed 1920×1080 vertical band (y 316 → 503) and crossfades in
  * when the dashboard APPLIES teams mode.
  *
- * Format (updated 2026-04-29 — transparent-background artwork):
+ * Format (updated 2026-05-23 — translucent content backing):
  * - Background: `/teamsbg3.png` (1920×187, 32-bit ARGB with full alpha)
  *   rendered at native resolution and aligned to the band's top-left so
  *   it covers the band edge-to-edge. The image is mostly transparent and
- *   only contains a small white "MatBeast" logo near the top center
- *   (opaque bounding box ≈ x [787..1156] y [23..65]). Everywhere else,
- *   the underlying scoreboard shows through. We DO NOT draw any extra
- *   border, box, shadow, or fallback fill around the image.
+ *   only contains a small white "MatBeast" logo near the top center.
+ *   A measured 80% black rectangle is drawn behind the logo and team text
+ *   only, with padding, so the rest of the overlay remains transparent.
  * - Team text: rendered as one or two lines centered horizontally inside
  *   the band and vertically centered in the lower portion (beneath the
  *   logo). One team → one line, two teams → two lines stacked with a
@@ -48,6 +47,17 @@ const LINE_GAP_PX = Math.round(FONT_SIZE_PX * 0.5);
 const BACKGROUND_IMAGE_URL = "/teamsbg3.png";
 const BACKGROUND_IMAGE_WIDTH_PX = 1920;
 const BACKGROUND_IMAGE_HEIGHT_PX = 187;
+
+/** Approximate opaque pixel bounds of the white MatBeast logo baked into teamsbg3.png. */
+const LOGO_BOUNDS_PX = {
+  left: 787,
+  top: 23,
+  right: 1156,
+  bottom: 65,
+};
+const CONTENT_BACKDROP_PADDING_X_PX = 34;
+const CONTENT_BACKDROP_PADDING_Y_PX = 18;
+const CONTENT_BACKDROP_COLOR = "rgba(0, 0, 0, 0.8)";
 
 /**
  * Vertical strip at the top of `teamsbg3.png` reserved for the built-in
@@ -268,6 +278,8 @@ export function OverlayTeamListLayer({
 }) {
   const normalizedA = useMemo(() => normalizeLine(teamA), [teamA]);
   const normalizedB = useMemo(() => normalizeLine(teamB), [teamB]);
+  const normalizedAPlayersKey = normalizedA?.players.join("\u0001") ?? "";
+  const normalizedBPlayersKey = normalizedB?.players.join("\u0001") ?? "";
 
   const contentWrapperRef = useRef<HTMLDivElement | null>(null);
 
@@ -278,7 +290,11 @@ export function OverlayTeamListLayer({
    * overlay is rendered at opacity 0 during the initial frame so a
    * temporarily over-wide stack never flashes onscreen.
    */
-  const [dims, setDims] = useState<{ scale: number } | null>(null);
+  const [dims, setDims] = useState<{
+    scale: number;
+    naturalW: number;
+    naturalH: number;
+  } | null>(null);
 
   const measureAndFit = () => {
     const wrapper = contentWrapperRef.current;
@@ -295,7 +311,7 @@ export function OverlayTeamListLayer({
     const scaleW = TEXT_AREA_WIDTH_PX / naturalW;
     const scaleH = TEXT_AREA_HEIGHT_PX / naturalH;
     const scale = Math.min(1, scaleW, scaleH);
-    setDims({ scale });
+    setDims({ scale, naturalW, naturalH });
   };
 
   useLayoutEffect(() => {
@@ -363,14 +379,44 @@ export function OverlayTeamListLayer({
     };
   }, [
     normalizedA?.label,
-    normalizedA?.players.join("\u0001"),
+    normalizedAPlayersKey,
     normalizedB?.label,
-    normalizedB?.players.join("\u0001"),
+    normalizedBPlayersKey,
   ]);
 
   if (!normalizedA && !normalizedB) return null;
 
   const resolvedScale = dims ? dims.scale : 1;
+  const scaledTextW = dims ? dims.naturalW * dims.scale : 0;
+  const scaledTextH = dims ? dims.naturalH * dims.scale : 0;
+  const textCenterX = TEXT_AREA_SIDE_INSET_PX + TEXT_AREA_WIDTH_PX / 2;
+  const textCenterY = TITLE_AREA_HEIGHT_PX + TEXT_AREA_HEIGHT_PX / 2;
+  const contentBackdropRect = dims
+    ? (() => {
+        const rawLeft =
+          Math.min(LOGO_BOUNDS_PX.left, textCenterX - scaledTextW / 2) -
+          CONTENT_BACKDROP_PADDING_X_PX;
+        const rawRight =
+          Math.max(LOGO_BOUNDS_PX.right, textCenterX + scaledTextW / 2) +
+          CONTENT_BACKDROP_PADDING_X_PX;
+        const rawTop =
+          Math.min(LOGO_BOUNDS_PX.top, textCenterY - scaledTextH / 2) -
+          CONTENT_BACKDROP_PADDING_Y_PX;
+        const rawBottom =
+          Math.max(LOGO_BOUNDS_PX.bottom, textCenterY + scaledTextH / 2) +
+          CONTENT_BACKDROP_PADDING_Y_PX;
+        const left = Math.max(0, rawLeft);
+        const top = Math.max(0, rawTop);
+        const right = Math.min(BACKGROUND_IMAGE_WIDTH_PX, rawRight);
+        const bottom = Math.min(BACKGROUND_IMAGE_HEIGHT_PX, rawBottom);
+        return {
+          left,
+          top,
+          width: Math.max(0, right - left),
+          height: Math.max(0, bottom - top),
+        };
+      })()
+    : null;
 
   return (
     <div
@@ -394,7 +440,6 @@ export function OverlayTeamListLayer({
        * cheaply and the browser parses the rule only once per document.
        */}
       <style
-        // eslint-disable-next-line react/no-unknown-property
         dangerouslySetInnerHTML={{ __html: BREATHE_KEYFRAMES_CSS }}
       />
       <div
@@ -406,11 +451,24 @@ export function OverlayTeamListLayer({
           transition: "opacity 120ms linear",
         }}
       >
+        {contentBackdropRect ? (
+          <div
+            style={{
+              position: "absolute",
+              left: `${contentBackdropRect.left}px`,
+              top: `${contentBackdropRect.top}px`,
+              width: `${contentBackdropRect.width}px`,
+              height: `${contentBackdropRect.height}px`,
+              background: CONTENT_BACKDROP_COLOR,
+              pointerEvents: "none",
+            }}
+          />
+        ) : null}
         {/*
          * Background image — rendered at native 1920×187 px. Mostly
          * transparent with the white MatBeast logo baked into the upper
-         * portion of the artwork; no additional border, fill, or shadow
-         * is drawn around it.
+         * portion of the artwork. The measured black rectangle above sits
+         * behind the logo and team text without filling the full band.
          */}
         <img
           src={BACKGROUND_IMAGE_URL}

@@ -1,6 +1,13 @@
 # Progress Log
 
 ## Current Build Status
+- **v1.2.15 (2026-05-23)** — darker SHOW TEAMS backing.
+  - **SHOW TEAMS readability.** The dynamic black rectangle behind the
+    MatBeast logo and team/player text now uses 80% opacity, keeping the
+    same padded content-sized box while improving contrast over bright
+    video or scoreboard backgrounds.
+  - Bumped `web/package.json` to `1.2.15`.
+
 - **v1.2.14 (2026-05-23)** — desktop startup status window.
   - **Immediate launch feedback.** Packaged desktop launches now show a
     small native startup status window as soon as Electron is ready, so
