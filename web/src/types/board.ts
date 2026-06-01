@@ -66,7 +66,7 @@ export type BoardPayload = {
   sound0Enabled: boolean;
   sound10PlayNonce: number;
   sound0PlayNonce: number;
-  /** True when `overtimeIndex === -1` (1:00 rest). */
+  /** True when `overtimeIndex === -1` (0:30 rest). */
   timerRestMode: boolean;
   /** True when `overtimeIndex === -2` (OT minute: count up 0:00→1:00 internally as 60→0 remaining). */
   timerOtCountUpMode: boolean;

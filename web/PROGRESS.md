@@ -1,6 +1,13 @@
 # Progress Log
 
 ## Current Build Status
+- **v1.2.16 (2026-05-31)** — shorter REST timer.
+  - **Timer REST preset.** The timer card's REST button now starts a
+    30-second rest period instead of the previous 1:00 rest period,
+    while preserving the same REST PERIOD overlay label and paused
+    setup behavior.
+  - Bumped `web/package.json` to `1.2.16`.
+
 - **v1.2.15 (2026-05-23)** — darker SHOW TEAMS backing.
   - **SHOW TEAMS readability.** The dynamic black rectangle behind the
     MatBeast logo and team/player text now uses 80% opacity, keeping the

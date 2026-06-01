@@ -783,7 +783,7 @@ export async function PATCH(req: Request) {
       case "set_timer_rest_period": {
         bumpTimerCueNonce();
         resetOtRoundSecondary();
-        next.timerSeconds = 60;
+        next.timerSeconds = 30;
         next.timerRunning = false;
         next.timerEndsAt = null;
         next.timerPhase = "REGULATION";
