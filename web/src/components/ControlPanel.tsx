@@ -124,7 +124,9 @@ export default function ControlPanel({
   const [roundDirty, setRoundDirty] = useState(false);
   const [showFinalPanel, setShowFinalPanel] = useState(false);
   const [finalCorner, setFinalCorner] = useState<"LEFT" | "RIGHT" | null>(null);
-  const [warningSelectOverride, setWarningSelectOverride] = useState<"CUS" | null>(null);
+  const [warningSelectOverride, setWarningSelectOverride] = useState<
+    "30" | "CUS" | null
+  >(null);
   const [customWarningDraft, setCustomWarningDraft] = useState("30");
   const [audioVolume, setAudioVolume] = useState(100);
   const [selectedBracketTeamIds, setSelectedBracketTeamIds] = useState<string[] | null>(
@@ -137,6 +139,7 @@ export default function ControlPanel({
     null,
   );
   const firstBoardLoad = useRef(true);
+  const prevTimerOtRoundModeRef = useRef(false);
   const selectedBracketMatchIdRef = useRef<string | null>(null);
   const patchRef = useRef<
     (body: Record<string, unknown>) => Promise<BoardPayload | null>
@@ -287,18 +290,37 @@ export default function ControlPanel({
     typeof board?.soundWarningSeconds === "number" && Number.isFinite(board.soundWarningSeconds)
       ? Math.max(1, Math.min(99, Math.trunc(board.soundWarningSeconds)))
       : 30;
-  const warningSelectValue = warningSelectOverride
-    ? warningSelectOverride
-    : board?.sound10Enabled === false
+  const effectiveWarningSeconds =
+    board?.timerOtRoundMode && warningSelectOverride === null ? 10 : warningSeconds;
+  const warningSelectValue = board?.sound10Enabled === false
       ? "OFF"
-      : warningSeconds === 10
+      : board?.timerOtRoundMode && warningSelectOverride === null
         ? "10"
-        : warningSeconds === 30
-          ? "30"
-          : "CUS";
+        : warningSelectOverride
+          ? warningSelectOverride
+          : warningSeconds === 10
+            ? "10"
+            : warningSeconds === 30
+              ? "30"
+              : "CUS";
 
   useEffect(() => {
     if (!board) return;
+    const wasTimerOtRoundMode = prevTimerOtRoundModeRef.current;
+    prevTimerOtRoundModeRef.current = board.timerOtRoundMode;
+    if (board.timerOtRoundMode) {
+      if (!wasTimerOtRoundMode) {
+        setCustomWarningDraft("10");
+        setWarningSelectOverride(null);
+        return;
+      }
+      if (warningSelectOverride === null) {
+        setCustomWarningDraft("10");
+      } else if (warningSelectOverride !== "CUS") {
+        setCustomWarningDraft(String(warningSeconds).padStart(2, "0").slice(-2));
+      }
+      return;
+    }
     if (warningSelectOverride !== "CUS") {
       setCustomWarningDraft(String(warningSeconds).padStart(2, "0").slice(-2));
     }
@@ -326,7 +348,7 @@ export default function ControlPanel({
     board?.secondsRemaining,
     timerAudioResetKey,
     board?.sound10Enabled,
-    board?.soundWarningSeconds,
+    effectiveWarningSeconds,
     board?.sound0Enabled,
     board?.timerRestMode,
     board?.sound10PlayNonce,
@@ -1258,8 +1280,10 @@ export default function ControlPanel({
                     });
                     return;
                   }
-                  setWarningSelectOverride(null);
                   const seconds = Number(value);
+                  setWarningSelectOverride(
+                    board?.timerOtRoundMode && seconds !== 10 ? "30" : null,
+                  );
                   setCustomWarningDraft(String(seconds).padStart(2, "0"));
                   void patch({
                     command: {

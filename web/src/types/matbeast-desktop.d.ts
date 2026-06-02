@@ -94,6 +94,13 @@ interface MatBeastDesktopApi {
   /** Focus main `webContents` even when the window is already foreground (Windows keyboard routing after in-app actions). */
   restoreWebKeyboardFocus?: () => Promise<{ ok: boolean }>;
   /**
+   * Escalation for the Windows "input is focused but keystrokes go
+   * nowhere until Alt-Tab" bug: blur + re-focus the BrowserWindow (an
+   * Alt-Tab-equivalent OS activation cycle) when soft `webContents.focus()`
+   * nudges fail. Used only when the renderer detects it is still stuck.
+   */
+  hardRestoreWebKeyboardFocus?: () => Promise<{ ok: boolean }>;
+  /**
    * v1.2.9: First-launch password gate persistence under
    * `userData/first-launch-password.json`. Origin-stable so the
    * unlock survives the bundled Next server's per-launch port roll.

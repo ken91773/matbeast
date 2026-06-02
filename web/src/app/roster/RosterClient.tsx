@@ -132,6 +132,48 @@ type Team = {
   players: Player[];
 };
 
+/** Optimistic helpers: pure transforms over the roster team list. */
+function optimisticPatchPlayer(
+  list: Team[],
+  playerId: string,
+  patch: Partial<Player>,
+): Team[] {
+  return list.map((t) => ({
+    ...t,
+    players: (t.players ?? []).map((p) =>
+      p.id === playerId ? { ...p, ...patch } : p,
+    ),
+  }));
+}
+
+function optimisticRemovePlayer(list: Team[], playerId: string): Team[] {
+  return list.map((t) => ({
+    ...t,
+    players: (t.players ?? []).filter((p) => p.id !== playerId),
+  }));
+}
+
+/** Move a player to a new 0-based position within its team and renumber. */
+function optimisticMovePlayer(
+  list: Team[],
+  playerId: string,
+  toIndex: number,
+): Team[] {
+  return list.map((t) => {
+    const players = t.players ?? [];
+    if (!players.some((p) => p.id === playerId)) return t;
+    const sorted = [...players].sort(
+      (a, b) => (a.lineupOrder ?? 0) - (b.lineupOrder ?? 0),
+    );
+    const fromIdx = sorted.findIndex((p) => p.id === playerId);
+    if (fromIdx === -1) return t;
+    const [moved] = sorted.splice(fromIdx, 1);
+    const clamped = Math.max(0, Math.min(toIndex, sorted.length));
+    sorted.splice(clamped, 0, moved);
+    return { ...t, players: sorted.map((p, i) => ({ ...p, lineupOrder: i })) };
+  });
+}
+
 type RosterFilePlayer = {
   firstName: string;
   lastName: string;
@@ -677,6 +719,19 @@ export function RosterClient({
     body: { name?: string; seedOrder?: number },
   ) {
     setErr(null);
+    // Optimistic: show the rename/reseed instantly; sync runs after.
+    const prevTeams = teams;
+    setTeams((cur) =>
+      cur.map((t) =>
+        t.id === teamId
+          ? {
+              ...t,
+              ...(body.name !== undefined ? { name: body.name } : {}),
+              ...(body.seedOrder !== undefined ? { seedOrder: body.seedOrder } : {}),
+            }
+          : t,
+      ),
+    );
     const rosterTid =
       (dashboardLiveTournamentId && dashboardLiveTournamentId.trim()) ||
       (wsTournamentId && wsTournamentId.trim()) ||
@@ -696,6 +751,7 @@ export function RosterClient({
     if (!res.ok) {
       const j = (await res.json()) as { error?: string };
       setErr(j.error ?? "Team update failed");
+      setTeams(prevTeams);
       return;
     }
     await refresh();
@@ -727,6 +783,16 @@ export function RosterClient({
     flags: { lineupConfirmed?: boolean; weighedConfirmed?: boolean },
   ) {
     setErr(null);
+    // Optimistic: flip the checkbox instantly; sync runs after.
+    const prevTeams = teams;
+    setTeams((cur) =>
+      cur.map((t) => ({
+        ...t,
+        players: (t.players ?? []).map((p) =>
+          p.id === playerId ? { ...p, ...flags } : p,
+        ),
+      })),
+    );
     const rosterTid =
       (dashboardLiveTournamentId && dashboardLiveTournamentId.trim()) ||
       (wsTournamentId && wsTournamentId.trim()) ||
@@ -746,6 +812,7 @@ export function RosterClient({
     if (!res.ok) {
       const j = (await res.json()) as { error?: string };
       setErr(j.error ?? "Could not update checkboxes");
+      setTeams(prevTeams);
       return;
     }
     await refresh();
@@ -753,6 +820,15 @@ export function RosterClient({
 
   async function postTeamReorder(orderedIds: string[]) {
     setErr(null);
+    // Optimistic: re-seed to the dragged order instantly; sync runs after.
+    const prevTeams = teams;
+    const orderIndex = new Map(orderedIds.map((id, i) => [id, i]));
+    setTeams((cur) =>
+      cur.map((t) => {
+        const idx = orderIndex.get(t.id);
+        return idx === undefined ? t : { ...t, seedOrder: idx };
+      }),
+    );
     const res = await matbeastFetch("/api/tournament/reorder-teams", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -761,6 +837,7 @@ export function RosterClient({
     if (!res.ok) {
       const j = (await res.json()) as { error?: string };
       setErr(j.error ?? "Reorder failed");
+      setTeams(prevTeams);
       return;
     }
     await refresh();
@@ -837,6 +914,7 @@ export function RosterClient({
             teams={sortedTeams}
             defaultBelt={defaultBelt}
             onSaved={() => refresh()}
+            onOptimisticTeams={(updater) => setTeams((cur) => updater(cur))}
             compact
             showMasterProfilePicker
             liveTournamentId={dashboardLiveTournamentId}
@@ -1108,6 +1186,7 @@ export function RosterClient({
               teams={sortedTeams}
               defaultBelt={defaultBelt}
               onSaved={() => refresh()}
+              onOptimisticTeams={(updater) => setTeams((cur) => updater(cur))}
             />
           </div>
         </>
@@ -1254,6 +1333,7 @@ function PlayerEntryForm({
   teams,
   defaultBelt,
   onSaved,
+  onOptimisticTeams,
   compact = false,
   showMasterProfilePicker = false,
   liveTournamentId = null,
@@ -1261,6 +1341,13 @@ function PlayerEntryForm({
   teams: Team[];
   defaultBelt: BeltRank;
   onSaved: () => Promise<void>;
+  /**
+   * Optimistic roster updater for the parent's local `teams` state (used
+   * in roster mode, where the grid renders from the parent prop rather
+   * than the React Query cache). Lets player add/edit/delete/move reflect
+   * instantly before the network round-trip.
+   */
+  onOptimisticTeams?: (updater: (list: Team[]) => Team[]) => void;
   compact?: boolean;
   showMasterProfilePicker?: boolean;
   liveTournamentId?: string | null;
@@ -1300,6 +1387,38 @@ function PlayerEntryForm({
     () => ({ useTrainingMasters: tournamentTrainingMode === true }),
     [tournamentTrainingMode],
   );
+
+  /**
+   * Apply an optimistic change to whichever roster source is currently
+   * rendered: the React Query cache in master-picker mode, or the
+   * parent's local `teams` state in roster mode. Used so player edits
+   * appear instantly; the network sync + reconcile run afterwards.
+   */
+  const applyOptimisticTeams = useCallback(
+    (updater: (list: Team[]) => Team[]) => {
+      if (showMasterProfilePicker && masterScopeId) {
+        queryClient.setQueryData<{ teams: Team[] }>(
+          matbeastKeys.teams(masterScopeId),
+          (old) => (old ? { teams: updater(old.teams) } : old),
+        );
+      } else {
+        onOptimisticTeams?.(updater);
+      }
+    },
+    [showMasterProfilePicker, masterScopeId, queryClient, onOptimisticTeams],
+  );
+
+  /** Roll back an optimistic change by resyncing from the server. */
+  const resyncTeams = useCallback(() => {
+    if (showMasterProfilePicker && masterScopeId) {
+      void queryClient.invalidateQueries({
+        queryKey: matbeastKeys.teams(masterScopeId),
+      });
+    } else {
+      void onSaved();
+    }
+  }, [showMasterProfilePicker, masterScopeId, queryClient, onSaved]);
+
   const [editingId, setEditingId] = useState<string | null>(null);
   const [masterPickId, setMasterPickId] = useState("");
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
@@ -2180,6 +2299,68 @@ function PlayerEntryForm({
       weighedConfirmed: form.weighedConfirmed,
     };
 
+    /**
+     * Optimistic roster update so the saved/added row appears instantly.
+     * The network save, master-profile sync, and cloud push all run
+     * after; the success path's onSaved()/invalidate reconciles with
+     * server truth (replacing the temp row), and the catch's
+     * resyncTeams() rolls back on failure.
+     */
+    const optimisticPlayerFields: Partial<Player> = {
+      teamId: payload.teamId,
+      firstName: payload.firstName,
+      lastName: payload.lastName,
+      nickname: payload.nickname,
+      academyName: payload.academyName,
+      unofficialWeight: payload.unofficialWeight,
+      officialWeight: payload.officialWeight,
+      heightFeet: payload.heightFeet,
+      heightInches: payload.heightInches,
+      age: payload.age,
+      beltRank: payload.beltRank,
+      profilePhotoUrl: payload.profilePhotoUrl,
+      headShotUrl: payload.headShotUrl,
+      lineupConfirmed: payload.lineupConfirmed,
+      weighedConfirmed: payload.weighedConfirmed,
+    };
+    if (editingId) {
+      applyOptimisticTeams((list) =>
+        optimisticPatchPlayer(list, editingId, optimisticPlayerFields),
+      );
+    } else if (dupOnRoster) {
+      applyOptimisticTeams((list) =>
+        optimisticPatchPlayer(list, dupOnRoster.id, optimisticPlayerFields),
+      );
+    } else {
+      const tempPlayer: Player = {
+        id: `optimistic-${Date.now()}`,
+        teamId: payload.teamId,
+        firstName: payload.firstName,
+        lastName: payload.lastName,
+        nickname: payload.nickname,
+        academyName: payload.academyName,
+        unofficialWeight: payload.unofficialWeight,
+        officialWeight: payload.officialWeight,
+        heightFeet: payload.heightFeet,
+        heightInches: payload.heightInches,
+        age: payload.age,
+        beltRank: payload.beltRank,
+        profilePhotoUrl: payload.profilePhotoUrl,
+        headShotUrl: payload.headShotUrl,
+        lineupOrder: null,
+        lineupConfirmed: payload.lineupConfirmed,
+        weighedConfirmed: payload.weighedConfirmed,
+        team: { name: teamRow?.name ?? "" },
+      };
+      applyOptimisticTeams((list) =>
+        list.map((t) =>
+          t.id === payload.teamId
+            ? { ...t, players: [...(t.players ?? []), tempPlayer] }
+            : t,
+        ),
+      );
+    }
+
     try {
       if (masterScopeId) {
         setMatBeastTournamentId(masterScopeId);
@@ -2331,6 +2512,7 @@ function PlayerEntryForm({
       }
     } catch (er) {
       setFormErr(er instanceof Error ? er.message : "Save failed");
+      resyncTeams();
     } finally {
       setSaving(false);
     }
@@ -2369,6 +2551,10 @@ function PlayerEntryForm({
     setOfficialWeightConfirm(null);
     setFlagBusyId(playerId);
     setFormErr(null);
+    // Optimistic: show the new official weight instantly.
+    applyOptimisticTeams((list) =>
+      optimisticPatchPlayer(list, playerId, { officialWeight: next }),
+    );
     try {
       const res = await matbeastFetch(
         `/api/players/${playerId}`,
@@ -2400,6 +2586,7 @@ function PlayerEntryForm({
       flashSaveNotice("Official weight saved");
     } catch (er) {
       setFormErr(er instanceof Error ? er.message : "Weight update failed");
+      resyncTeams();
     } finally {
       setFlagBusyId(null);
     }
@@ -2409,6 +2596,8 @@ function PlayerEntryForm({
     if (!confirm("Remove this player from the roster?")) return;
     setFlagBusyId(playerId);
     setFormErr(null);
+    // Optimistic: drop the row instantly; sync + reconcile run after.
+    applyOptimisticTeams((list) => optimisticRemovePlayer(list, playerId));
     try {
       const res = await matbeastFetch(
         `/api/players/${playerId}`,
@@ -2429,6 +2618,7 @@ function PlayerEntryForm({
       await onSaved();
     } catch (er) {
       setFormErr(er instanceof Error ? er.message : "Delete failed");
+      resyncTeams();
     } finally {
       setFlagBusyId(null);
     }
@@ -2445,6 +2635,10 @@ function PlayerEntryForm({
     }
     setFlagBusyId(playerId);
     setFormErr(null);
+    // Optimistic: reorder within the team instantly; sync runs after.
+    applyOptimisticTeams((list) =>
+      optimisticMovePlayer(list, playerId, toLineupOrder),
+    );
     try {
       const res = await matbeastFetch(
         `/api/players/${playerId}`,
@@ -2473,6 +2667,7 @@ function PlayerEntryForm({
       await onSaved();
     } catch (er) {
       setFormErr(er instanceof Error ? er.message : "Seed reorder failed");
+      resyncTeams();
     } finally {
       setFlagBusyId(null);
     }

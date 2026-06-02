@@ -357,6 +357,31 @@ export function DashboardTeamsPanel() {
         throw new Error(j.error ?? "Update failed");
       }
     },
+    // Optimistic: reflect the rename/color change instantly; the PATCH +
+    // background cloud autosync happen after, and onSuccess reconciles.
+    onMutate: async ({ id, name, overlayColor }) => {
+      const key = matbeastKeys.teams(tournamentId);
+      await queryClient.cancelQueries({ queryKey: key });
+      const previous = queryClient.getQueryData<TeamsPayload>(key);
+      if (previous && (name !== undefined || overlayColor !== undefined)) {
+        queryClient.setQueryData<TeamsPayload>(key, {
+          teams: previous.teams.map((t) =>
+            t.id === id
+              ? {
+                  ...t,
+                  ...(name !== undefined ? { name } : {}),
+                  ...(overlayColor !== undefined ? { overlayColor } : {}),
+                }
+              : t,
+          ),
+        });
+      }
+      return { previous };
+    },
+    onError: (_e, _v, ctx) => {
+      const prev = (ctx as { previous?: TeamsPayload } | undefined)?.previous;
+      if (prev) queryClient.setQueryData(matbeastKeys.teams(tournamentId), prev);
+    },
     onSuccess: () => {
       invalidateTeams();
       invalidateMasterTeams();
@@ -374,6 +399,26 @@ export function DashboardTeamsPanel() {
         const j = (await res.json()) as { error?: string };
         throw new Error(j.error ?? "Reorder failed");
       }
+    },
+    // Optimistic: re-seed the cached teams to the dragged order instantly.
+    onMutate: async (teamIds: string[]) => {
+      const key = matbeastKeys.teams(tournamentId);
+      await queryClient.cancelQueries({ queryKey: key });
+      const previous = queryClient.getQueryData<TeamsPayload>(key);
+      if (previous) {
+        const orderIndex = new Map(teamIds.map((id, i) => [id, i]));
+        queryClient.setQueryData<TeamsPayload>(key, {
+          teams: previous.teams.map((t) => {
+            const idx = orderIndex.get(t.id);
+            return idx === undefined ? t : { ...t, seedOrder: idx };
+          }),
+        });
+      }
+      return { previous };
+    },
+    onError: (_e, _v, ctx) => {
+      const prev = (ctx as { previous?: TeamsPayload } | undefined)?.previous;
+      if (prev) queryClient.setQueryData(matbeastKeys.teams(tournamentId), prev);
     },
     onSuccess: () => invalidateTeams(),
   });

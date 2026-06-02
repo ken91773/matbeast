@@ -5,6 +5,7 @@ import {
   awaitPendingMatbeastMutations,
   getMatBeastTournamentId,
   matbeastFetch,
+  MATBEAST_TOURNAMENT_HEADER,
 } from "@/lib/matbeast-fetch";
 import {
   buildRosterDocumentFromTeamsApi,
@@ -238,12 +239,22 @@ export async function buildEnvelopeText(args: {
   eventTitle: string;
   /** Board `currentRosterFileName` — drives default filename, disk map key, and `eventFileKey` in JSON. */
   rosterFileName: string;
+  /**
+   * When set, every read targets this tournament via the
+   * `x-matbeast-tournament-id` header instead of the renderer's active
+   * tab. Lets the background sync coordinator rebuild an envelope for a
+   * non-active (or even closed) linked event without switching tabs.
+   */
+  tournamentId?: string;
 }) {
   const eventTitle = args.eventTitle.trim() || "Untitled event";
   const rf = args.rosterFileName.trim();
   const rosterFileLabel =
     !rf || rf.toUpperCase() === "UNTITLED" ? "UNTITLED" : rf;
-  const resTeams = await matbeastFetch("/api/teams");
+  const scopeInit: RequestInit | undefined = args.tournamentId
+    ? { headers: { [MATBEAST_TOURNAMENT_HEADER]: args.tournamentId } }
+    : undefined;
+  const resTeams = await matbeastFetch("/api/teams", scopeInit);
   if (!resTeams.ok) {
     throw new Error("Could not load teams for export");
   }
@@ -262,7 +273,7 @@ export async function buildEnvelopeText(args: {
       }
     | undefined;
   try {
-    const resBracket = await matbeastFetch("/api/bracket");
+    const resBracket = await matbeastFetch("/api/bracket", scopeInit);
     if (resBracket.ok) {
       const b = (await resBracket.json()) as BracketApiForExport;
       bracket = {
@@ -308,7 +319,7 @@ export async function buildEnvelopeText(args: {
    */
   let resultLogsForEnvelope: import("@/lib/roster-file-types").RosterFileResultLog[] = [];
   try {
-    const boardRes = await matbeastFetch("/api/board");
+    const boardRes = await matbeastFetch("/api/board", scopeInit);
     if (boardRes.ok) {
       const b = (await boardRes.json()) as {
         trainingMode?: boolean;
@@ -911,6 +922,206 @@ async function pushToCloudSync(
   }
 }
 
+/** Precise outcome of a background flush push, for the sync coordinator. */
+export type BackgroundPushOutcome =
+  | { kind: "ok" }
+  | { kind: "no-op" }
+  | { kind: "no-link" }
+  | { kind: "conflict"; localVersion?: number; cloudVersion?: number }
+  | { kind: "error"; message: string };
+
+/**
+ * Rebuild and push a specific *linked* tournament's current envelope to
+ * the cloud WITHOUT switching the active tab. Used by the background
+ * sync coordinator to flush events that aren't the one the operator is
+ * looking at (including tabs closed while offline).
+ *
+ * Serializes against the active-tab save pipeline via the shared
+ * `matbeastSaveInflight` mutex so the two never race the same
+ * `baseVersion` and trip a spurious 409.
+ */
+export async function pushLinkedTournamentInBackground(
+  tournamentId: string,
+  eventTitle: string,
+): Promise<BackgroundPushOutcome> {
+  const tid = tournamentId.trim();
+  if (!tid) return { kind: "error", message: "missing tournamentId" };
+  // Wait out any in-flight save of the same tab first (loop because more
+  // callers can queue behind us while we wait).
+  while (matbeastSaveInflight.has(tid)) {
+    try {
+      await matbeastSaveInflight.get(tid);
+    } catch {
+      /* swallow — we still run our own push below */
+    }
+  }
+  const job = pushLinkedTournamentInBackgroundInner(tid, eventTitle);
+  // Register a boolean-coerced promise so the active-tab pipeline
+  // serializes behind us too (it awaits whatever is in the map).
+  const guard = job
+    .then((o) => o.kind === "ok" || o.kind === "no-op")
+    .catch(() => false);
+  matbeastSaveInflight.set(tid, guard);
+  try {
+    return await job;
+  } finally {
+    if (matbeastSaveInflight.get(tid) === guard) {
+      matbeastSaveInflight.delete(tid);
+    }
+  }
+}
+
+async function pushLinkedTournamentInBackgroundInner(
+  tid: string,
+  eventTitle: string,
+): Promise<BackgroundPushOutcome> {
+  // Make sure in-flight mutations have committed to SQLite before we
+  // snapshot the envelope, mirroring the active-tab save pipeline.
+  await awaitPendingMatbeastMutations();
+
+  let rosterFileName = "UNTITLED";
+  try {
+    const boardRes = await matbeastFetch("/api/board", {
+      headers: { [MATBEAST_TOURNAMENT_HEADER]: tid },
+    });
+    if (boardRes.ok) {
+      const b = (await boardRes.json()) as { currentRosterFileName?: string };
+      rosterFileName = b.currentRosterFileName?.trim() || "UNTITLED";
+    }
+  } catch {
+    /* keep UNTITLED */
+  }
+
+  let envelope: string;
+  try {
+    const built = await buildEnvelopeText({
+      eventTitle: eventTitle.trim() || "Untitled event",
+      rosterFileName,
+      tournamentId: tid,
+    });
+    envelope = built.text;
+  } catch (e) {
+    return {
+      kind: "error",
+      message: e instanceof Error ? e.message : "envelope build failed",
+    };
+  }
+
+  try {
+    const r = await fetch("/api/cloud/events/push", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tournamentId: tid, envelope }),
+    });
+    if (r.status === 409) {
+      const data = (await r.json().catch(() => ({}))) as {
+        localVersion?: number;
+        cloudVersion?: number;
+      };
+      // A 409 is a real server response → cloud is reachable.
+      markCloudReachable();
+      return {
+        kind: "conflict",
+        localVersion: data.localVersion,
+        cloudVersion: data.cloudVersion,
+      };
+    }
+    if (r.ok) {
+      const data = (await r.json().catch(() => ({}))) as { kind?: string };
+      markCloudReachable();
+      // The cloud now has these bytes — clear the renderer dirty flag so
+      // the close/quit "unsynced changes" probes stay accurate even when
+      // the push was driven by the background coordinator rather than the
+      // active-tab save pipeline.
+      markTournamentClean(tid);
+      window.dispatchEvent(
+        new CustomEvent("matbeast-cloud-sync-changed", {
+          detail: { tournamentId: tid },
+        }),
+      );
+      if (data.kind === "no-op") return { kind: "no-op" };
+      if (data.kind === "no-link") return { kind: "no-link" };
+      return { kind: "ok" };
+    }
+    const body = await r.text().catch(() => "");
+    const message = `HTTP ${r.status}${
+      body.trim() ? ` — ${body.trim().slice(0, 180)}` : ""
+    }`;
+    markCloudUnreachable(`Cloud push failed: ${message}`);
+    return { kind: "error", message };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    markCloudUnreachable(`Cloud push error: ${msg.slice(0, 180)}`);
+    return { kind: "error", message: msg };
+  }
+}
+
+/**
+ * Safety net: silently write a `.matb` backup of a tournament's current
+ * state to the default Events folder. Used by the sync coordinator when
+ * the cloud has been unreachable long enough that we don't want the
+ * operator's edits living only in memory + SQLite.
+ */
+export async function writeOfflineBackupForTournament(
+  tournamentId: string,
+  eventTitle: string,
+): Promise<{ ok: boolean; filePath?: string; error?: string }> {
+  const desk = typeof window !== "undefined" ? window.matBeastDesktop : undefined;
+  if (!desk?.getDefaultEventSavePath || !desk?.writeTextFile) {
+    return { ok: false, error: "desktop file API unavailable" };
+  }
+  const tid = tournamentId.trim();
+  if (!tid) return { ok: false, error: "missing tournamentId" };
+
+  let rosterFileName = "UNTITLED";
+  try {
+    const boardRes = await matbeastFetch("/api/board", {
+      headers: { [MATBEAST_TOURNAMENT_HEADER]: tid },
+    });
+    if (boardRes.ok) {
+      const b = (await boardRes.json()) as { currentRosterFileName?: string };
+      rosterFileName = b.currentRosterFileName?.trim() || "UNTITLED";
+    }
+  } catch {
+    /* keep UNTITLED */
+  }
+
+  let text: string;
+  let defaultFile: string;
+  try {
+    const built = await buildEnvelopeText({
+      eventTitle: eventTitle.trim() || "Untitled event",
+      rosterFileName,
+      tournamentId: tid,
+    });
+    text = built.text;
+    defaultFile = built.defaultFile;
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "build failed" };
+  }
+
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const stamp =
+    `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
+    `-${pad(now.getHours())}${pad(now.getMinutes())}`;
+  const base = (defaultFile || `${rosterFileName}.matb`).replace(
+    /\.matb$/i,
+    "",
+  );
+  const name = `${base}-offline-backup-${stamp}.matb`;
+
+  const pathRes = await desk.getDefaultEventSavePath({ defaultName: name });
+  if (!pathRes.ok) {
+    return { ok: false, error: pathRes.error ?? "could not resolve save path" };
+  }
+  const w = await desk.writeTextFile(pathRes.filePath, text);
+  if (!w.ok) {
+    return { ok: false, error: w.error ?? "write failed" };
+  }
+  return { ok: true, filePath: pathRes.filePath };
+}
+
 async function pushToCloudAfterSave(
   tournamentId: string,
   envelope: string,
@@ -1346,6 +1557,54 @@ export async function matbeastCreateNewEventTab(opts: {
   return { ok: true, tournamentId: j.id, cloudSkipped: true } as const;
 }
 
+/**
+ * Cloud-is-truth open resolution.
+ *
+ * The cloud event is the canonical copy; a `.matb` on disk is only ever
+ * a backup. So when the user opens a loose disk file, check whether a
+ * cloud event already exists with the same filename. If it does, we
+ * open the CLOUD bytes (they win) and the caller binds the freshly
+ * imported tournament to that cloud event — so every later edit syncs
+ * into the original event instead of spawning a duplicate catalog row.
+ *
+ * Returns null (→ import the raw disk bytes as a brand-new event, same
+ * as before) when cloud isn't configured, the catalog can't be read,
+ * or no event matches the filename (genuinely new / offline file).
+ */
+async function resolveCloudEventForOpenedFile(
+  fileName: string,
+): Promise<{ id: string; eventName: string | null; envelope: string } | null> {
+  const target = fileName.trim().toLowerCase();
+  if (!target) return null;
+  if (!(await isCloudConfigured())) return null;
+  try {
+    const listRes = await fetch("/api/cloud/events", { cache: "no-store" });
+    if (!listRes.ok) return null;
+    const list = (await listRes.json()) as {
+      events?: Array<{ id?: string; name?: string; eventName?: string | null }>;
+    };
+    const match = (list.events ?? []).find(
+      (e) => (e.name ?? "").trim().toLowerCase() === target,
+    );
+    if (!match?.id) return null;
+    const pullRes = await fetch("/api/cloud/events/pull", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cloudEventId: match.id }),
+    });
+    if (!pullRes.ok) return null;
+    const pulled = (await pullRes.json()) as { envelope?: string };
+    if (typeof pulled.envelope !== "string") return null;
+    return {
+      id: match.id,
+      eventName: match.eventName ?? null,
+      envelope: pulled.envelope,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** Imports JSON from disk into a new tournament tab. */
 export async function matbeastImportOpenedEventFile(opts: {
   filePath: string;
@@ -1420,9 +1679,50 @@ export async function matbeastImportOpenedEventFile(opts: {
     return;
   }
 
+  /**
+   * Cloud-is-truth: when a disk-opened file maps to an existing cloud
+   * event (same filename), open the cloud copy and remember to bind the
+   * link after import so edits sync into the original event instead of
+   * creating a duplicate. Skipped when the caller already knows the
+   * cloud event (open-from-cloud) or when nothing matches (new file).
+   */
+  let effectiveText = text;
+  let effectiveCloudEventId = cloudEventId;
+  let effectiveDisplayNameOverride = displayNameOverride;
+  let bindCloudLinkAfterImport = false;
+  if (!effectiveCloudEventId?.trim()) {
+    const matched = await resolveCloudEventForOpenedFile(
+      eventNameFromPath(filePath),
+    );
+    if (matched) {
+      // If that cloud event is already open (e.g. opened from the cloud
+      // list this session), focus it rather than spawning a second tab
+      // bound to the same cloud event.
+      if (openTabs?.length && selectTab) {
+        const focused = await tryFocusExistingTabForCloudEvent({
+          cloudEventId: matched.id,
+          openTabs,
+          selectTab,
+          setShowHome,
+        });
+        if (focused) return;
+      }
+      effectiveCloudEventId = matched.id;
+      effectiveText = matched.envelope;
+      effectiveDisplayNameOverride = matched.eventName ?? displayNameOverride;
+      bindCloudLinkAfterImport = true;
+      matbeastDebugLog(
+        "file:import",
+        "disk open matched existing cloud event — opening cloud copy",
+        matched.id,
+        eventNameFromPath(filePath),
+      );
+    }
+  }
+
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text) as unknown;
+    parsed = JSON.parse(effectiveText) as unknown;
   } catch {
     window.alert("Could not parse JSON file.");
     return;
@@ -1454,7 +1754,9 @@ export async function matbeastImportOpenedEventFile(opts: {
    * the caller does not pass this field, so behaviour is unchanged.
    */
   const overrideTrim =
-    typeof displayNameOverride === "string" ? displayNameOverride.trim() : "";
+    typeof effectiveDisplayNameOverride === "string"
+      ? effectiveDisplayNameOverride.trim()
+      : "";
   const eventName = overrideTrim ? overrideTrim : parsedEventName;
   /**
    * Prefer the envelope's `trainingMode` whenever it is a boolean so the
@@ -1538,6 +1840,34 @@ export async function matbeastImportOpenedEventFile(opts: {
   matbeastDebugLog("file:import", "syncBoardFileName", displayFile);
   await queryClient.invalidateQueries({ queryKey: matbeastKeys.all });
   await refreshTournaments();
+  if (bindCloudLinkAfterImport && effectiveCloudEventId) {
+    /**
+     * Bind the freshly-imported tournament to the existing cloud event.
+     * We imported the cloud bytes above, so local == cloud here; the
+     * second pull (with `tournamentId`) only upserts the `CloudEventLink`
+     * row and sets `baseVersion` to the cloud's current version. From now
+     * on, every save pushes into THIS event — no duplicate catalog entry.
+     */
+    await fetch("/api/cloud/events/pull", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        cloudEventId: effectiveCloudEventId,
+        tournamentId: j.id,
+      }),
+    }).catch(() => {});
+    window.dispatchEvent(
+      new CustomEvent("matbeast-cloud-sync-changed", {
+        detail: { tournamentId: j.id },
+      }),
+    );
+    matbeastDebugLog(
+      "file:import",
+      "bound disk-opened tab to cloud event",
+      effectiveCloudEventId,
+      j.id,
+    );
+  }
   /** Imported in-memory state is not yet written to disk from this session. */
   markTournamentDirty(j.id);
   matbeastDebugLog("file:import", "done");

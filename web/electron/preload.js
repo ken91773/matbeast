@@ -126,6 +126,9 @@ if (!contextBridge || !ipcRenderer) {
   /** Nudge `webContents.focus()` without requiring a window deactivation (fixes dead inputs after overlay/bracket work). */
   restoreWebKeyboardFocus: () =>
     ipcRenderer.invoke("app:restore-web-keyboard-focus"),
+  /** Escalation for the Windows dead-keyboard bug: blur+focus the window (Alt-Tab equivalent) when the soft nudge fails. */
+  hardRestoreWebKeyboardFocus: () =>
+    ipcRenderer.invoke("app:hard-restore-web-keyboard-focus"),
   checkForUpdates: () => ipcRenderer.invoke("app:check-for-updates"),
   checkForUpdatesWithDebug: () => ipcRenderer.invoke("app:check-for-updates-debug"),
   getRuntimeInfo: () => ipcRenderer.invoke("app:get-runtime-info"),

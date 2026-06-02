@@ -630,6 +630,41 @@ export default function BracketPanel({ embed = false }: { embed?: boolean }) {
       }
       return normalizeBracketPayload(j);
     },
+    /**
+     * Optimistic update: reflect the winner pick in the cache instantly so
+     * the click returns a result with zero latency. The PATCH (plus its
+     * undo snapshot and the background cloud autosync) runs after; the
+     * authoritative payload — including bracket advancement — lands in
+     * `onSuccess`. On failure we roll back to the pre-click bracket.
+     */
+    onMutate: async ({ matchId, winnerTeamId }) => {
+      const key = matbeastKeys.bracket(tournamentId);
+      await queryClient.cancelQueries({ queryKey: key });
+      const previous = queryClient.getQueryData<BracketPayload>(key);
+      if (previous) {
+        const applyWinner = (m: BracketMatchJson): BracketMatchJson => {
+          if (m.id !== matchId) return m;
+          const winnerTeam =
+            winnerTeamId === m.homeTeam.id
+              ? m.homeTeam
+              : winnerTeamId === m.awayTeam.id
+                ? m.awayTeam
+                : null;
+          return { ...m, winnerTeamId, winnerTeam };
+        };
+        queryClient.setQueryData<BracketPayload>(key, {
+          ...previous,
+          quarterFinals: previous.quarterFinals.map(applyWinner),
+          semiFinals: previous.semiFinals.map(applyWinner),
+          grandFinal: previous.grandFinal ? applyWinner(previous.grandFinal) : null,
+        });
+      }
+      return { previous };
+    },
+    onError: (_err, _vars, ctx) => {
+      const prev = (ctx as { previous?: BracketPayload } | undefined)?.previous;
+      if (prev) queryClient.setQueryData(matbeastKeys.bracket(tournamentId), prev);
+    },
     onSuccess: (payload) => {
       queryClient.setQueryData(matbeastKeys.bracket(tournamentId), payload);
       void queryClient.invalidateQueries({
@@ -660,6 +695,32 @@ export default function BracketPanel({ embed = false }: { embed?: boolean }) {
         throw new Error(j.error ?? "Could not update match teams");
       }
       return normalizeBracketPayload(j);
+    },
+    onMutate: async ({ matchId, homeTeamId, awayTeamId }) => {
+      const key = matbeastKeys.bracket(tournamentId);
+      await queryClient.cancelQueries({ queryKey: key });
+      const previous = queryClient.getQueryData<BracketPayload>(key);
+      const lookup = (id: string): TeamRef | null =>
+        teamOptions.find((t) => t.id === id) ?? null;
+      if (previous) {
+        const applyTeams = (m: BracketMatchJson): BracketMatchJson => {
+          if (m.id !== matchId) return m;
+          const home = lookup(homeTeamId) ?? m.homeTeam;
+          const away = lookup(awayTeamId) ?? m.awayTeam;
+          return { ...m, homeTeam: home, awayTeam: away };
+        };
+        queryClient.setQueryData<BracketPayload>(key, {
+          ...previous,
+          quarterFinals: previous.quarterFinals.map(applyTeams),
+          semiFinals: previous.semiFinals.map(applyTeams),
+          grandFinal: previous.grandFinal ? applyTeams(previous.grandFinal) : null,
+        });
+      }
+      return { previous };
+    },
+    onError: (_err, _vars, ctx) => {
+      const prev = (ctx as { previous?: BracketPayload } | undefined)?.previous;
+      if (prev) queryClient.setQueryData(matbeastKeys.bracket(tournamentId), prev);
     },
     onSuccess: (payload) => {
       queryClient.setQueryData(matbeastKeys.bracket(tournamentId), payload);

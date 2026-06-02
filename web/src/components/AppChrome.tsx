@@ -38,6 +38,8 @@ import type { BoardPayload } from "@/types/board";
 import packageJson from "../../package.json";
 import CloudSettingsModal from "@/components/CloudSettingsModal";
 import CloudSyncBadge from "@/components/CloudSyncBadge";
+import SyncPendingIndicator from "@/components/SyncPendingIndicator";
+import { installSyncCoordinator } from "@/lib/matbeast-sync-coordinator";
 
 const APP_VERSION = packageJson.version;
 
@@ -134,7 +136,11 @@ export default function AppChrome() {
   const [cloudSettingsOpen, setCloudSettingsOpen] = useState(false);
   const [audioOutputDevices, setAudioOutputDevices] = useState<MediaDeviceInfo[]>([]);
   const [audioOutputSelected, setAudioOutputSelected] = useState("default");
-  const [autoSaveEvery5Minutes, setAutoSaveEvery5Minutes] = useState(false);
+  // Legacy "Auto-save every 5 minutes" preference. Immediate autosync is
+  // now always on (see the change-driven autosave effect below), so the
+  // stored value is no longer read — we keep the setter only so the
+  // native menu / desktop-preferences plumbing stays intact.
+  const [, setAutoSaveEvery5Minutes] = useState(false);
   const [saveFeedbackText, setSaveFeedbackText] = useState<string | null>(null);
   const [saveFeedbackTone, setSaveFeedbackTone] = useState<"saving" | "saved" | "error">(
     "saving",
@@ -224,6 +230,15 @@ export default function AppChrome() {
     return () =>
       window.removeEventListener("matbeast-request-save", onRequestSave);
   }, [queryClient, selectTab]);
+
+  /**
+   * Background cloud-sync coordinator. Drains the durable "needs sync"
+   * queue for ALL linked events (not just the active tab) on startup,
+   * on reconnect, on focus/online, and on a backoff timer — so edits
+   * made while the cloud was unreachable always sync once it returns,
+   * and survive restarts. Idempotent install; cleans up on unmount.
+   */
+  useEffect(() => installSyncCoordinator(), []);
 
   /**
    * Pull the persisted auto-save preference on mount. The main process
@@ -403,7 +418,11 @@ export default function AppChrome() {
    * so they do not interrupt the UI or pop dialogs.
    */
   useEffect(() => {
-    if (!autoSaveEvery5Minutes || !ready || !tournamentId) return;
+    // Cloud is the source of truth and every change must sync
+    // immediately, so the change-driven autosave always runs (it is no
+    // longer gated behind the legacy "Auto-save every 5 minutes"
+    // preference). Saves are still coalesced through an in-flight lock.
+    if (!ready || !tournamentId) return;
 
     let inflight = false;
     let pendingAfterInflight = false;
@@ -445,7 +464,7 @@ export default function AppChrome() {
       cancelled = true;
       unsubscribe();
     };
-  }, [autoSaveEvery5Minutes, ready, tournamentId, queryClient, selectTab]);
+  }, [ready, tournamentId, queryClient, selectTab]);
 
   useEffect(() => {
     return () => {
@@ -1038,6 +1057,7 @@ export default function AppChrome() {
                         </span>
                       ) : null}
                       <CloudSyncBadge tournamentId={tournamentId} />
+                      <SyncPendingIndicator />
                       <button
                         type="button"
                         title="Undo (Ctrl+Z)"

@@ -1,6 +1,62 @@
 # Progress Log
 
 ## Current Build Status
+- **v1.2.22 (2026-06-02)** — Scoreboard Preview Monitor zoom-to-fill.
+  - **Fill-width preview.** The Scoreboard Preview Monitor now zooms the
+    16:9 overlay to fill the monitor width and crops the empty top/bottom
+    of the canvas (anchored on the scoreboard band) instead of
+    letterboxing the whole frame. Driven by a new `fit=cover` overlay
+    mode with an optional `focusY` vertical-anchor override.
+  - Bumped `web/package.json` to `1.2.22`.
+
+- **v1.2.21 (2026-06-02)** — Scoreboard Preview Monitor.
+  - **Window menu toggle.** A new "Scoreboard Preview Monitor" item under
+    the Window menu opens a borderless full-screen overlay preview on an
+    attached strip display (prefers ~1920×440). It mirrors the dashboard
+    Overlay card via the shared BroadcastChannel and follows the active
+    event, and repositions automatically when displays change.
+  - Bumped `web/package.json` to `1.2.21`.
+
+- **v1.2.20 (2026-06-01)** — cloud-as-truth sync, offline resilience,
+  sync-aware close, and input recovery.
+  - **Cloud is the source of truth.** Edits to a linked cloud event now
+    sync immediately to the original event instead of spawning a
+    duplicate local file. Bracket and most roster actions return
+    optimistically and sync in the background so the UI stays responsive.
+  - **Offline resilience.** A durable per-event sync queue, a global
+    background flush loop, instant reconnect triggers, an automatic local
+    backup safety net, a pending-sync UI indicator ("N changes pending •
+    Retry now"), and a reconnect conflict policy keep work safe and
+    editable while the cloud is unreachable.
+  - **Sync-aware close.** Closing the program/file with pending syncs now
+    prompts to "Wait for sync", "Save backup & close", or "Close without
+    syncing".
+  - **Input recovery.** A hard keyboard-routing recovery (Windows) fixes
+    the recurring case where an input field intermittently stops
+    accepting keystrokes.
+  - Bumped `web/package.json` to `1.2.20`.
+
+- **v1.2.19 (2026-05-31)** — OT WARN override support.
+  - **OT WARN overrides.** OT ROUND mode still defaults the WARN dropdown
+    to `10`, but operators can now override it to `30` or `CUS` while
+    the OT round remains active. The timer warning sound follows that
+    override instead of forcing the dropdown back to `10`.
+  - Bumped `web/package.json` to `1.2.19`.
+
+- **v1.2.18 (2026-05-31)** — OT WARN dropdown display.
+  - **OT WARN UI.** When an OT ROUND label is applied to the scoreboard,
+    the timer card's WARN dropdown now displays `10`, matching the
+    automatic OT round warning cue timing. Normal rounds still display
+    and use the saved WARN threshold, which defaults to `30`.
+  - Bumped `web/package.json` to `1.2.18`.
+
+- **v1.2.17 (2026-05-31)** — OT round warning cue timing.
+  - **OT round warning sound.** Normal matches continue to use the saved
+    WARN threshold, which defaults to 30 seconds, while OT ROUND modes now
+    force the automatic warning cue to fire at 10 seconds remaining.
+    Existing OFF behavior still disables the warning cue.
+  - Bumped `web/package.json` to `1.2.17`.
+
 - **v1.2.16 (2026-05-31)** — shorter REST timer.
   - **Timer REST preset.** The timer card's REST button now starts a
     30-second rest period instead of the previous 1:00 rest period,

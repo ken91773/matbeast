@@ -222,7 +222,12 @@ function rescueDeadKeyboardKeystroke(e: KeyboardEvent): void {
   if (e.ctrlKey || e.altKey || e.metaKey) return;
   if (e.isComposing) return;
   if (e.key.length !== 1) return;
-  if (isTextEditableElement(document.activeElement)) return;
+  if (isTextEditableElement(document.activeElement)) {
+    // Keys are reaching the focused field — the route is healthy. Record
+    // it so the stuck-input detector doesn't escalate on normal typing.
+    noteTypingActivity();
+    return;
+  }
   const target = lastClickedEditable?.deref();
   if (!target || !target.isConnected) return;
   matbeastFocusLog("dead-keystroke detected", {
@@ -238,7 +243,117 @@ function rescueDeadKeyboardKeystroke(e: KeyboardEvent): void {
   e.preventDefault();
   e.stopPropagation();
   insertPrintableKeyIntoTextEditable(target, e.key);
-  nudgeElectronWebContentsKeyboardRouting("dead-keystroke");
+  // A printable key landing outside the field is a *confirmed* detached
+  // keyboard route, so escalate straight to the Alt-Tab-equivalent
+  // recovery — the soft nudge already failed for this keystroke.
+  hardRecoverKeyboardRouting("dead-keystroke", target);
+}
+
+/**
+ * Strong escalation for the Windows "input is focused but keystrokes go
+ * nowhere until Alt-Tab" bug. The per-click soft nudge calls
+ * `webContents.focus()`, which is a no-op once Chromium's focus controller
+ * has desynced from the OS keyboard route. This asks the main process to
+ * blur + re-focus the window (the same activation cycle the user performs
+ * by Alt-Tabbing), then restores the caret to the field they were typing
+ * into. Throttled, and falls back to the soft nudge if the desktop bridge
+ * doesn't expose the hard path.
+ */
+let lastHardRecoverAt = 0;
+
+function hardRecoverKeyboardRouting(
+  source: string,
+  target?: HTMLElement | null,
+): void {
+  if (typeof window === "undefined") return;
+  const fn = window.matBeastDesktop?.hardRestoreWebKeyboardFocus;
+  if (typeof fn !== "function") {
+    nudgeElectronWebContentsKeyboardRouting(source);
+    return;
+  }
+  const now = Date.now();
+  if (now - lastHardRecoverAt < 900) {
+    matbeastFocusLog("hard-recover throttled", { source });
+    return;
+  }
+  lastHardRecoverAt = now;
+  const el = target ?? lastClickedEditable?.deref() ?? null;
+  matbeastFocusLog("hard-recover → hardRestoreWebKeyboardFocus()", {
+    source,
+    activeElement: activeElementHint(),
+  });
+  void fn()
+    .then(() => {
+      // The OS deactivate/activate cycle fires a DOM blur on the focused
+      // field; put the caret back so the user keeps typing seamlessly.
+      if (el && el.isConnected) {
+        try {
+          el.focus({ preventScroll: true });
+        } catch {
+          /* ignore */
+        }
+      }
+      matbeastFocusLog("hard-recover settled", {
+        source,
+        refocused: Boolean(el && el.isConnected),
+      });
+    })
+    .catch((err: unknown) => {
+      matbeastFocusLog("hard-recover rejected", {
+        source,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    });
+}
+
+/**
+ * Stuck-input detector. We can't observe the dead state directly when a
+ * field is visually focused but keys never reach the renderer (no keydown
+ * fires at all), so we infer it from behavior: the operator re-clicks the
+ * SAME field several times, deliberately (not a fast double-click for
+ * word-select, not field-to-field navigation), without any typing landing
+ * in between. That pattern is the signature of the dead-keyboard bug, so
+ * we escalate to the hard recovery. Any real typing resets the streak.
+ */
+let lastEditableEngageAt = 0;
+let lastEngagedEditable: WeakRef<HTMLElement> | null = null;
+let lastTypingActivityAt = 0;
+let deadReengageStreak = 0;
+
+function noteTypingActivity(): void {
+  lastTypingActivityAt = Date.now();
+  deadReengageStreak = 0;
+}
+
+function noteEditableEngagement(target: EventTarget | null): void {
+  if (!(target instanceof HTMLElement)) return;
+  const editable = target.closest(
+    "input, textarea, [contenteditable=''], [contenteditable='true']",
+  );
+  if (!(editable instanceof HTMLElement) || !isTextEditableElement(editable)) {
+    return;
+  }
+  const now = Date.now();
+  const prevEl = lastEngagedEditable?.deref() ?? null;
+  const sameEl = prevEl === editable;
+  const gap = now - lastEditableEngageAt;
+  const typedSincePrev = lastTypingActivityAt >= lastEditableEngageAt;
+  const deliberateReengage =
+    sameEl && gap > 350 && gap < 2500 && !typedSincePrev;
+  if (deliberateReengage) {
+    deadReengageStreak += 1;
+  } else {
+    deadReengageStreak = 0;
+  }
+  lastEditableEngageAt = now;
+  lastEngagedEditable = new WeakRef(editable);
+  if (deadReengageStreak >= 2) {
+    deadReengageStreak = 0;
+    matbeastFocusLog("dead-input streak → hard recover", {
+      element: `${editable.tagName}${editable.id ? `#${editable.id}` : ""}`,
+    });
+    hardRecoverKeyboardRouting("dead-input-reengage", editable);
+  }
 }
 
 let installed = false;
@@ -260,12 +375,26 @@ export function installMatbeastPanelPointerRecovery(): void {
   const onPointerDown = (e: Event) => {
     recover();
     rememberClickedEditable(e.target);
+    noteEditableEngagement(e.target);
     nudgeElectronWebContentsKeyboardRouting(e.type);
   };
 
   document.addEventListener("mousedown", onPointerDown, true);
   document.addEventListener("touchstart", onPointerDown, true);
   document.addEventListener("pointerdown", onPointerDown, true);
+
+  /**
+   * Any text actually landing in a field (typing, IME commit, paste)
+   * means the keyboard route is healthy — reset the stuck-input streak so
+   * the detector never escalates during normal editing.
+   */
+  document.addEventListener(
+    "input",
+    () => {
+      noteTypingActivity();
+    },
+    true,
+  );
 
   /**
    * Native `<select>` dropdowns on Windows show an OS-level popup that
@@ -308,6 +437,7 @@ export function installMatbeastPanelPointerRecovery(): void {
       if (!isLikelyEditableInteractionTarget(e.target)) return;
       recover();
       rememberClickedEditable(e.target);
+      noteEditableEngagement(e.target);
       nudgeElectronWebContentsKeyboardRouting(e.type);
     },
     true,

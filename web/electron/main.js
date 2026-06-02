@@ -260,9 +260,20 @@ let githubUpdateConfig = null;
 let mainWindow = null;
 let scoreboardOverlayWindow = null;
 let bracketOverlayWindow = null;
+/**
+ * Optional borderless preview window mirrored onto an attached strip
+ * monitor (e.g. a 1920×440 display). Shows the same `/overlay?preview=1`
+ * surface as the dashboard Overlay card, scaled to fit while preserving
+ * the 16:9 aspect ratio. Toggled from the Window menu.
+ */
+let scoreboardPreviewMonitorWindow = null;
 let overlayTournamentId = null;
 function closeOverlayWindows() {
-  const wins = [scoreboardOverlayWindow, bracketOverlayWindow];
+  const wins = [
+    scoreboardOverlayWindow,
+    bracketOverlayWindow,
+    scoreboardPreviewMonitorWindow,
+  ];
   for (const win of wins) {
     if (!win || win.isDestroyed()) continue;
     try {
@@ -273,6 +284,7 @@ function closeOverlayWindows() {
   }
   scoreboardOverlayWindow = null;
   bracketOverlayWindow = null;
+  scoreboardPreviewMonitorWindow = null;
 }
 /** Production default: keep scoreboard + bracket output windows enabled. */
 const ENABLE_BRACKET_OVERLAY_WINDOW = true;
@@ -1885,53 +1897,153 @@ function attachMainWindowCloseConfirm(win) {
   win.on("close", async (e) => {
     if (win._matbeastQuitAllowClose || win.isDestroyed()) return;
     e.preventDefault();
+
+    // Probe the renderer for unsynced state: either dirty open tabs
+    // (edits not yet pushed) OR linked events still queued for the
+    // background sync coordinator. The app is local-first, so the data
+    // is always safe in SQLite — the only question is whether the cloud
+    // copy has caught up yet.
     let dirty = false;
+    let pending = 0;
     try {
-      dirty = Boolean(
-        await win.webContents.executeJavaScript(
-          "Boolean(window.__MATBEAST_HAS_UNSAVED_CHANGES__)",
-          true,
-        ),
+      const probe = await win.webContents.executeJavaScript(
+        "({ dirty: Boolean(window.__MATBEAST_HAS_UNSAVED_CHANGES__), pending: Number(window.__MATBEAST_PENDING_SYNC_COUNT__ || 0) })",
+        true,
       );
+      dirty = Boolean(probe && probe.dirty);
+      pending = Number((probe && probe.pending) || 0);
     } catch {
       dirty = false;
+      pending = 0;
     }
-    if (!dirty) {
+
+    if (!dirty && pending <= 0) {
       win._matbeastQuitAllowClose = true;
       win.close();
       return;
     }
+
     const r = await dialog.showMessageBox(win, {
       type: "question",
-      buttons: ["Save", "Don't Save", "Cancel"],
+      buttons: [
+        "Wait for sync",
+        "Save backup & close",
+        "Close without syncing",
+        "Cancel",
+      ],
+      defaultId: 0,
+      cancelId: 3,
+      noLink: true,
+      title: "Mat Beast Scoreboard",
+      message: "Changes are still syncing to the cloud",
+      detail:
+        "Some edits haven't finished syncing to the cloud yet. Your changes " +
+        "are saved on this computer and will sync automatically the next " +
+        "time the app can reach the cloud.\n\n" +
+        "Wait for the sync to finish, save a local backup file first, or " +
+        "close now without waiting?",
+    });
+    if (r.response === 3) return; // Cancel — keep the window open.
+    if (r.response === 2) {
+      // Close without syncing — edits remain safe locally and will sync
+      // on next launch.
+      win._matbeastQuitAllowClose = true;
+      win.close();
+      return;
+    }
+    if (r.response === 1) {
+      // Save a local .matb backup of every dirty tab, then close.
+      if (await runBackupBeforeClose(win)) {
+        win._matbeastQuitAllowClose = true;
+        win.close();
+      }
+      return;
+    }
+
+    // Wait for sync: push dirty tabs + drain the pending queue once.
+    let result = { synced: false, remaining: pending };
+    try {
+      result = await win.webContents.executeJavaScript(
+        "window.__MATBEAST_FLUSH_PENDING_SYNC__ ? window.__MATBEAST_FLUSH_PENDING_SYNC__() : Promise.resolve({ synced: true, remaining: 0 })",
+        true,
+      );
+    } catch {
+      result = { synced: false, remaining: pending };
+    }
+    if (win.isDestroyed()) return;
+    if (result && result.synced) {
+      win._matbeastQuitAllowClose = true;
+      win.close();
+      return;
+    }
+
+    // Still pending — almost always means the cloud is unreachable.
+    const remaining = result && result.remaining ? result.remaining : null;
+    const r2 = await dialog.showMessageBox(win, {
+      type: "warning",
+      buttons: ["Save backup & close", "Close without syncing", "Cancel"],
       defaultId: 0,
       cancelId: 2,
       noLink: true,
       title: "Mat Beast Scoreboard",
-      message: "Save changes before closing?",
+      message: "Sync couldn't be completed",
+      detail:
+        "The cloud still can't be reached, so " +
+        (remaining ? `${remaining} change(s)` : "your changes") +
+        " haven't synced yet. They're saved on this computer and will sync " +
+        "automatically the next time you're online.\n\n" +
+        "Save a local backup file before closing, or close now?",
     });
-    if (r.response === 2) return;
-    if (r.response === 1) {
-      win._matbeastQuitAllowClose = true;
-      win.close();
+    if (win.isDestroyed()) return;
+    if (r2.response === 2) return; // Cancel — keep the window open.
+    if (r2.response === 0) {
+      if (await runBackupBeforeClose(win)) {
+        win._matbeastQuitAllowClose = true;
+        win.close();
+      }
       return;
     }
-    let saved = false;
-    try {
-      saved = Boolean(
-        await win.webContents.executeJavaScript(
-          "window.__MATBEAST_SAVE_BEFORE_QUIT__ ? window.__MATBEAST_SAVE_BEFORE_QUIT__() : Promise.resolve(false)",
-          true,
-        ),
-      );
-    } catch {
-      saved = false;
-    }
-    if (saved) {
-      win._matbeastQuitAllowClose = true;
-      win.close();
-    }
+    // Close without syncing.
+    win._matbeastQuitAllowClose = true;
+    win.close();
   });
+}
+
+/**
+ * Writes a local `.matb` backup of every dirty open tab via the renderer,
+ * then reports whether it's safe to close. On failure the user is shown an
+ * error and can choose to close anyway (data is still safe in SQLite) or
+ * cancel — returns true only when the window should proceed to close.
+ */
+async function runBackupBeforeClose(win) {
+  let res = { ok: false, count: 0 };
+  try {
+    res = await win.webContents.executeJavaScript(
+      "window.__MATBEAST_BACKUP_BEFORE_QUIT__ ? window.__MATBEAST_BACKUP_BEFORE_QUIT__() : Promise.resolve({ ok: false, count: 0, lastError: 'backup unavailable' })",
+      true,
+    );
+  } catch (err) {
+    res = { ok: false, count: 0, lastError: String((err && err.message) || err) };
+  }
+  if (win.isDestroyed()) return false;
+  if (res && res.ok) return true;
+
+  const fail = await dialog.showMessageBox(win, {
+    type: "warning",
+    buttons: ["Close anyway", "Cancel"],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+    title: "Mat Beast Scoreboard",
+    message: "Couldn't save the local backup",
+    detail:
+      ((res && res.lastError) ||
+        "The backup file couldn't be written.") +
+      "\n\nYour changes are still saved on this computer and will sync " +
+      "automatically next time you're online. Close anyway?",
+  });
+  if (win.isDestroyed()) return false;
+  return fail.response === 0;
 }
 
 /**
@@ -1962,6 +2074,58 @@ function forceMainWebContentsKeyboardFocus() {
       /* ignore */
     }
   });
+}
+
+let hardKeyboardRecoveryInFlight = false;
+
+/**
+ * Strong, Alt-Tab-equivalent recovery for the Windows "dead keyboard in a
+ * foreground window" bug. The soft path ({@link forceMainWebContentsKeyboardFocus},
+ * fired on every interaction) repeatedly calls `webContents.focus()`, but
+ * that sometimes does nothing because Chromium's focus controller already
+ * believes the web view is focused while the OS keyboard route is detached —
+ * exactly the state the operator currently clears by Alt-Tabbing away and
+ * back. `webContents.focus()` is a no-op in that desynced state.
+ *
+ * Here we replicate the Alt-Tab activation cycle the user knows works:
+ * blur the BrowserWindow (OS HWND deactivate) then immediately focus it
+ * again (SetForegroundWindow), and rebind the renderer afterward. This is
+ * deliberately an *escalation only* — the renderer calls it when it detects
+ * it is still stuck after the soft nudges — because the deactivate/activate
+ * fires a DOM blur on the focused field and briefly toggles the title-bar
+ * active state, which we don't want on every click.
+ */
+function hardRecoverMainWindowKeyboardFocus() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (process.platform !== "win32") {
+    // Only Windows exhibits the detached-keyboard-route bug; elsewhere a
+    // soft re-focus is sufficient and avoids needless z-order churn.
+    forceMainWebContentsKeyboardFocus();
+    return;
+  }
+  if (hardKeyboardRecoveryInFlight) return;
+  hardKeyboardRecoveryInFlight = true;
+  try {
+    // Deactivate then reactivate the HWND so Windows + Chromium rebuild the
+    // keyboard route into the renderer (what Alt-Tab does for the user).
+    mainWindow.blur();
+    mainWindow.focus();
+  } catch {
+    /* ignore */
+  }
+  setImmediate(() => {
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.focus();
+      }
+    } catch {
+      /* ignore */
+    }
+  });
+  // Cooldown so a burst of renderer escalations can't thrash the window.
+  setTimeout(() => {
+    hardKeyboardRecoveryInFlight = false;
+  }, 300);
 }
 
 function createMainWindow() {
@@ -2313,6 +2477,144 @@ function createOverlayWindows() {
   if (ENABLE_BRACKET_OVERLAY_WINDOW) {
     createOverlayWindowForRole("bracket");
   }
+}
+
+/**
+ * Choose the display for the Scoreboard Preview Monitor. Prefer an attached
+ * ~1920×440 strip monitor (the intended hardware); if none is found, fall
+ * back to the first non-primary (external) display, then the primary.
+ */
+function pickScoreboardPreviewMonitorDisplay() {
+  try {
+    const displays = screen.getAllDisplays();
+    const primary = screen.getPrimaryDisplay();
+    const isStrip = (d) =>
+      Math.abs(d.bounds.width - 1920) <= 8 && Math.abs(d.bounds.height - 440) <= 8;
+    const strip = displays.find(isStrip);
+    if (strip) return strip;
+    const external = displays.find((d) => d.id !== primary.id);
+    return external ?? primary;
+  } catch {
+    return screen.getPrimaryDisplay();
+  }
+}
+
+function isScoreboardPreviewMonitorOpen() {
+  return Boolean(
+    scoreboardPreviewMonitorWindow &&
+      !scoreboardPreviewMonitorWindow.isDestroyed(),
+  );
+}
+
+/**
+ * Snap the preview monitor window to its target display's full bounds and
+ * (re)enter borderless fullscreen so it fills the strip monitor edge to
+ * edge. The overlay page's own fit logic (`window.innerWidth/Height`)
+ * scales the 16:9 stage to the new size while preserving aspect ratio.
+ */
+function snapPreviewMonitorToDisplay() {
+  const win = scoreboardPreviewMonitorWindow;
+  if (!win || win.isDestroyed()) return;
+  const display = pickScoreboardPreviewMonitorDisplay();
+  const b = display.bounds;
+  try {
+    if (win.isFullScreen()) win.setFullScreen(false);
+    win.setBounds({ x: b.x, y: b.y, width: b.width, height: b.height });
+    win.setFullScreen(true);
+  } catch {
+    /* ignore */
+  }
+}
+
+function openScoreboardPreviewMonitor() {
+  if (isScoreboardPreviewMonitorOpen()) {
+    scoreboardPreviewMonitorWindow.show();
+    scoreboardPreviewMonitorWindow.focus();
+    return;
+  }
+
+  const display = pickScoreboardPreviewMonitorDisplay();
+  const b = display.bounds;
+  const win = new BrowserWindow({
+    title: "Mat Beast — Scoreboard Preview Monitor",
+    icon: appIconPath,
+    x: b.x,
+    y: b.y,
+    width: b.width,
+    height: b.height,
+    frame: false,
+    backgroundColor: "#000000",
+    autoHideMenuBar: true,
+    fullscreenable: true,
+    show: false,
+    skipTaskbar: false,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      backgroundThrottling: false,
+      autoplayPolicy: "no-user-gesture-required",
+    },
+  });
+  win.removeMenu();
+
+  /**
+   * Load the same surface as the dashboard Overlay card
+   * (`/overlay?preview=1`). Scene (scoreboard ↔ bracket) and LIVE/STOPPED
+   * state arrive via the shared BroadcastChannel, which works across
+   * same-origin Electron windows, so this mirror stays in lock-step with
+   * the card without any extra wiring. The active-event id is seeded from
+   * the URL and kept current through the `overlay:set-tournament-id` push
+   * below.
+   */
+  const qs = new URLSearchParams({ preview: "1", fit: "cover" });
+  if (overlayTournamentId) qs.set("tournamentId", overlayTournamentId);
+  win.loadURL(`${appUrl}/overlay?${qs.toString()}`, {
+    extraHeaders: "pragma: no-cache\r\nCache-Control: no-cache\r\n",
+  });
+
+  win.webContents.on("page-title-updated", (event) => {
+    event.preventDefault();
+    if (!win.isDestroyed()) {
+      win.setTitle("Mat Beast — Scoreboard Preview Monitor");
+    }
+  });
+
+  scoreboardPreviewMonitorWindow = win;
+
+  win.once("ready-to-show", () => {
+    if (win.isDestroyed()) return;
+    snapPreviewMonitorToDisplay();
+    win.show();
+    // Keep the operator's dashboard visually in front.
+    ensureMainWindowOnTop();
+  });
+
+  win.on("closed", () => {
+    scoreboardPreviewMonitorWindow = null;
+    refreshApplicationMenu();
+  });
+}
+
+function closeScoreboardPreviewMonitor() {
+  const win = scoreboardPreviewMonitorWindow;
+  scoreboardPreviewMonitorWindow = null;
+  if (win && !win.isDestroyed()) {
+    try {
+      win.close();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function toggleScoreboardPreviewMonitor() {
+  if (isScoreboardPreviewMonitorOpen()) {
+    closeScoreboardPreviewMonitor();
+  } else {
+    openScoreboardPreviewMonitor();
+  }
+  refreshApplicationMenu();
 }
 
 /**
@@ -2923,6 +3225,21 @@ function buildMenuTemplate() {
           },
         },
         { type: "separator" },
+        {
+          /**
+           * Mirror the scoreboard overlay preview onto an attached strip
+           * monitor (e.g. 1920×440), borderless-fullscreen and scaled to
+           * fit while preserving the 16:9 aspect ratio. Toggle: checked
+           * while the preview monitor window is open.
+           */
+          label: "Scoreboard Preview Monitor",
+          type: "checkbox",
+          checked: isScoreboardPreviewMonitorOpen(),
+          click: () => {
+            toggleScoreboardPreviewMonitor();
+          },
+        },
+        { type: "separator" },
         { role: "minimize" },
         { role: "zoom" },
         { role: "togglefullscreen" },
@@ -3269,7 +3586,12 @@ if (!gotSingleInstanceLock) {
   });
 
   try {
-    const onScreensChanged = () => scheduleRepositionOverlayOutputs();
+    const onScreensChanged = () => {
+      scheduleRepositionOverlayOutputs();
+      // Re-snap the preview monitor in case the strip display was added,
+      // removed, or had its resolution/position changed.
+      if (isScoreboardPreviewMonitorOpen()) snapPreviewMonitorToDisplay();
+    };
     screen.on("display-metrics-changed", onScreensChanged);
     screen.on("display-added", onScreensChanged);
     screen.on("display-removed", onScreensChanged);
@@ -3298,6 +3620,7 @@ if (!gotSingleInstanceLock) {
     };
     updateWindow(scoreboardOverlayWindow, "scoreboard");
     updateWindow(bracketOverlayWindow, "bracket");
+    updateWindow(scoreboardPreviewMonitorWindow, "preview-monitor");
     return { ok: true };
   });
   ipcMain.handle("overlay:capture-preview", async (_event, payload) => {
@@ -3634,6 +3957,15 @@ if (!gotSingleInstanceLock) {
   ipcMain.handle("app:restore-web-keyboard-focus", async () => {
     try {
       forceMainWebContentsKeyboardFocus();
+    } catch {
+      /* ignore */
+    }
+    return { ok: true };
+  });
+
+  ipcMain.handle("app:hard-restore-web-keyboard-focus", async () => {
+    try {
+      hardRecoverMainWindowKeyboardFocus();
     } catch {
       /* ignore */
     }

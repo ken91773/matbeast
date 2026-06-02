@@ -39,6 +39,7 @@ import {
   RIGHT_PLAYER_STRIP,
   RIGHT_SILHOUETTE_ICONS,
   RIGHT_TEAM_STRIP,
+  SCOREBOARD_VIEWBOX,
   silhouetteSlotCenterLeftFrac,
   silhouetteSlotCenterRightFrac,
   vbRectToPercentStyle,
@@ -61,6 +62,22 @@ import { type CSSProperties, useEffect, useMemo, useState } from "react";
 
 const W = 1920;
 const H = 1080;
+
+/**
+ * Vertical center (fraction of the 1080 native canvas) of the visible
+ * scoreboard graphic band. Derived from the dynamic-text regions so it
+ * tracks the layout: top of the player-name strips → bottom of the
+ * silhouette icon row. Used by the `fit=cover` preview-monitor mode to
+ * fill the screen width and crop the empty top/bottom of the 16:9 canvas
+ * while keeping the scoreboard bar vertically anchored.
+ */
+const SCOREBOARD_BAND_TOP_VB = LEFT_PLAYER_STRIP.y;
+const SCOREBOARD_BAND_BOTTOM_VB =
+  LEFT_SILHOUETTE_ICONS.y + LEFT_SILHOUETTE_ICONS.height;
+const SCOREBOARD_BAND_FOCUS_Y =
+  (SCOREBOARD_BAND_TOP_VB + SCOREBOARD_BAND_BOTTOM_VB) /
+  2 /
+  SCOREBOARD_VIEWBOX.height;
 const OVERLAY_FONT_STACK = '"Bebas Neue", system-ui, sans-serif';
 
 /** 1920×1080 native art: convert pixel bbox to percent strings for absolute layout. */
@@ -188,6 +205,19 @@ export default function OverlayClient() {
   const previewSceneParam = searchParams.get("previewScene");
   const forcePreviewLive = searchParams.get("forcePreviewLive") === "1";
   const disableBarnDoor = searchParams.get("disableBarnDoor") === "1";
+  /**
+   * Preview-monitor zoom: `fit=cover` fills the window width and crops the
+   * empty top/bottom of the 16:9 canvas (used by the Scoreboard Preview
+   * Monitor on a short/wide display like 1920×440). Default `contain`
+   * keeps the existing letterboxed whole-frame preview. `focusY` (0–1)
+   * overrides the vertical anchor of the crop.
+   */
+  const fitMode = searchParams.get("fit") === "cover" ? "cover" : "contain";
+  const focusYFrac = (() => {
+    const raw = Number.parseFloat(searchParams.get("focusY") ?? "");
+    if (Number.isFinite(raw)) return Math.min(1, Math.max(0, raw));
+    return SCOREBOARD_BAND_FOCUS_Y;
+  })();
   /** Electron output windows: fixed scene; never follow dashboard `postOverlayScene` broadcast. */
   const lockedOutputScene = useMemo((): OverlayScene | null => {
     if (isPreview) return null;
@@ -397,7 +427,7 @@ export default function OverlayClient() {
     board?.secondsRemaining,
     ndiTimerAudioResetKey,
     board?.sound10Enabled,
-    board?.soundWarningSeconds,
+    board?.timerOtRoundMode ? 10 : board?.soundWarningSeconds,
     board?.sound0Enabled,
     board?.timerRestMode,
     board?.sound10PlayNonce,
@@ -964,14 +994,19 @@ export default function OverlayClient() {
     function fit() {
       const sx = window.innerWidth / W;
       const sy = window.innerHeight / H;
-      const s = Math.min(sx, sy);
+      /**
+       * `cover` fills the whole window (crop overflow, keep aspect) so the
+       * scoreboard bar spans the full screen width on a short/wide monitor;
+       * `contain` letterboxes the whole 16:9 frame (default preview).
+       */
+      const s = fitMode === "cover" ? Math.max(sx, sy) : Math.min(sx, sy);
       /** Avoid scale(0) / NaN on odd first paints (Electron/OBS) which hides all overlay text. */
       setScale(Number.isFinite(s) && s > 0 ? s : 1);
     }
     fit();
     window.addEventListener("resize", fit);
     return () => window.removeEventListener("resize", fit);
-  }, []);
+  }, [fitMode]);
 
   useEffect(() => {
     if (isPreview) return;
@@ -1008,6 +1043,7 @@ export default function OverlayClient() {
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
+        overflow: "hidden",
         backgroundColor: isPreview ? "#52525b" : OVERLAY_OUTPUT_CHROME_BG,
         /**
          * Inset teal frame is operator-confidence-only — broadcast viewers
@@ -1025,7 +1061,10 @@ export default function OverlayClient() {
           width: W,
           height: H,
           overflow: isPreview ? "hidden" : "visible",
-          transform: `scale(${scale})`,
+          transform:
+            fitMode === "cover"
+              ? `scale(${scale}) translateY(${H / 2 - focusYFrac * H}px)`
+              : `scale(${scale})`,
           transformOrigin: "center center",
           backgroundColor: isPreview ? "#52525b" : OVERLAY_OUTPUT_CHROME_BG,
         }}

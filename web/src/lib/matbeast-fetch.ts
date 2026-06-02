@@ -175,13 +175,61 @@ function appendClientTrainingMastersHeader(headers: Headers): void {
   }
 }
 
+/**
+ * Board (`/api/board`) command types that change *persisted* event data —
+ * i.e. the final, recorded match results that live in the saved file.
+ * Every other board mutation (timer, scoring, overlay toggles, sound
+ * cues, OT controls, round label, etc.) is a LIVE broadcast control that
+ * must NOT be saved or synced. Keeping these live actions out of the
+ * dirty set means they never trigger the (now always-on) cloud autosync,
+ * so the scoreboard controls stay latency-free.
+ */
+const PERSISTENT_BOARD_COMMAND_TYPES = new Set<string>([
+  "final_save",
+  "final_unsave",
+  "result_log_manual_add",
+  "result_log_delete",
+]);
+
+/**
+ * True when a `/api/board` mutation is a live broadcast control (anything
+ * other than recording/editing a final result). Live controls are
+ * deliberately excluded from dirty-marking so they don't fire an autosave.
+ * Any board mutation we can't classify is treated as live (fail-safe: a
+ * live control firing an extra sync is the bug we're avoiding).
+ */
+function isLiveOnlyBoardRequest(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): boolean {
+  const url = String(input);
+  if (!url.startsWith("/api/board")) return false;
+  try {
+    const body = init?.body;
+    if (typeof body !== "string") return true;
+    const parsed = JSON.parse(body) as { command?: { type?: unknown } };
+    const type = parsed?.command?.type;
+    if (typeof type === "string" && PERSISTENT_BOARD_COMMAND_TYPES.has(type)) {
+      return false;
+    }
+    return true;
+  } catch {
+    return true;
+  }
+}
+
 /** Fetch with active tournament header (for API routes that scope by event file). */
 export function matbeastFetch(
   input: RequestInfo | URL,
   init?: RequestInit,
 ): Promise<Response> {
   return (async () => {
-    if (shouldCaptureUndo(input, init)) {
+    // Live scoreboard controls (timer/scoring/overlay/sound/OT/round
+    // label) take a fast path: they skip both the undo snapshot (3
+    // blocking GETs) and dirty-marking, so they fire immediately and
+    // never trigger the always-on cloud autosync. Only persistent roster
+    // and recorded-result changes capture undo + sync.
+    if (shouldCaptureUndo(input, init) && !isLiveOnlyBoardRequest(input, init)) {
       await captureDashboardUndoSnapshot();
       const tid = getMatBeastTournamentId();
       if (tid) markTournamentDirty(tid);
