@@ -1,6 +1,15 @@
 # Progress Log
 
 ## Current Build Status
+- **v2.0.22 (2026-06-10)** — NDI scoreboard + bracket feeds auto-start on event open.
+  Opening an event now starts both NDI sources automatically (no need to toggle them
+  from the menu each session). Implemented in the main process: new quiet
+  `autoStartNdiFeedsForEvent()` (no dialogs, skips a scene already broadcasting, no-op
+  until the bundled server URL is ready) fired from the `overlay:set-tournament-id`
+  no-event → event transition (also covers an event restored on launch). Manual
+  NDI menu Start/Stop is unaffected, and auto-start only fires on the transition so a
+  manual stop while the event stays open isn't immediately undone. (`electron/main.js`.)
+  Built + published.
 - **v2.0.21 (2026-06-10)** — Fix: full screen triggered on a bare "F".
   The Window ▸ Full Screen menu item registered a single-letter Electron
   accelerator (`CmdOrControl+F`), which on Windows could fire on a plain "F"

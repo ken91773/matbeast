@@ -2923,9 +2923,10 @@ async function runNdiOffscreenSmokeTest() {
  * item until v0.9.30). Surfaces success/failure via a dialog so the
  * operator gets immediate feedback in NDI Studio Monitor or vMix.
  *
- * Called from the menu and (in v0.9.30+) from auto-start at boot when
- * `desktopPreferences.ndiAutoStart[scene]` is true. Today no auto-start —
- * operator toggles each session manually.
+ * Called from the NDI menu (manual Start/Stop). Feeds now also auto-start
+ * when an event is opened — see {@link autoStartNdiFeedsForEvent}, wired to
+ * the `overlay:set-tournament-id` no-event → event transition. This toggle
+ * remains the manual override for either scene.
  */
 async function toggleNdiFeed(scene) {
   if (!appUrl) {
@@ -2995,6 +2996,42 @@ async function toggleNdiFeed(scene) {
           : ""),
       buttons: ["OK"],
     });
+  }
+}
+
+/**
+ * Auto-start both NDI feeds (scoreboard + bracket) when an event becomes
+ * active, per operator request ("NDI should automatically start upon opening
+ * the event"). Quiet by design: no dialogs, idempotent (skips a scene that's
+ * already broadcasting), and a no-op until the bundled server URL is ready.
+ * Manual Start/Stop from the NDI menu still works — this only fires on the
+ * no-event → event transition (see the `overlay:set-tournament-id` handler),
+ * so a manual stop while an event stays open is not immediately undone.
+ */
+async function autoStartNdiFeedsForEvent() {
+  if (!appUrl) return;
+  const log = (line) => appendUpdaterLog(`${nowIso()}  ${line}\n`);
+  const preloadPath = path.join(__dirname, "preload.js");
+  let startedAny = false;
+  for (const scene of ["scoreboard", "bracket"]) {
+    if (ndiFeed.isFeedRunning(scene)) continue;
+    try {
+      const result = await ndiFeed.startNdiFeed({
+        scene,
+        appUrl,
+        preloadPath,
+        userDataDir: app.getPath("userData"),
+        onLog: log,
+      });
+      log(`ndi-feed: auto-start ${scene} result ${JSON.stringify(result)}`);
+      if (result && result.ok) startedAny = true;
+    } catch (err) {
+      log(`ndi-feed: auto-start ${scene} error ${String(err?.message || err)}`);
+    }
+  }
+  if (startedAny) {
+    refreshApplicationMenu();
+    broadcastNdiState();
   }
 }
 
@@ -3867,7 +3904,13 @@ if (!gotSingleInstanceLock) {
     if (nextId === overlayTournamentId) {
       return { ok: true };
     }
+    const prevId = overlayTournamentId;
     overlayTournamentId = nextId;
+    // Opening an event (no active event → active event) auto-starts the NDI
+    // feeds. Idempotent + dialog-free; manual menu Start/Stop is unaffected.
+    if (nextId && !prevId) {
+      void autoStartNdiFeedsForEvent();
+    }
     const updateWindow = (win, role) => {
       if (!win || win.isDestroyed()) return;
       const payloadJson = JSON.stringify({
