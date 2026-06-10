@@ -19,6 +19,11 @@ import {
   registerOpenEventFilePath,
 } from "@/lib/matbeast-open-file-registry";
 import { getEventDiskPath, setEventDiskPath } from "@/lib/matbeast-disk-path";
+import {
+  getLocalBackupFilePath,
+  markLocalBackupClean,
+  setLocalBackupFilePath,
+} from "@/lib/matbeast-local-backup";
 import { markTournamentClean, markTournamentDirty } from "@/lib/matbeast-document-dirty";
 import { matbeastKeys } from "@/lib/matbeast-query-keys";
 import type { QueryClient } from "@tanstack/react-query";
@@ -1377,6 +1382,14 @@ export async function matbeastCreateNewEventTab(opts: {
   filename?: string;
   /** Training event files use the separate TrainingMaster* lists. */
   trainingMode?: boolean;
+  /**
+   * Offline mode: when the cloud is unreachable, create the event
+   * LOCAL-ONLY instead of blocking. The downstream auto-link upload in
+   * the save pipeline (and the reconnect-retry save) will push it to the
+   * cloud once the connection returns. Used by the home page's "Create
+   * offline event" flow when launch-time cloud probing failed.
+   */
+  allowOffline?: boolean;
 }) {
   const {
     queryClient,
@@ -1386,6 +1399,7 @@ export async function matbeastCreateNewEventTab(opts: {
     eventName: requestedEventName,
     filename: requestedFilename,
     trainingMode: requestedTrainingMode,
+    allowOffline,
   } = opts;
 
   /**
@@ -1406,12 +1420,20 @@ export async function matbeastCreateNewEventTab(opts: {
   if (!demoMode) {
     const probed = await probeCloud();
     if (!probed.online && probed.reason !== "not-configured") {
-      window.alert(
-        "Can't reach the cloud right now, so a new event can't be created. " +
-          "Check your internet connection and try again. Your existing open " +
-          "events will keep working and re-sync when the connection returns.",
-      );
-      return { ok: false } as const;
+      // Cloud is configured but unreachable. By default we block (a new
+      // event created now would never reach the shared catalog, which is
+      // confusing on the receiving end). When the caller explicitly opts
+      // into offline mode, proceed LOCAL-ONLY instead: the auto-link
+      // upload on the next successful save (e.g. the reconnect-retry) will
+      // push it to the cloud once the connection returns.
+      if (!allowOffline) {
+        window.alert(
+          "Can't reach the cloud right now, so a new event can't be created. " +
+            "Check your internet connection and try again. Your existing open " +
+            "events will keep working and re-sync when the connection returns.",
+        );
+        return { ok: false } as const;
+      }
     }
   }
 
@@ -1835,6 +1857,11 @@ export async function matbeastImportOpenedEventFile(opts: {
   }
   setEventDiskPath(fileKey, filePath);
   registerOpenEventFilePath(j.id, filePath);
+  // The freshly-imported tournament matches the file it came from, so its
+  // local backup is up to date and bound to this path. (A later edit marks
+  // it dirty again via matbeast-fetch.)
+  setLocalBackupFilePath(j.id, filePath);
+  markLocalBackupClean(j.id);
   const displayFile = eventNameFromPath(filePath);
   await syncBoardFileName(queryClient, displayFile, j.id);
   matbeastDebugLog("file:import", "syncBoardFileName", displayFile);
@@ -1945,6 +1972,88 @@ export async function matbeastBackupTabByIdToDisk(opts: {
   return true;
 }
 
+/**
+ * Close-time local backup: write a tab's current state to its `.matb` file.
+ *
+ *  - If the event already has a known local file path, overwrite it in place
+ *    (no picker) — this is the "save changes to the local backup file" path.
+ *  - Otherwise show the native Save dialog so the user can pick where to back
+ *    it up, and remember that path for next time.
+ *
+ * On success the event's local-backup-dirty flag is cleared. Returns
+ * `cancelled: true` when the user dismissed the Save dialog (so the caller
+ * can keep its close prompt open instead of treating it as a hard failure).
+ */
+export async function matbeastSaveTabToLocalFile(opts: {
+  queryClient: QueryClient;
+  selectTab: (id: string) => void;
+  getOpenTabs: () => EventTab[];
+  tabId: string;
+}): Promise<{ ok: boolean; filePath?: string; cancelled?: boolean }> {
+  const { queryClient, selectTab, getOpenTabs, tabId } = opts;
+  // Envelope is built from the active tournament context server-side.
+  selectTab(tabId);
+  await new Promise<void>((r) => setTimeout(r, 60));
+
+  const tabMeta = getOpenTabs().find((t) => t.id === tabId);
+  const eventTitle = (tabMeta?.name ?? "Untitled event").trim();
+  let rosterFileName = "UNTITLED";
+  try {
+    const boardRes = await matbeastFetch("/api/board");
+    if (boardRes.ok) {
+      const b = (await boardRes.json()) as { currentRosterFileName?: string };
+      rosterFileName = b.currentRosterFileName?.trim() || "UNTITLED";
+    }
+  } catch {
+    /* keep UNTITLED */
+  }
+  const { text, defaultFile } = await buildEnvelopeText({
+    eventTitle,
+    rosterFileName,
+  });
+
+  const desk = typeof window !== "undefined" ? window.matBeastDesktop : undefined;
+  if (!desk?.writeTextFile) {
+    // Browser fallback: trigger a download.
+    downloadEventFile(defaultFile, text);
+    markLocalBackupClean(tabId);
+    return { ok: true };
+  }
+
+  // Prefer the tracked original-cased path; fall back to the disk-path
+  // registry keyed by the saved filename.
+  const fileKeyForLookup =
+    normalizeEventFileKey(rosterFileName) ?? tabId;
+  let targetPath =
+    getLocalBackupFilePath(tabId) ??
+    getEventDiskPath(fileKeyForLookup, tabId);
+
+  if (!targetPath) {
+    if (!desk.showSaveEventDialog) {
+      downloadEventFile(defaultFile, text);
+      markLocalBackupClean(tabId);
+      return { ok: true };
+    }
+    const pick = await desk.showSaveEventDialog({ defaultName: defaultFile });
+    if (!pick.ok || !pick.filePath) return { ok: false, cancelled: true };
+    targetPath = pick.filePath;
+  }
+
+  const w = await desk.writeTextFile(targetPath, text);
+  if (!w.ok) {
+    window.alert(w.error ?? "Could not write file");
+    return { ok: false };
+  }
+  const savedName = eventNameFromPath(targetPath);
+  const savedKey = normalizeEventFileKey(savedName) ?? tabId;
+  setEventDiskPath(savedKey, targetPath);
+  registerOpenEventFilePath(tabId, targetPath);
+  setLocalBackupFilePath(tabId, targetPath);
+  markLocalBackupClean(tabId);
+  void queryClient;
+  return { ok: true, filePath: targetPath };
+}
+
 export async function matbeastSaveActiveTabAs(opts: {
   queryClient: QueryClient;
   selectTab: (id: string) => void;
@@ -1986,6 +2095,8 @@ export async function matbeastSaveActiveTabAs(opts: {
       if (w.ok) {
         await syncBoardFileName(opts.queryClient, pickedName);
         markTournamentClean(tid);
+        setLocalBackupFilePath(tid, pick.filePath);
+        markLocalBackupClean(tid);
       }
     } else {
       downloadEventFile(defaultFile, text);

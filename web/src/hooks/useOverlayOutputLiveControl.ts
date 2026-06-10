@@ -3,6 +3,7 @@
 import {
   type OverlayOutputBroadcast,
   isOverlayOutputBroadcast,
+  mirrorOverlayControlToServer,
   openOverlayOutputChannel,
 } from "@/lib/overlay-output-broadcast";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -45,6 +46,7 @@ export function useOverlayOutputLiveControl() {
   const setLiveAndBroadcast = useCallback((next: boolean) => {
     setLive(next);
     channelRef.current?.postMessage({ kind: "live", live: next } satisfies OverlayOutputBroadcast);
+    mirrorOverlayControlToServer({ kind: "live", live: next });
   }, []);
 
   const deactivateOverlay = useCallback(() => {

@@ -5,6 +5,12 @@ import {
   matbeastImportOpenedEventFile,
   tryFocusExistingTabForCloudEvent,
 } from "@/lib/matbeast-dashboard-file-actions";
+import {
+  markCloudNotConfigured,
+  markCloudReachable,
+  markCloudUnreachable,
+  subscribeCloudOnline,
+} from "@/lib/matbeast-cloud-online";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -113,12 +119,14 @@ export default function HomeCloudPanel() {
       const cfgRes = await fetch("/api/cloud/config", { cache: "no-store" });
       if (!cfgRes.ok) {
         setCfg({ configured: false, tokenSet: false, syncEnabled: false });
+        markCloudUnreachable(`Cloud config HTTP ${cfgRes.status}`);
         return;
       }
       const c = (await cfgRes.json()) as CloudConfig;
       setCfg(c);
       if (!c.configured) {
         setEvents(null);
+        markCloudNotConfigured();
         return;
       }
       const evRes = await fetch("/api/cloud/events", { cache: "no-store" });
@@ -133,18 +141,38 @@ export default function HomeCloudPanel() {
           /* non-JSON body — fall back to status line */
         }
         setError(detail || `Cloud list HTTP ${evRes.status}`);
+        // Publish the offline signal so the new-event flow knows to create
+        // local-only, and so the badge/coordinator reflect reality.
+        markCloudUnreachable(detail || `Cloud list HTTP ${evRes.status}`);
         return;
       }
       const data = (await evRes.json()) as { events: CloudEventMeta[] };
       setEvents(data.events);
+      markCloudReachable();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not load cloud events");
+      const msg = e instanceof Error ? e.message : "Could not load cloud events";
+      setError(msg);
+      markCloudUnreachable(msg);
     }
   }, []);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  /**
+   * While the cloud is unreachable on the home page, retry periodically so
+   * the catalog self-heals when the connection returns — the user doesn't
+   * have to sit and click Retry. Only runs while `error` is set; clears as
+   * soon as a load succeeds (error → null).
+   */
+  useEffect(() => {
+    if (!error) return;
+    const id = window.setInterval(() => {
+      void load();
+    }, 20_000);
+    return () => window.clearInterval(id);
+  }, [error, load]);
 
   // Close any open 3-dot menu when the user clicks anywhere else in
   // the panel. Listening on the whole window is fine here: the panel
@@ -240,6 +268,36 @@ export default function HomeCloudPanel() {
     // just ask it to open and let the user pick a title + filename.
     window.dispatchEvent(new CustomEvent("matbeast-open-new-event-dialog"));
   }, []);
+
+  /**
+   * Open an event from a `.matb` file on disk. Reuses the native File ▸
+   * Open pipeline (`NativeFileMenuBridge` listens for this event), so it
+   * works without any cloud connection — the primary "work offline"
+   * escape hatch surfaced on the home page when the cloud is unreachable.
+   */
+  const openFromFile = useCallback(() => {
+    window.dispatchEvent(
+      new CustomEvent("matbeast-native-file", {
+        detail: { source: "menu", action: "open" },
+      }),
+    );
+  }, []);
+
+  /**
+   * Auto-refresh the catalog when the cloud comes back. The home panel's
+   * `load()` writes the offline signal on failure; once any other part of
+   * the app (badge poll, a successful save) flips the signal back to
+   * online, re-pull the list so the user sees the live catalog without a
+   * manual Refresh.
+   */
+  const wasOfflineRef = useRef(false);
+  useEffect(() => {
+    return subscribeCloudOnline((next) => {
+      const reconnected = wasOfflineRef.current && next.online;
+      wasOfflineRef.current = !next.online;
+      if (reconnected) void load();
+    });
+  }, [load]);
 
   const copyCloudEvent = useCallback(
     async (meta: CloudEventMeta) => {
@@ -456,15 +514,38 @@ export default function HomeCloudPanel() {
           </div>
         ) : error ? (
           <div className="rounded border border-red-700/50 bg-red-900/20 p-4 text-[12px] text-red-100">
-            <p className="m-0 font-semibold">Could not reach the cloud</p>
-            <p className="m-0 mt-1 break-words text-red-100/80">{error}</p>
-            <div className="mt-3 flex gap-2">
+            <p className="m-0 font-semibold">
+              Can&apos;t reach the cloud — you can work offline
+            </p>
+            <p className="m-0 mt-1 text-red-100/80">
+              The cloud catalog isn&apos;t available right now. You can create a
+              new offline event or open one from a file, and the app will upload
+              and sync it automatically once the connection returns.
+            </p>
+            <p className="m-0 mt-1 break-words text-[11px] text-red-100/60">
+              {error}
+            </p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => void createNew()}
+                className="rounded bg-teal-700 px-3 py-1 text-[11px] font-semibold text-white hover:bg-teal-600"
+              >
+                Create offline event
+              </button>
+              <button
+                type="button"
+                onClick={() => openFromFile()}
+                className="rounded border border-zinc-500 bg-zinc-800 px-3 py-1 text-[11px] font-semibold text-zinc-100 hover:bg-zinc-700"
+              >
+                Load event from file…
+              </button>
               <button
                 type="button"
                 onClick={() => void load()}
                 className="rounded bg-red-700 px-3 py-1 text-[11px] font-semibold text-white hover:bg-red-600"
               >
-                Retry
+                Retry connection
               </button>
             </div>
           </div>

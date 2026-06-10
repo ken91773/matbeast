@@ -107,6 +107,11 @@ if (!contextBridge || !ipcRenderer) {
       .catch(() => ({ ok: false })),
   /** Bring the main dashboard window to the foreground (keyboard focus). */
   focusMainWindow: () => ipcRenderer.invoke("app:focus-main-window"),
+  /** Enter (true) / exit (false) borderless full screen on the dashboard window. */
+  setMainFullScreen: (enabled) =>
+    ipcRenderer
+      .invoke("app:set-main-fullscreen", { enabled: Boolean(enabled) })
+      .catch(() => ({ ok: false })),
   /**
    * v1.2.9: First-launch password gate persistence. Stored in a small
    * JSON file under `userData/` rather than `localStorage`, because

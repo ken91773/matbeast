@@ -91,6 +91,8 @@ interface MatBeastDesktopApi {
   }) => Promise<{ ok: boolean; changed?: boolean }>;
   /** Focus the main dashboard window (desktop); helps OS keyboard routing after Alt-Tab / overlay windows. */
   focusMainWindow?: () => Promise<{ ok: boolean }>;
+  /** Enter (true) / exit (false) borderless full screen on the dashboard window. */
+  setMainFullScreen?: (enabled: boolean) => Promise<{ ok: boolean }>;
   /** Focus main `webContents` even when the window is already foreground (Windows keyboard routing after in-app actions). */
   restoreWebKeyboardFocus?: () => Promise<{ ok: boolean }>;
   /**

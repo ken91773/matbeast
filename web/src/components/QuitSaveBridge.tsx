@@ -45,6 +45,15 @@ declare global {
       count: number;
       lastError?: string;
     }>;
+    /**
+     * Close-time local-file prompt (owned by AppChrome). For each open event
+     * with edits since its last local save, asks the user whether to save to
+     * its `.matb` file (or back up to a new file). Resolves `{ proceed }` —
+     * false when the user cancelled, so the main process aborts the close.
+     */
+    __MATBEAST_LOCAL_BACKUP_BEFORE_QUIT__?: () => Promise<{
+      proceed: boolean;
+    }>;
   }
 }
 

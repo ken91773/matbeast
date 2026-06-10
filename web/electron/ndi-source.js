@@ -24,13 +24,20 @@
  *   - `onError` is called for capture failures so the sender can decide
  *     whether to keep going or surface a UI warning.
  *
- * Resolution is locked to 1920×1080 by the same three-layer defense
- * (constructor `useContentSize` + `zoomFactor`, `capturePage(rect)`, and
- * the always-resize fallback) we proved out in the smoke test (v0.9.27 →
- * v0.9.28).
+ * Resolution is locked to a host-independent 1920×1080 by sizing the
+ * offscreen window's content area to `target / hostScaleFactor` (so the
+ * physical back-buffer lands on the target on any monitor regardless of
+ * its DPI scale), backed by a `capturePage(rect)` + ±1 px resize safety
+ * net.
  */
-const { BrowserWindow } = require("electron");
+const { BrowserWindow, screen } = require("electron");
 
+/**
+ * Broadcast frame size. Fixed 1080p (1920×1080) — this is the ONLY
+ * resolution the NDI source ever advertises, regardless of the operator's
+ * monitor or its DPI scale (see the scale-factor compensation in
+ * `createOffscreenSource`).
+ */
 const NDI_OFFSCREEN_W = 1920;
 const NDI_OFFSCREEN_H = 1080;
 
@@ -69,10 +76,42 @@ async function createOffscreenSource(opts) {
       ? Math.round(opts.captureIntervalMs)
       : Math.round(1000 / frameRate);
 
+  /**
+   * Host-independent native resolution.
+   *
+   * Electron's offscreen renderer multiplies the window's content size (in
+   * DIPs) by the host monitor's `scaleFactor` to produce the physical
+   * back-buffer. On a 100 %-scale monitor a 1920×1080 window yields a
+   * 1920×1080 buffer; on a 125 %/150 % monitor the same window would yield
+   * 2400×1350 / 2880×1620, and capturePage can also clamp to the desktop
+   * work area — which is exactly why the operator saw a 2562×1529 capture.
+   *
+   * Compensating the content size by the scale factor (`target / scale`)
+   * makes the PHYSICAL buffer land on the target (≈1920×1080) on ANY
+   * machine, so the page renders natively at broadcast resolution with no
+   * downscale pass. `normalizeFrame` below stays as a ±1 px safety net for
+   * non-integer scale factors; it's a no-op when the buffer already matches.
+   */
+  let hostScaleFactor = 1;
+  try {
+    hostScaleFactor = screen.getPrimaryDisplay()?.scaleFactor || 1;
+  } catch {
+    hostScaleFactor = 1;
+  }
+  if (!Number.isFinite(hostScaleFactor) || hostScaleFactor <= 0) {
+    hostScaleFactor = 1;
+  }
+  const contentW = Math.max(1, Math.round(NDI_OFFSCREEN_W / hostScaleFactor));
+  const contentH = Math.max(1, Math.round(NDI_OFFSCREEN_H / hostScaleFactor));
+  log(
+    `[ndi-source/${opts.scene}] target ${NDI_OFFSCREEN_W}x${NDI_OFFSCREEN_H}` +
+      ` hostScale=${hostScaleFactor} -> content ${contentW}x${contentH} (DIP)`,
+  );
+
   const win = new BrowserWindow({
     show: false,
-    width: NDI_OFFSCREEN_W,
-    height: NDI_OFFSCREEN_H,
+    width: contentW,
+    height: contentH,
     useContentSize: true,
     transparent: true,
     frame: false,
@@ -96,15 +135,15 @@ async function createOffscreenSource(opts) {
   const captureRect = {
     x: 0,
     y: 0,
-    width: NDI_OFFSCREEN_W,
-    height: NDI_OFFSCREEN_H,
+    width: contentW,
+    height: contentH,
   };
 
   /**
    * Layer 3 of the resolution-lock — see ndi-smoke.js for the full
    * rationale. NDI receivers re-negotiate the format on every frame whose
    * dimensions disagree with the announced sender format, which causes
-   * downstream stutter. Resizing to 1920×1080 here means the announced
+   * downstream stutter. Forcing 1920×1080 here means the announced
    * format is also the actual format on the wire.
    */
   let resizesPerformed = 0;
@@ -117,7 +156,10 @@ async function createOffscreenSource(opts) {
     return image.resize({
       width: NDI_OFFSCREEN_W,
       height: NDI_OFFSCREEN_H,
-      quality: "best",
+      // `good` (bilinear) not `best` (Lanczos): with scale-factor
+      // compensation this is a ±1 px correction, not a real downscale, so
+      // the cheaper filter keeps per-frame cost (and latency) low.
+      quality: "good",
     });
   };
 

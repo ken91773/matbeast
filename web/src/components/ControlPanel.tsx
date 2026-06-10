@@ -16,6 +16,7 @@ import {
   OVERLAY_APPLY_PROPAGATION_MS,
   OVERLAY_BARN_DOOR_MS,
   isOverlayOutputBroadcast,
+  mirrorOverlayControlToServer,
   openOverlayOutputChannel,
 } from "@/lib/overlay-output-broadcast";
 import {
@@ -33,10 +34,7 @@ import {
   parseOtElapsedMmss,
   totalEscapeSecondsForSide,
 } from "@/lib/ot-intermediate-log";
-import {
-  formatWallMss,
-  scoreboardOtRedTimerStyle,
-} from "@/lib/scoreboard-timer-display";
+import { formatWallMss } from "@/lib/scoreboard-timer-display";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -265,6 +263,7 @@ export default function ControlPanel({
   const setOverlayLiveBroadcast = (next: boolean) => {
     setOverlayOutputLive(next);
     overlayLiveChannelRef.current?.postMessage({ kind: "live", live: next });
+    mirrorOverlayControlToServer({ kind: "live", live: next });
   };
   const [leftId, setLeftId] = useState<string>("");
   const [rightId, setRightId] = useState<string>("");
@@ -311,6 +310,14 @@ export default function ControlPanel({
   >(async () => null);
   const timerRunningRef = useRef(false);
   const boardReadyRef = useRef(false);
+  /**
+   * Latest `runTimerCommandAndGoLive` so the once-subscribed Space-bar handler
+   * can start the timer AND bring the overlay live with the barn-door effect,
+   * matching the on-screen Start/Rest buttons.
+   */
+  const runTimerCommandAndGoLiveRef = useRef<
+    (command: Record<string, unknown>) => void
+  >(() => {});
 
   useEffect(() => {
     firstBoardLoad.current = true;
@@ -691,11 +698,11 @@ export default function ControlPanel({
       // have focus (the prior behavior let Space "click" the focused control).
       e.preventDefault();
       if (!boardReadyRef.current) return;
-      void patchRef.current({
-        command: {
-          type: timerRunningRef.current ? "timer_pause" : "timer_start",
-        },
-      });
+      if (timerRunningRef.current) {
+        void patchRef.current({ command: { type: "timer_pause" } });
+      } else {
+        runTimerCommandAndGoLiveRef.current({ type: "timer_start" });
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -1068,6 +1075,26 @@ export default function ControlPanel({
     await sleep(OVERLAY_APPLY_PROPAGATION_MS);
     setOverlayLiveBroadcast(true);
   }
+
+  /**
+   * Run a timer command (Start / Rest) and bring the overlay LIVE with the
+   * barn-door effect when it's currently stopped. If the overlay is already
+   * live, just commit the command (no door flicker). We pause after the commit
+   * so the overlay window's board poll picks up the running clock before the
+   * doors open.
+   */
+  async function runTimerCommandAndGoLive(
+    command: Record<string, unknown>,
+  ): Promise<void> {
+    const wasLive = overlayOutputLive;
+    const saved = await patch({ command });
+    if (!saved) return;
+    if (!wasLive) {
+      await new Promise((r) => setTimeout(r, OVERLAY_APPLY_PROPAGATION_MS));
+      setOverlayLiveBroadcast(true);
+    }
+  }
+  runTimerCommandAndGoLiveRef.current = runTimerCommandAndGoLive;
 
   if (!board) {
     const blockingErr = err ?? boardErr;
@@ -1636,11 +1663,9 @@ export default function ControlPanel({
               className={`font-mono text-4xl ${
                 board.timerRestMode
                   ? "text-amber-300"
-                  : scoreboardOtRedTimerStyle(board)
-                    ? "text-red-800"
-                    : board.timerRunning
-                      ? "text-white"
-                      : "text-red-500"
+                  : board.timerRunning
+                    ? "text-white"
+                    : "text-red-500"
               }`}
             >
               {scoreboardTimerLine}
@@ -1698,13 +1723,13 @@ export default function ControlPanel({
                         ? "bg-red-800 hover:bg-red-700"
                         : "bg-green-800 hover:bg-green-700")
                     }
-                    onClick={() =>
-                      patch({
-                        command: {
-                          type: board.timerRunning ? "timer_pause" : "timer_start",
-                        },
-                      })
-                    }
+                    onClick={() => {
+                      if (board.timerRunning) {
+                        patch({ command: { type: "timer_pause" } });
+                      } else {
+                        void runTimerCommandAndGoLive({ type: "timer_start" });
+                      }
+                    }}
                   >
                     {board.timerRunning ? (
                       <PauseIcon className="h-4 w-4" />
@@ -1784,13 +1809,13 @@ export default function ControlPanel({
                   ? "bg-red-800 hover:bg-red-700"
                   : "bg-green-800 hover:bg-green-700")
               }
-              onClick={() =>
-                patch({
-                  command: {
-                    type: board.timerRunning ? "timer_pause" : "timer_start",
-                  },
-                })
-              }
+              onClick={() => {
+                if (board.timerRunning) {
+                  patch({ command: { type: "timer_pause" } });
+                } else {
+                  void runTimerCommandAndGoLive({ type: "timer_start" });
+                }
+              }}
             >
               {board.timerRunning ? (
                 <PauseIcon className="h-5 w-5" />
@@ -1822,7 +1847,11 @@ export default function ControlPanel({
               <button
                 type="button"
                 className="rounded bg-amber-500 px-3 py-2 text-sm font-semibold text-black hover:bg-amber-400"
-                onClick={() => patch({ command: { type: "set_timer_rest_period" } })}
+                onClick={() =>
+                  void runTimerCommandAndGoLive({
+                    type: "set_timer_rest_period",
+                  })
+                }
               >
                 Rest
               </button>

@@ -1,6 +1,158 @@
 # Progress Log
 
 ## Current Build Status
+- **v2.0.20 (2026-06-10)** — Dashboard opens in borderless full screen; Escape ⇄ Ctrl+F.
+  The dashboard window now launches in true full screen (no title bar / taskbar) instead of
+  a maximized window. Pressing Escape drops it back to a maximized window (with borders), and
+  Window ▸ Full Screen (Ctrl+F) re-enters full screen. F11 still toggles via the platform role.
+  Implementation:
+    - `electron/main.js`: `ready-to-show` now `maximize()`s then `setFullScreen(true)` so the
+      pre-fullscreen state Escape restores to is "maximized". New Window ▸ Full Screen item
+      (`CmdOrControl+F`) calls `setFullScreen(true)`. New `app:set-main-fullscreen` IPC.
+    - `electron/preload.js` + `matbeast-desktop.d.ts`: expose `setMainFullScreen(enabled)`.
+    - `AppChrome.tsx`: global Escape handler calls `setMainFullScreen(false)` — skipped while
+      typing in a field or when any modal/dialog is open (so Escape still closes dialogs first).
+  Built locally (not published).
+- **v2.0.19 (2026-06-10)** — Local-file backup prompt on close (event tab + app quit).
+  Closing an event tab or the whole app now prompts to preserve the event to a local
+  `.matb` file when it has edits since its last local save:
+    - If the event already has a known local file → "Save changes to <file>?"
+      (Save / Don't save / Cancel), overwriting that file in place.
+    - If it has no local file yet → "Back up event to a local file?" (Back up… opens the
+      native Save dialog and remembers the path / Don't back up / Cancel).
+  Behavior choices (per request): prompt only when changed since the last local save (no
+  nagging on clean closes); always ask even when the file exists; runs *alongside* the
+  existing cloud-sync quit dialog and offline tab-close prompt (kept as-is). If the user
+  saves a local backup during a tab close, the separate offline cloud-backup prompt is
+  skipped (data already on disk).
+  Implementation:
+    - New session tracker `matbeast-local-backup.ts` (dirty-since-last-local-save +
+      known file path per tab), separate from the cloud document-dirty set (cloud autosave
+      must not hide a stale disk copy). Marked dirty on every mutating `matbeastFetch`
+      (alongside the cloud dirty flag); cleared when the event is opened from / written to
+      its local file; forgotten on tab close.
+    - `matbeastSaveTabToLocalFile()` writes to the tracked path in place, or shows the Save
+      dialog when none is known (remembering it). (`matbeast-dashboard-file-actions.ts`.)
+    - AppChrome owns a reusable promise-driven modal used by both `requestCloseTab` and a
+      new `window.__MATBEAST_LOCAL_BACKUP_BEFORE_QUIT__` hook; the Electron `close` handler
+      calls that hook first and aborts the close if the user cancels.
+      (`AppChrome.tsx`, `QuitSaveBridge.tsx`, `electron/main.js`,
+      `EventWorkspaceProvider.tsx`, `matbeast-fetch.ts`.)
+  Built locally (not published).
+- **v2.0.18 (2026-06-10)** — Offline-at-launch flow: work offline, sync on reconnect.
+  When the cloud can't be reached, the home page now explicitly notifies the user and
+  offers **Create offline event** and **Load event from file…** (plus Retry), instead of a
+  bare error. The app stays local-first and uploads/syncs automatically once the
+  connection returns. Specifics:
+    - `HomeCloudPanel.load()` now publishes cloud reachability into the shared online
+      signal (`markCloudReachable` / `markCloudUnreachable` / `markCloudNotConfigured`), so
+      the badge, sync coordinator, and new-event flow all agree on offline state. The error
+      branch became an offline panel with the two CTAs; **Load event from file…** reuses the
+      native File ▸ Open pipeline (dispatches `matbeast-native-file` open). The panel also
+      auto-reloads the catalog on reconnect (`subscribeCloudOnline`) and retries every 20s
+      while offline so it self-heals without a manual click. (`HomeCloudPanel.tsx`.)
+    - `matbeastCreateNewEventTab` gained an `allowOffline` option: when the cloud is
+      unreachable it creates the event LOCAL-ONLY instead of blocking. `AppChrome`'s
+      new-event submit passes `allowOffline` whenever the live online signal is offline, so
+      the New event dialog never dead-ends. (`matbeast-dashboard-file-actions.ts`,
+      `AppChrome.tsx`.)
+    - Reconnect upload reuses existing infrastructure: the active event's `CloudSyncBadge`
+      dispatches a silent save on reconnect (which auto-link-uploads a local-only event),
+      and the sync coordinator's 60s heartbeat + online/focus/visibility/reconnect triggers
+      drain anything linked. The `NewEventDialog` already degrades offline (catalog fetch
+      fails → empty list → `MMDD-1` default). No data-model changes (local-first +
+      `CloudEventLink` pending queue already supported this).
+  Note: restored local event tabs still open offline (not force-redirected to home); the
+  home offline panel is the cold-start escape hatch. Built locally (not published).
+- **v2.0.17 (2026-06-10)** — App opens maximized + dashboard fills wide/ultrawide screens.
+  The main Electron window now opens maximized (created with `show: false`, then
+  `maximize()` + `show()` on `ready-to-show` to avoid a 1500×980 flash; restore size stays
+  1500×980). It fills the host display's work area at any DPI — no per-resolution math.
+  Separately, the dashboard content wrapper in `DashboardClient.tsx` dropped its
+  `mx-auto max-w-[1600px]` cap for the *event dashboard* view (now `max-w-none`), which was
+  leaving empty left/right margins on the 3027×1440 ultrawide; the resizable cards (all
+  percentage-based) now spread into the extra width. The home / cloud catalog view keeps
+  the centered 1600px cap. (`electron/main.js`, `DashboardClient.tsx`.) Built locally
+  (not published).
+- **v2.0.16 (2026-06-10)** — SHOW TEAMS APPLY now auto-goes-live with the barn-door effect.
+  When the overlay is stopped and the operator clicks APPLY with a team selection, the
+  dashboard commits the team-list scene, waits `OVERLAY_APPLY_PROPAGATION_MS` for the
+  overlay to pick up the selection, then activates the overlay (opens the barn doors) via
+  `activateOverlay` from `useOverlayOutputLiveControl`. If already live, behavior is
+  unchanged; the empty-selection (blank/fade-out) branch is unaffected.
+  (`DashboardFullWorkspace.tsx`.) Built locally (not published).
+- **v2.0.15 (2026-06-10)** — SHOW TEAMS CURRENT cycle reordered. The CURRENT button now
+  cycles both teams → TEAM A only → TEAM B only → cleared (was TEAM A → TEAM B → both →
+  cleared), so the first tap shows both team names. Pure phase-order change in
+  `handleCurrent`; no change to APPLY or the underlying team-list overlay.
+  (`DashboardFullWorkspace.tsx`.) Built locally (not published).
+- **v2.0.14 (2026-06-10)** — Start/Rest now auto-go-live with the barn-door effect.
+  When the overlay is stopped (not LIVE), starting the timer or clicking Rest in the
+  Control Panel now commits the command, waits `OVERLAY_APPLY_PROPAGATION_MS` for the
+  overlay poll to catch the running clock, then sets the overlay LIVE — opening the barn
+  doors (same mechanism APPLY uses). If already live, it just commits the command (no door
+  flicker); Pause is unaffected. New `runTimerCommandAndGoLive()` helper drives the main
+  Start button, the OT-round Start button, the Rest button, and the Space-bar shortcut
+  (via `runTimerCommandAndGoLiveRef` so the once-subscribed key handler stays in sync).
+  (`ControlPanel.tsx`.) Built locally (not published).
+- **v2.0.13 (2026-06-10)** — Rest button now auto-starts the rest clock. The Control
+  Panel "Rest" button (`set_timer_rest_period`) already reset the clock to 0:30; it now
+  also starts the countdown immediately (`timerRunning = true`, `timerEndsAt = now + 30s`)
+  instead of leaving it paused for the operator to press play. The match-end clock/round
+  snapshot logic (for a later `final_save`) is unchanged. (`api/board/route.ts`.) Built
+  locally (not published).
+- **v2.0.6 → v2.0.12 (2026-06-10)** — Browser-source clock latency/jitter investigation + overlay clock-color fixes; NDI receiver decision & discovery triage. Built locally (not published).
+  - **Root cause of browser-source latency.** The overlay *polls* `/api/board`; discrete
+    edges (start/stop, manual cue nonces, name/score/round changes) only surface on the
+    next poll, so perceived lag varies 0 → ~¾ s. The running clock is extrapolated
+    locally on each receiver from `timerEndsAt` (100 ms tick) — accurate, but **each
+    receiver paces its own seconds**, so two browser sources can stop on slightly
+    different times. That per-machine behavior is the reason the user is moving receivers
+    back to NDI (identical pixels to every receiver).
+  - **v2.0.6 — faster scoreboard-source poll.** `boardRefetchIntervalMs` gained an
+    optional `maxIntervalMs` cap (default 1000 → dashboard unchanged); the scoreboard
+    overlay passes 250 ms, dropping worst-case edge lag from ~1 s to ~¼ s.
+    (`board-timer-poll.ts`, `overlay-client.tsx`.)
+  - **v2.0.7 — SSE push + poll fallback, then FULLY REVERTED.** Briefly added
+    `/api/board/stream` (SSE), a `board-event-bus` pub/sub, a PATCH wrapper that
+    published on success, and an overlay `EventSource` writing snapshots into the query
+    cache (slow backstop poll while healthy, fast when down). The clock "backed up" on
+    stop and the user rejected push; all of it was removed (files deleted, route
+    unwrapped, overlay reverted to the v2.0.6 poll).
+  - **v2.0.9 — stop-freeze guard.** The overlay clock no longer steps *backward* when the
+    timer stops. On a running→stopped edge where the server's frozen value lands ≤3 s
+    above the last running value (latency/skew artifact), it holds the last shown value;
+    genuine resets (large jumps) still display. Overlay-only; the localhost dashboard is
+    unaffected (no latency to suppress). (`useLiveScoreboardTimerLine.ts`.)
+  - **v2.0.10 — broadcast clock stays white when stopped.** `scoreboardTimerColorHex`
+    (overlay-only) no longer turns the clock red on stop, so the overlay can freeze on a
+    white time. The Control Panel keeps its own inline red-when-stopped indicator so the
+    operator still knows. REST amber / OT red precedence unchanged here.
+    (`scoreboard-timer-display.ts`.)
+  - **v2.0.11 — OT clock color matches regulation.** Removed the always-on OT red from the
+    clock *number* on both the overlay (`scoreboardTimerColorHex`) and the Control Panel
+    (inline class). OT now follows the regulation rule (overlay always white;
+    control white-running / red-stopped). The "OT PERIOD" sub-label keeps its red identity
+    (it's a static label, not running/stopped behavior). (`scoreboard-timer-display.ts`,
+    `ControlPanel.tsx`.)
+  - **v2.0.12 — `?diag=1` build-version stamp.** The overlay renders a small cyan
+    `v<version>` bottom-right when the URL carries `&diag=1`, sourced from
+    `NEXT_PUBLIC_APP_VERSION` (set in `next.config.ts` from `package.json`). Lets an OBS
+    Browser Source be verified as running the expected build vs. a stale cached one — the
+    red-on-stop symptom had revealed OBS was running pre-2.0.10 cached code.
+    (`next.config.ts`, `overlay-client.tsx`.)
+  - **Clock sync (OS-level, user task — not an app change).** The "OBS clock ahead/behind"
+    gap is Windows system-clock skew between machines. Guidance given: either enable
+    "Set time automatically" on both PCs (internet), or make one PC a `w32tm` NTP server
+    and point the other at it via `w32tm /config /manualpeerlist`. Independent of the
+    stop-freeze fix.
+  - **OPEN: NDI source not listed in OBS.** Decision made to use NDI for receiving
+    computers (avoids per-machine clock extrapolation). The source shows in NDI Studio
+    Monitor but not in OBS's NDI dropdown — being triaged as OBS-side (allow `obs64.exe`
+    through Windows Firewall, DistroAV plugin/NDI-runtime mismatch, or OBS restart) vs.
+    cross-subnet discovery (mDNS is link-local; both PCs must share a /24, or use NDI
+    Access Manager / Discovery Server). App NDI adapter binding is at
+    **Options ▸ NDI ▸ Network adapter** (`ndi-config.js`, `ndi-adapters.js`).
 - **v2.0.0 (2026-06-09)** — Overlay APPLY behavior, regulation/OT timer + bracket automation (released).
   - Full-match reset now keeps the highlighted bracket round (e.g. "Semi
     Finals") instead of snapping the round label back to "Quarter Finals":

@@ -98,8 +98,44 @@ function getSenderChannel(): BroadcastChannel | null {
   return senderChannel;
 }
 
+/**
+ * Control kinds that must also reach a *remote* Browser Source (which has no
+ * same-machine BroadcastChannel). Transport-only kinds (ping/pong/output-closed)
+ * are local plumbing and never mirrored.
+ */
+const OVERLAY_CONTROL_MIRROR_KINDS = new Set<OverlayOutputBroadcast["kind"]>([
+  "live",
+  "scene",
+  "scoreboard-mode",
+  "team-list-highlight",
+  "bracket-current-match",
+]);
+
+/**
+ * Fire-and-forget mirror of a dashboard control change to
+ * `POST /api/overlay-control`, so a remote OBS / browser-source overlay can
+ * poll and replicate OVERLAY LIVE / barn doors, SHOW TEAMS, and the bracket
+ * current-match highlight. Best-effort: failures are swallowed (the local
+ * BroadcastChannel path is unaffected).
+ */
+export function mirrorOverlayControlToServer(message: OverlayOutputBroadcast): void {
+  if (typeof window === "undefined") return;
+  if (!OVERLAY_CONTROL_MIRROR_KINDS.has(message.kind)) return;
+  try {
+    void fetch("/api/overlay-control", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(message),
+      keepalive: true,
+    }).catch(() => {});
+  } catch {
+    /* best-effort; remote overlays simply stay on their last polled state */
+  }
+}
+
 export function postOverlayOutputMessage(message: OverlayOutputBroadcast) {
   getSenderChannel()?.postMessage(message);
+  mirrorOverlayControlToServer(message);
 }
 
 export function postOverlayScene(scene: OverlayScene) {

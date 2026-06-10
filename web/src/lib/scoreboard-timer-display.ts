@@ -1,6 +1,5 @@
 import type { BoardPayload } from "@/types/board";
 import { otRoundLabelParts } from "@/lib/ot-round-label";
-import { SCOREBOARD_OT_MAIN_HEX } from "@/lib/scoreboard-ot-colors";
 
 /** Wall-clock seconds shown on scoreboard (count-down except OT count-up minute). */
 export function scoreboardDisplayedWallSeconds(
@@ -111,24 +110,19 @@ export function scoreboardOtRedTimerStyle(
 }
 
 /**
- * Match-clock text color. White only while the timer is actively counting
- * down; red whenever it is paused/stopped (not moving). REST keeps its amber
- * and OT keeps its dedicated red, both of which take precedence.
+ * Broadcast scoreboard match-clock text color. The clock number behaves
+ * identically in OT and regulation: it stays white whether the timer is
+ * running OR stopped, so the audience never sees a red "stopped" indicator and
+ * the overlay can halt on a white time (stop-freeze guard). REST keeps its
+ * amber, which takes precedence. The operator's Control Panel has its own
+ * red/white stopped indicator (inline in ControlPanel.tsx) so the operator
+ * still knows the clock has stopped. (The OT "OT PERIOD" sub-label keeps its
+ * red identity via `scoreboardOtRedTimerStyle` — that is a static label, not
+ * the clock's running/stopped color behavior.)
  */
 export function scoreboardTimerColorHex(
-  board:
-    | Pick<
-        BoardPayload,
-        | "timerRunning"
-        | "timerRestMode"
-        | "timerOtCountUpMode"
-        | "timerOtArmedMode"
-        | "timerOtCountdownMode"
-        | "timerOtRoundMode"
-      >
-    | undefined,
+  board: Pick<BoardPayload, "timerRunning" | "timerRestMode"> | undefined,
 ): string {
   if (board?.timerRestMode) return "#fcd34d";
-  if (scoreboardOtRedTimerStyle(board)) return SCOREBOARD_OT_MAIN_HEX;
-  return board?.timerRunning ? "#e5e7eb" : SCOREBOARD_OT_MAIN_HEX;
+  return "#e5e7eb";
 }

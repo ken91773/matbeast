@@ -68,6 +68,14 @@ function getAudioContextCtor(): AudioCtxCtor | null {
 async function createAudioKit(opts?: {
   tapPcmForNdi?: boolean;
   ndiScene?: "scoreboard" | "bracket";
+  /**
+   * Browser-source audible mode (v2.0.3): keep cue audio on the AudioContext's
+   * DEFAULT output so an OBS Browser Source captures it. Never call `setSinkId`
+   * — routing to a named physical device bypasses OBS's internal CEF audio
+   * capture (the operator reports a meter with no signal). Also resumes the
+   * context up-front (OBS allows autoplay) so the first cue isn't clipped.
+   */
+  skipSinkRouting?: boolean;
 }): Promise<AudioKit | null> {
   const Ctor = getAudioContextCtor();
   if (!Ctor) return null;
@@ -79,6 +87,7 @@ async function createAudioKit(opts?: {
   let tapNode: AudioWorkletNode | null = null;
 
   const tapPcmForNdi = Boolean(opts?.tapPcmForNdi);
+  const skipSinkRouting = Boolean(opts?.skipSinkRouting);
   const ndiScene = opts?.ndiScene ?? "scoreboard";
 
   if (tapPcmForNdi) {
@@ -189,6 +198,24 @@ async function createAudioKit(opts?: {
       contextSampleRateHz: ctx.sampleRate,
       workletInstalled,
       silenced,
+    });
+  } else if (skipSinkRouting) {
+    /**
+     * Default-sink path for a remote Browser Source. Full amplitude (OBS
+     * controls level); audio flows gain → destination on the default CEF
+     * sink so OBS captures it. Resume now (suspended contexts emit no PCM,
+     * which is exactly the "meter present, no signal" symptom).
+     */
+    gain.gain.value = 1;
+    gain.connect(ctx.destination);
+    try {
+      if (ctx.state === "suspended") await ctx.resume();
+    } catch {
+      /* will also resume on the first cue's playBuffer */
+    }
+    console.debug("[MatBeast timer audio] path: default sink (browser source)", {
+      contextSampleRateHz: ctx.sampleRate,
+      state: ctx.state,
     });
   } else {
     gain.gain.value = getAudioVolumePercent() / 100;
@@ -406,6 +433,7 @@ function crossWindowClaim(eventKey: string): boolean {
 async function buildAudioKitAndBuffers(opts?: {
   tapPcmForNdi?: boolean;
   ndiScene?: "scoreboard" | "bracket";
+  skipSinkRouting?: boolean;
 }): Promise<{
   kit: AudioKit | null;
   b10: AudioBuffer | null;
@@ -488,9 +516,12 @@ export function useTimerAlertSounds(
     tapPcmForNdi?: boolean;
     /** Defaults to "scoreboard". Forwarded to `pushNdiAudio` so the main process routes to the right feed. */
     ndiScene?: "scoreboard" | "bracket";
+    /** Browser-source audible mode: play on the default sink (no setSinkId) so OBS captures the audio. */
+    skipSinkRouting?: boolean;
   },
 ): void {
   const tapPcmForNdi = Boolean(options?.tapPcmForNdi);
+  const skipSinkRouting = Boolean(options?.skipSinkRouting);
   const ndiScene = options?.ndiScene ?? "scoreboard";
   const instanceIdRef = useRef(`timer-audio-${Math.random().toString(36).slice(2)}`);
   const prevSecondsRef = useRef<number | null>(null);
@@ -530,6 +561,7 @@ export function useTimerAlertSounds(
       const { kit, b10, b0 } = await buildAudioKitAndBuffers({
         tapPcmForNdi,
         ndiScene,
+        skipSinkRouting,
       });
       if (cancelled) {
         kit?.dispose();
@@ -578,7 +610,7 @@ export function useTimerAlertSounds(
         releaseCoordinatorOwner(instanceId);
       }
     };
-  }, [enabled, tapPcmForNdi, ndiScene]);
+  }, [enabled, tapPcmForNdi, ndiScene, skipSinkRouting]);
 
   useEffect(() => {
     if (resetKey !== lastResetKeyRef.current) {

@@ -127,13 +127,21 @@ function getStatus() {
  *   - `sender.audio(AudioFrame)` -> Promise (planned for v0.9.30, bracket
  *     music tap)
  *
- * `clockVideo: false` deliberately. With `clockVideo: true`, grandiose
- * paces our `video()` calls itself by sleeping inside the underlying
- * `NDIlib_send_send_video_v2` until the announced frame rate is met.
- * That throttles our event loop and risks back-pressure if the capture
- * loop is faster than the announced rate. Our offscreen capture loop
- * already runs at exactly 30 fps via `setInterval(33ms)`, so we do the
- * pacing ourselves and let NDI just pass each frame through.
+ * `clockVideo: true` (v2.0.5). NDI paces each `video()` send by sleeping
+ * inside the underlying `NDIlib_send_send_video_v2` until the announced
+ * frame rate is met, giving receivers a stable, consistent frame clock to
+ * lock onto (the previous `false` left pacing to jittery JS `setInterval` /
+ * capture-completion timing, which made receivers buffer seconds of latency
+ * and then skip). The sleep runs on grandiose's async-work thread, NOT the
+ * JS event loop, so it does not stall the app. To avoid the back-pressure
+ * this used to risk, the feed now drives sends from a *backpressured* loop
+ * (`ndi-feed.js`) that awaits each `video()` before issuing the next — so at
+ * most one frame is ever in flight per feed and the NDI clock sets the pace.
+ *
+ * `clockAudio: false` deliberately: cue audio (10s warning / air horn) is
+ * sparse and bursty, so it must be delivered immediately (with a synthesized
+ * timecode) rather than clock-paced, which would stall the worker waiting for
+ * a continuous audio stream we don't produce.
  *
  * @param {{ name: string, frameRate?: number }} opts
  * @returns {Promise<{ ok: true, sender: object } | { ok: false, error: string }>}
@@ -147,7 +155,7 @@ async function createNdiSender(opts) {
   try {
     const sender = await grandioseModule.send({
       name: opts.name,
-      clockVideo: false,
+      clockVideo: true,
       clockAudio: false,
     });
     return { ok: true, sender };
@@ -192,10 +200,43 @@ async function createNdiSender(opts) {
 const DIAG_FRAME_COUNT = 3;
 const diagFrameCounters = new WeakMap();
 
+/**
+ * Cache the expensive `toBitmap()` + dimension inference per `NativeImage`.
+ * The feed's backpressured loop re-sends the most recent captured frame on
+ * the NDI clock (every frame for the scoreboard, ~75× per capture for the
+ * 15 fps / 5 s bracket); without this each re-send would re-serialize the
+ * same ~8 MB 1080p buffer. Keyed by the image object, so when the capture
+ * pump swaps in a new frame the old entry is GC'd with it — no leak.
+ * @type {WeakMap<Electron.NativeImage, { xres:number, yres:number, lineStrideBytes:number, data:Buffer }>}
+ */
+const serializedFrameCache = new WeakMap();
+
 async function sendNdiVideoFrame(sender, image, frameRateN, frameRateD, onLog) {
   if (!sender || typeof sender.video !== "function") {
     throw new Error("sendNdiVideoFrame: sender is invalid or already destroyed");
   }
+
+  const cached = serializedFrameCache.get(image);
+  if (cached) {
+    return sender.video({
+      type: "video",
+      xres: cached.xres,
+      yres: cached.yres,
+      frameRateN,
+      frameRateD,
+      pictureAspectRatio:
+        cached.xres > 0 && cached.yres > 0 ? cached.xres / cached.yres : 16 / 9,
+      frameFormatType: NDI_FRAME_FORMAT_TYPE_PROGRESSIVE,
+      /** Ignored by grandiose's videoSend; the native default already uses
+       *  NDIlib_send_timecode_synthesize so the SDK assigns coherent A/V
+       *  timecodes. Left for shape-compatibility / clarity. */
+      timecode: [0, 0],
+      lineStrideBytes: cached.lineStrideBytes,
+      fourCC: NDI_FOURCC_BGRA,
+      data: cached.data,
+    });
+  }
+
   const reportedSize = image.getSize();
   const data = image.toBitmap();
   const bufferLength = data.length;
@@ -231,6 +272,7 @@ async function sendNdiVideoFrame(sender, image, frameRateN, frameRateD, onLog) {
     }
   }
   const lineStrideBytes = xres * 4;
+  serializedFrameCache.set(image, { xres, yres, lineStrideBytes, data });
 
   const counters = diagFrameCounters.get(sender) || { count: 0 };
   if (counters.count < DIAG_FRAME_COUNT && typeof onLog === "function") {
@@ -258,6 +300,8 @@ async function sendNdiVideoFrame(sender, image, frameRateN, frameRateD, onLog) {
     frameRateD,
     pictureAspectRatio: xres > 0 && yres > 0 ? xres / yres : 16 / 9,
     frameFormatType: NDI_FRAME_FORMAT_TYPE_PROGRESSIVE,
+    /** Ignored by grandiose's videoSend (the native default is
+     *  NDIlib_send_timecode_synthesize, matching the audio path). */
     timecode: [0, 0],
     lineStrideBytes,
     fourCC: NDI_FOURCC_BGRA,

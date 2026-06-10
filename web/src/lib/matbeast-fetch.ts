@@ -5,6 +5,7 @@ import {
   shouldCaptureUndo,
 } from "@/lib/dashboard-undo";
 import { markTournamentDirty } from "@/lib/matbeast-document-dirty";
+import { markLocalBackupDirty } from "@/lib/matbeast-local-backup";
 
 /** Sent on API requests so board/players/etc. scope to the active event tab. */
 export const MATBEAST_TOURNAMENT_HEADER = "x-matbeast-tournament-id";
@@ -232,7 +233,12 @@ export function matbeastFetch(
     if (shouldCaptureUndo(input, init) && !isLiveOnlyBoardRequest(input, init)) {
       await captureDashboardUndoSnapshot();
       const tid = getMatBeastTournamentId();
-      if (tid) markTournamentDirty(tid);
+      if (tid) {
+        markTournamentDirty(tid);
+        // Same edit also makes the on-disk backup stale (cleared when the
+        // event is written to / opened from its local file).
+        markLocalBackupDirty(tid);
+      }
     }
     const id = getMatBeastTournamentId();
     const headers = new Headers(init?.headers);

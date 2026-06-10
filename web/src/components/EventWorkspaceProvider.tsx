@@ -7,6 +7,7 @@ import {
 } from "@/lib/matbeast-fetch";
 import { matbeastDebugLog } from "@/lib/matbeast-debug-log";
 import { unregisterOpenEventFilePath } from "@/lib/matbeast-open-file-registry";
+import { forgetLocalBackup } from "@/lib/matbeast-local-backup";
 import { matbeastKeys } from "@/lib/matbeast-query-keys";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -22,6 +23,26 @@ import {
 const TABS_STORAGE_KEY = "matbeast-open-tabs-v1";
 /** Must match `STORAGE_KEY` in `@/lib/matbeast-fetch` (localStorage sync across windows). */
 const ACTIVE_TOURNAMENT_STORAGE_KEY = "matbeast-active-tournament-id";
+
+/**
+ * Publish the currently-driven event to the bundled server so a constant,
+ * id-less overlay URL (e.g. an OBS Browser Source on another PC) can follow
+ * the live event. Fire-and-forget — failures are non-fatal (the overlay also
+ * still works with an explicit `?tournamentId=` when one is supplied).
+ */
+function publishActiveOverlayTournament(tournamentId: string | null): void {
+  if (typeof window === "undefined") return;
+  try {
+    void fetch("/api/active-tournament", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tournamentId: tournamentId ?? null }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch {
+    /* ignore */
+  }
+}
 
 export type EventTab = { id: string; name: string; trainingMode?: boolean };
 
@@ -193,6 +214,7 @@ export function EventWorkspaceProvider({
   useEffect(() => {
     if (typeof window !== "undefined" && !window.location.pathname.startsWith("/overlay")) {
       void window.matBeastDesktop?.setOverlayTournamentId?.(tournamentId ?? null);
+      publishActiveOverlayTournament(tournamentId ?? null);
     }
   }, [tournamentId]);
 
@@ -215,6 +237,7 @@ export function EventWorkspaceProvider({
       syncMatBeastActiveTabContextToClientStorage(id, openTabsRef.current);
       if (typeof window !== "undefined" && !window.location.pathname.startsWith("/overlay")) {
         void window.matBeastDesktop?.setOverlayTournamentId?.(id);
+        publishActiveOverlayTournament(id);
       }
       void queryClient.invalidateQueries({ queryKey: matbeastKeys.all });
       window.dispatchEvent(
@@ -456,6 +479,7 @@ export function EventWorkspaceProvider({
   const closeTab = useCallback(
     (id: string) => {
       unregisterOpenEventFilePath(id);
+      forgetLocalBackup(id);
       const prev = openTabsRef.current;
       const idx = prev.findIndex((t) => t.id === id);
       if (idx < 0) return;

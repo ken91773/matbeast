@@ -981,8 +981,8 @@ export async function PATCH(req: Request) {
         bumpTimerCueNonce();
         resetOtRoundSecondary();
         next.timerSeconds = 30;
-        next.timerRunning = false;
-        next.timerEndsAt = null;
+        next.timerRunning = true;
+        next.timerEndsAt = new Date(Date.now() + 30 * 1000);
         next.timerPhase = "REGULATION";
         next.overtimeIndex = -1;
         next.otPlayDirection = 1;

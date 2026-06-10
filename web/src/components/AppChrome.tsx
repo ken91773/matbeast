@@ -2,10 +2,12 @@
 
 import { useEventWorkspace } from "@/components/EventWorkspaceProvider";
 import {
+  eventNameFromPath,
   matbeastBackupTabByIdToDisk,
   matbeastCreateNewEventTab,
   matbeastOpenEventOrShowPicker,
   matbeastSaveTabById,
+  matbeastSaveTabToLocalFile,
 } from "@/lib/matbeast-dashboard-file-actions";
 import NewEventDialog from "@/components/NewEventDialog";
 import {
@@ -17,6 +19,10 @@ import {
   isTournamentDirty,
   subscribeDocumentDirty,
 } from "@/lib/matbeast-document-dirty";
+import {
+  getLocalBackupFilePath,
+  isLocalBackupDirty,
+} from "@/lib/matbeast-local-backup";
 import { matbeastDebugLog } from "@/lib/matbeast-debug-log";
 import { MATBEAST_TOURNAMENT_HEADER } from "@/lib/matbeast-fetch";
 import { matbeastKeys } from "@/lib/matbeast-query-keys";
@@ -86,6 +92,61 @@ export default function AppChrome() {
       }
     | null
   >(null);
+
+  /**
+   * Local-file backup prompt shown on close (tab or app) when an event has
+   * edits since its last local save. When the event already has a known
+   * `.matb` file, the prompt offers to save changes to it; otherwise it
+   * offers to back up to a new file. Driven via a promise resolver so both
+   * the tab-close path and the app-quit hook can `await` the user's choice.
+   */
+  const [localBackupPrompt, setLocalBackupPrompt] = useState<
+    | {
+        tabId: string;
+        tabName: string;
+        filePath: string | null;
+        fileName: string | null;
+        working: boolean;
+      }
+    | null
+  >(null);
+  const localBackupResolverRef = useRef<
+    ((decision: "saved" | "skipped" | "cancel") => void) | null
+  >(null);
+
+  /**
+   * Escape exits borderless full screen back to a maximized window. We skip
+   * it while typing in a field or when any modal/dialog is open so Escape
+   * keeps closing dialogs first; otherwise we ask the main process to drop
+   * full screen (a no-op when already windowed).
+   */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" && e.code !== "Escape") return;
+      const t = e.target;
+      if (t instanceof HTMLElement) {
+        const tag = t.tagName;
+        if (
+          tag === "INPUT" ||
+          tag === "TEXTAREA" ||
+          tag === "SELECT" ||
+          t.isContentEditable
+        ) {
+          return;
+        }
+      }
+      // Let an open modal handle Escape (close itself) before we touch the
+      // window state.
+      if (document.querySelector('[role="dialog"], [aria-modal="true"]')) {
+        return;
+      }
+      const desk =
+        typeof window !== "undefined" ? window.matBeastDesktop : undefined;
+      void desk?.setMainFullScreen?.(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   /**
    * "Create new event" dialog state. Opened by both the File ▸ New
@@ -755,23 +816,109 @@ export default function AppChrome() {
    * surprising. Clean tabs (or dirty tabs with a live cloud) keep
    * the v0.8.9 no-prompt behavior.
    */
+  /**
+   * Show the local-file backup prompt for a tab and resolve with the user's
+   * choice. `saved` → written to disk; `skipped` → user declined; `cancel`
+   * → keep the event open (abort the close).
+   */
+  const promptLocalBackup = useCallback(
+    (tabId: string): Promise<"saved" | "skipped" | "cancel"> => {
+      const meta = openTabsRef.current.find((t) => t.id === tabId);
+      const fp = getLocalBackupFilePath(tabId);
+      setLocalBackupPrompt({
+        tabId,
+        tabName: meta?.name ?? "this event",
+        filePath: fp,
+        fileName: fp ? eventNameFromPath(fp) : null,
+        working: false,
+      });
+      return new Promise((resolve) => {
+        localBackupResolverRef.current = resolve;
+      });
+    },
+    [],
+  );
+
+  const resolveLocalBackup = useCallback(
+    (decision: "saved" | "skipped" | "cancel") => {
+      const resolver = localBackupResolverRef.current;
+      localBackupResolverRef.current = null;
+      setLocalBackupPrompt(null);
+      resolver?.(decision);
+    },
+    [],
+  );
+
+  const handleLocalBackupSave = useCallback(async () => {
+    const st = localBackupPrompt;
+    if (!st || st.working) return;
+    setLocalBackupPrompt({ ...st, working: true });
+    try {
+      const res = await matbeastSaveTabToLocalFile({
+        queryClient,
+        selectTab,
+        getOpenTabs: () => openTabsRef.current,
+        tabId: st.tabId,
+      });
+      if (res.cancelled || !res.ok) {
+        // User dismissed the Save dialog or the write failed — keep the
+        // prompt open so they can retry, skip, or cancel.
+        setLocalBackupPrompt((cur) => (cur ? { ...cur, working: false } : cur));
+        return;
+      }
+      resolveLocalBackup("saved");
+    } catch (e) {
+      matbeastDebugLog(
+        "close-tab",
+        "local backup save threw",
+        e instanceof Error ? e.message : String(e),
+      );
+      setLocalBackupPrompt((cur) => (cur ? { ...cur, working: false } : cur));
+    }
+  }, [localBackupPrompt, queryClient, selectTab, resolveLocalBackup]);
+
+  const handleLocalBackupSkip = useCallback(() => {
+    if (localBackupPrompt?.working) return;
+    resolveLocalBackup("skipped");
+  }, [localBackupPrompt, resolveLocalBackup]);
+
+  const handleLocalBackupCancel = useCallback(() => {
+    if (localBackupPrompt?.working) return;
+    resolveLocalBackup("cancel");
+  }, [localBackupPrompt, resolveLocalBackup]);
+
   const requestCloseTab = useCallback(
     (tabId: string) => {
-      if (!isTournamentDirty(tabId)) {
-        closeTab(tabId);
-        return;
-      }
-      const onlineNow = cloudOnlineRef.current.online;
-      if (!onlineNow) {
-        const meta = openTabsRef.current.find((t) => t.id === tabId);
-        setOfflineCloseState({
-          tabId,
-          tabName: meta?.name ?? "this event",
-          working: false,
-        });
-        return;
-      }
       void (async () => {
+        // Step 1: local-file backup prompt when the on-disk copy is stale.
+        let localSaved = false;
+        if (isLocalBackupDirty(tabId)) {
+          const decision = await promptLocalBackup(tabId);
+          if (decision === "cancel") return; // abort the close
+          if (decision === "saved") localSaved = true;
+        }
+
+        // Step 2: existing cloud-sync close behavior (kept alongside).
+        if (!isTournamentDirty(tabId)) {
+          closeTab(tabId);
+          return;
+        }
+        const onlineNow = cloudOnlineRef.current.online;
+        if (!onlineNow) {
+          // Edits already preserved to disk above — no need for the
+          // separate offline-backup prompt; just close.
+          if (localSaved) {
+            closeTab(tabId);
+            return;
+          }
+          const meta = openTabsRef.current.find((t) => t.id === tabId);
+          setOfflineCloseState({
+            tabId,
+            tabName: meta?.name ?? "this event",
+            working: false,
+          });
+          return;
+        }
         try {
           await matbeastSaveTabById(
             queryClient,
@@ -791,8 +938,28 @@ export default function AppChrome() {
         }
       })();
     },
-    [closeTab, queryClient, selectTab],
+    [closeTab, queryClient, selectTab, promptLocalBackup],
   );
+
+  /**
+   * App-quit hook: the Electron close handler calls this first. Walk every
+   * open event with a stale local backup and prompt sequentially; if the
+   * user cancels any prompt, report `proceed: false` so the window stays
+   * open. Runs alongside (before) the existing cloud-sync quit dialog.
+   */
+  useEffect(() => {
+    window.__MATBEAST_LOCAL_BACKUP_BEFORE_QUIT__ = async () => {
+      for (const t of openTabsRef.current) {
+        if (!isLocalBackupDirty(t.id)) continue;
+        const decision = await promptLocalBackup(t.id);
+        if (decision === "cancel") return { proceed: false };
+      }
+      return { proceed: true };
+    };
+    return () => {
+      delete window.__MATBEAST_LOCAL_BACKUP_BEFORE_QUIT__;
+    };
+  }, [promptLocalBackup]);
 
   const handleOfflineCloseBackup = useCallback(async () => {
     const st = offlineCloseState;
@@ -865,6 +1032,11 @@ export default function AppChrome() {
           eventName: result.eventName,
           filename: result.filename,
           trainingMode: result.trainingMode,
+          // When the cloud is currently unreachable, don't dead-end the
+          // dialog: create the event LOCAL-ONLY and let it sync on
+          // reconnect. (When online this is false and the normal
+          // cloud-first create runs.)
+          allowOffline: !cloudOnlineRef.current.online,
         });
         if (created && "duplicate" in created && created.duplicate) {
           // A race produced a collision between opening the dialog
@@ -1295,6 +1467,78 @@ export default function AppChrome() {
                 disabled={offlineCloseState.working}
               >
                 {offlineCloseState.working ? "Saving…" : "Backup to disk"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {localBackupPrompt ? (
+        <div
+          className="fixed inset-0 z-[610] flex items-center justify-center bg-black/60 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Save local backup"
+        >
+          <div className="w-full max-w-md overflow-hidden rounded-lg border border-zinc-600 bg-[#2d2d2d] shadow-2xl">
+            <div className="border-b border-zinc-600 px-4 py-2.5">
+              <h2 className="text-sm font-semibold text-zinc-100">
+                {localBackupPrompt.filePath
+                  ? "Save changes to local file?"
+                  : "Back up event to a local file?"}
+              </h2>
+            </div>
+            <div className="px-4 py-3 text-[12px] leading-relaxed text-zinc-200">
+              <p>
+                <span className="font-semibold">
+                  {localBackupPrompt.tabName}
+                </span>{" "}
+                has changes since its last local save.
+              </p>
+              {localBackupPrompt.filePath ? (
+                <p className="mt-2 text-zinc-400">
+                  Save the latest changes to{" "}
+                  <span className="font-mono text-zinc-200">
+                    {localBackupPrompt.fileName}
+                  </span>{" "}
+                  before closing?
+                </p>
+              ) : (
+                <p className="mt-2 text-zinc-400">
+                  This event isn&apos;t backed up to a local file yet. Choose a
+                  location to save a <code>.matb</code> backup before closing?
+                </p>
+              )}
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-zinc-600 px-3 py-2">
+              <button
+                type="button"
+                className="rounded px-2 py-1 text-[11px] text-zinc-300 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={handleLocalBackupCancel}
+                disabled={localBackupPrompt.working}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="rounded border border-zinc-500 px-2 py-1 text-[11px] text-zinc-200 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={handleLocalBackupSkip}
+                disabled={localBackupPrompt.working}
+                title="Close without writing to the local file"
+              >
+                {localBackupPrompt.filePath ? "Don't save" : "Don't back up"}
+              </button>
+              <button
+                type="button"
+                className="rounded bg-teal-700 px-3 py-1 text-[11px] font-medium text-white hover:bg-teal-600 disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={() => void handleLocalBackupSave()}
+                disabled={localBackupPrompt.working}
+              >
+                {localBackupPrompt.working
+                  ? "Saving…"
+                  : localBackupPrompt.filePath
+                    ? "Save"
+                    : "Back up…"}
               </button>
             </div>
           </div>

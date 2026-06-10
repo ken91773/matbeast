@@ -49,6 +49,8 @@ const ndiSender = require("./ndi-sender.js");
 
 const NDI_FRAME_RATE_DEFAULT = 30;
 
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /**
  * Per-scene NDI output tuning. Two independent rates:
  *   - `frameRate`         — how often we BROADCAST to NDI. The feed always
@@ -58,16 +60,23 @@ const NDI_FRAME_RATE_DEFAULT = 30;
  *                           look for a new picture. `0` means "capture every
  *                           broadcast frame" (tie capture to `frameRate`).
  *
- *   scoreboard — live match clock. Capture and broadcast both run at 15 fps,
- *     so the seconds tick is perfectly smooth while costing half of 30 fps.
+ *   scoreboard — live match clock + barn-door / fade transitions. v2.0.5:
+ *     captured every broadcast frame at 60 fps for smooth motion, and
+ *     broadcast on the NDI hardware clock via the decoupled resend loop
+ *     (`continuousResend`) so the send cadence is rock-steady instead of
+ *     riding `capturePage()` completion jitter (which made receivers buffer
+ *     seconds of latency and then skip).
  *
  *   bracket — the graphic is essentially static (it only changes when the
  *     operator advances the bracket). We keep broadcasting continuously at
- *     `frameRate` so the bracket is ALWAYS displaying (never goes black on a
- *     receiver), but only re-capture the page every `captureIntervalMs` (5 s)
- *     to check for changes — capturing a 1080p page is the expensive part,
- *     not re-sending the last frame. `continuousResend` re-broadcasts the
- *     most recent captured frame on the broadcast clock between captures.
+ *     `frameRate` (15 fps) so the bracket is ALWAYS displaying (never goes
+ *     black on a receiver), but only re-capture the page every
+ *     `captureIntervalMs` (5 s) to check for changes — capturing a 1080p page
+ *     is the expensive part, not re-sending the last frame.
+ *
+ * `continuousResend` (now true for both scenes) means the broadcast is driven
+ * by a backpressured loop that re-sends the most recent captured frame on the
+ * NDI clock, decoupled from the capture cadence.
  *
  * A future NDI settings UI can override these per install; until then the
  * scene defaults are the single source of truth.
@@ -75,7 +84,7 @@ const NDI_FRAME_RATE_DEFAULT = 30;
  * @type {Record<string, { frameRate: number, captureIntervalMs: number, continuousResend: boolean }>}
  */
 const SCENE_FEED_DEFAULTS = {
-  scoreboard: { frameRate: 15, captureIntervalMs: 0, continuousResend: false },
+  scoreboard: { frameRate: 60, captureIntervalMs: 0, continuousResend: true },
   bracket: { frameRate: 15, captureIntervalMs: 5000, continuousResend: true },
 };
 
@@ -188,9 +197,11 @@ async function startNdiFeed(opts) {
 
   log(
     `[ndi-feed/${scene}] starting "${sourceName}" @ ${frameRate}fps` +
-      ` (${frameRateN}/${frameRateD})` +
+      ` (${frameRateN}/${frameRateD}) NDI-clocked` +
       (continuousResend
-        ? ` continuous-resend (re-capture every ${captureIntervalMs}ms)`
+        ? ` continuous-resend (re-capture ${
+            captureIntervalMs > 0 ? `every ${captureIntervalMs}ms` : "every frame"
+          })`
         : ""),
   );
 
@@ -215,6 +226,8 @@ async function startNdiFeed(opts) {
     sender: senderResult.sender,
     latestImage: null,
     sendTimer: null,
+    /** Set true by stopNdiFeed so the backpressured send loop exits. */
+    stopped: false,
     startedAt: Date.now(),
     framesSent: 0,
     framesSkipped: 0,
@@ -252,16 +265,17 @@ async function startNdiFeed(opts) {
    *      Better to skip a beat and start the receiver-visible stream
    *      with a fully-laid-out frame.
    *
-   * Sized to ~1 s of warmup for a per-frame capture (e.g. 15 frames at
-   * 15 fps), matching the smoke test's `SMOKE_TEST_WARMUP_MS = 1500` ish.
-   * Continuous-resend feeds (e.g. bracket) capture slowly — their first
-   * capture lands seconds after `did-finish-load`, by which point the page
-   * is fully laid out, so they need no warmup skip (otherwise warmup would
-   * span minutes at one capture per 5 s).
+   * Sized to ~1 s of warmup for a per-frame capture (e.g. 60 frames at
+   * 60 fps). Keyed off the CAPTURE cadence, not `continuousResend`: a
+   * per-frame-capture feed (scoreboard, `captureIntervalMs === 0`) still
+   * needs to skip its hydration frames even though it now resends; a
+   * slow-capture feed (bracket, `captureIntervalMs > 0`) lands its first
+   * capture seconds after `did-finish-load` by which point the page is
+   * fully laid out, so it needs no warmup (otherwise warmup would span
+   * minutes at one capture per 5 s).
    */
-  const NDI_FEED_WARMUP_FRAMES = continuousResend
-    ? 0
-    : Math.max(10, Math.round(frameRate));
+  const NDI_FEED_WARMUP_FRAMES =
+    captureIntervalMs > 0 ? 0 : Math.max(10, Math.round(frameRate));
 
   /**
    * Fire-and-forget per-frame send. We return the promise from
@@ -345,37 +359,25 @@ async function startNdiFeed(opts) {
   };
 
   /**
-   * Hand one frame to NDI (fire-and-forget). Shared by the capture-driven
-   * path (scoreboard: send each capture) and the resend loop (bracket:
-   * re-broadcast the latest capture on the broadcast clock).
+   * Hand one frame to NDI and await the send. With `clockVideo: true` the
+   * underlying `NDIlib_send_send_video_v2` sleeps (on grandiose's worker
+   * thread) until the frame's slot on the NDI clock, so awaiting this is what
+   * paces the broadcast to `frameRate`. The frame buffer is memoized per
+   * `NativeImage` inside `ndiSender`, so re-sending the same capture is cheap.
    */
-  const sendFrame = (image) => {
+  const sendFrameAwait = async (image) => {
     if (!record.sender || !image) return;
     if (!firstFramePngWritten) {
       writeFirstFramePng(image);
     }
-    const sendPromise = ndiSender.sendNdiVideoFrame(
+    await ndiSender.sendNdiVideoFrame(
       record.sender,
       image,
       frameRateN,
       frameRateD,
       log,
     );
-    if (sendPromise && typeof sendPromise.then === "function") {
-      sendPromise
-        .then(() => {
-          record.framesSent += 1;
-        })
-        .catch((err) => {
-          record.sendFailures += 1;
-          record.lastSendError = String(err?.message || err);
-          if (record.sendFailures <= 3) {
-            log(`[ndi-feed/${scene}] send failure (${record.sendFailures}): ${record.lastSendError}`);
-          }
-        });
-    } else {
-      record.framesSent += 1;
-    }
+    record.framesSent += 1;
   };
 
   let warmupAnnounced = false;
@@ -393,15 +395,40 @@ async function startNdiFeed(opts) {
       return;
     }
     record.capturesReceived += 1;
+    /**
+     * Stash the newest capture. The backpressured send loop re-broadcasts it
+     * on the NDI clock, so the source is always displaying (and steadily
+     * paced) regardless of how often / irregularly captures arrive.
+     */
+    record.latestImage = image;
+  };
 
-    if (record.continuousResend) {
-      // Stash the newest capture; the resend loop keeps broadcasting it at
-      // `frameRate` so the source is always displaying between captures.
-      record.latestImage = image;
-      return;
+  /**
+   * Backpressured broadcast loop. Awaits each clocked `video()` send before
+   * issuing the next, so at most one frame is in flight per feed and the NDI
+   * hardware clock (not jittery JS timing) sets the cadence — no buildup.
+   */
+  const runSendLoop = async () => {
+    const idleMs = Math.max(1, Math.round(1000 / frameRate));
+    while (!record.stopped && record.sender) {
+      const img = record.latestImage;
+      if (!img) {
+        await delay(idleMs);
+        continue;
+      }
+      try {
+        await sendFrameAwait(img);
+      } catch (err) {
+        record.sendFailures += 1;
+        record.lastSendError = String(err?.message || err);
+        if (record.sendFailures <= 3) {
+          log(
+            `[ndi-feed/${scene}] send failure (${record.sendFailures}): ${record.lastSendError}`,
+          );
+        }
+        await delay(idleMs);
+      }
     }
-
-    sendFrame(image);
   };
 
   let source = null;
@@ -437,16 +464,9 @@ async function startNdiFeed(opts) {
 
   record.source = source;
 
-  if (continuousResend) {
-    // Decoupled broadcast clock: re-send the most recent capture at
-    // `frameRate` so the source streams continuously (always displaying)
-    // even though the page is only re-captured every `captureIntervalMs`.
-    const sendIntervalMs = Math.max(1, Math.round(1000 / frameRate));
-    record.sendTimer = setInterval(() => {
-      if (!record.sender || !record.latestImage) return;
-      sendFrame(record.latestImage);
-    }, sendIntervalMs);
-  }
+  // NDI-clocked, backpressured broadcast (decoupled from capture cadence).
+  // Fire-and-forget: the loop self-terminates when `record.stopped` flips.
+  void runSendLoop();
 
   activeFeeds.set(scene, record);
   log(`[ndi-feed/${scene}] running. Receivers should now see "${sourceName}".`);
@@ -461,6 +481,8 @@ function stopNdiFeed(scene, onLog) {
   const record = activeFeeds.get(scene);
   if (!record) return { ok: true, alreadyStopped: true };
   activeFeeds.delete(scene);
+  /** Signal the backpressured send loop to exit on its next iteration. */
+  record.stopped = true;
   if (record.sendTimer) {
     clearInterval(record.sendTimer);
     record.sendTimer = null;

@@ -54,9 +54,21 @@ export default function DashboardClient() {
     });
   }, [renderHome, openTabs.length]);
 
+  /**
+   * The home / cloud catalog reads best centered at a comfortable max width.
+   * The event dashboard, however, should fill the whole window so wide / ultra-
+   * wide monitors (e.g. 3027×1440) put the extra real estate into the resizable
+   * cards instead of empty side margins.
+   */
+  const contentWidthClass = renderHome
+    ? "mx-auto max-w-[1600px]"
+    : "max-w-none";
+
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-[#121212] text-zinc-100">
-      <div className="mx-auto flex min-h-0 w-full max-w-[1600px] flex-1 flex-col px-3 pb-3 pt-3">
+      <div
+        className={`flex min-h-0 w-full flex-1 flex-col px-3 pb-3 pt-3 ${contentWidthClass}`}
+      >
         {!ready ? (
           <p className="px-1 py-8 text-center text-sm text-zinc-500">Starting workspace…</p>
         ) : renderHome ? (

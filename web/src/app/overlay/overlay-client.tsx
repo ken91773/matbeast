@@ -201,6 +201,19 @@ export default function OverlayClient() {
    * (introduced in v0.9.23).
    */
   const isNdi = searchParams.get("ndi") === "1";
+  /**
+   * Audible-cue opt-in for a standalone scoreboard overlay loaded outside
+   * Electron (e.g. an OBS/Chrome Browser Source on the broadcast PC). The
+   * visible operator-monitor windows on the scoreboard PC must stay silent
+   * (the dashboard ControlPanel already plays cues there), so this audible
+   * path is gated behind an explicit `audio=1` query flag that only the
+   * remote Browser Source URL carries — never the operator's own windows.
+   */
+  const audioEnabled = searchParams.get("audio") === "1";
+  /** `?diag=1` shows a small build-version stamp so a Browser Source can be
+   * verified to be running the expected build (vs. a stale cached one). */
+  const showDiag = searchParams.get("diag") === "1";
+  const appVersion = process.env.NEXT_PUBLIC_APP_VERSION ?? "?";
   const previewSceneParam = searchParams.get("previewScene");
   const forcePreviewLive = searchParams.get("forcePreviewLive") === "1";
   const disableBarnDoor = searchParams.get("disableBarnDoor") === "1";
@@ -224,6 +237,23 @@ export default function OverlayClient() {
     if (o === "bracket" || o === "scoreboard") return o;
     return null;
   }, [isPreview, searchParams]);
+
+  /**
+   * A window locked to the bracket scene (e.g. an OBS bracket Browser Source)
+   * shows content that changes only seldom, so all of its polling runs at a
+   * lazy cadence to keep the remote source light instead of hammering the API
+   * at the scoreboard's sub-second rate.
+   */
+  const isBracketSource = lockedOutputScene === "bracket";
+  const BRACKET_SOURCE_POLL_MS = 5000;
+  /**
+   * Idle board-poll cap for a scoreboard source. The running clock is
+   * extrapolated locally from `timerEndsAt`, so this only governs how fast
+   * discrete edges (start/stop, manual cue nonces, name/score changes) are
+   * picked up. 250 ms keeps worst-case edge lag to ~¼ s on a remote OBS
+   * Browser Source while staying trivially cheap on the LAN.
+   */
+  const SCOREBOARD_SOURCE_MAX_POLL_MS = 250;
 
   /**
    * Bracket overlay window: drive the looping music engine. Gated to the
@@ -316,6 +346,67 @@ export default function OverlayClient() {
   }, [isPreview]);
 
   /**
+   * Constant, id-less overlay URL support (e.g. an OBS Browser Source on
+   * another PC): when no explicit `?tournamentId=` is supplied and this is not
+   * the dashboard preview iframe, follow whichever event the operator is
+   * currently driving — published by the dashboard to `/api/active-tournament`.
+   * Polled (incl. in background, for OBS) so the overlay tracks event switches
+   * and survives event re-opens / app relaunches, which mint brand-new
+   * tournament ids and would otherwise break a baked-in URL.
+   */
+  const followActiveTournament = !isPreview && !forcedTournamentIdFromQuery;
+  const { data: activeTournamentResp } = useQuery({
+    queryKey: ["active-overlay-tournament"],
+    queryFn: async () => {
+      const res = await fetch("/api/active-tournament", { cache: "no-store" });
+      if (!res.ok) throw new Error("active-tournament fetch failed");
+      return (await res.json()) as { tournamentId: string | null };
+    },
+    enabled: followActiveTournament,
+    refetchInterval: 3000,
+    refetchIntervalInBackground: true,
+    refetchOnWindowFocus: true,
+  });
+  useEffect(() => {
+    if (!followActiveTournament) return;
+    const id = activeTournamentResp?.tournamentId?.trim() || "";
+    if (!id) return;
+    setRuntimeTournamentId((prev) => (prev === id ? prev : id));
+  }, [followActiveTournament, activeTournamentResp]);
+
+  /**
+   * Remote-overlay show-control mirror (v2.0.3). A Browser Source on another PC
+   * never receives the dashboard's BroadcastChannel, so it polls the
+   * server-mirrored control state (OVERLAY LIVE / barn doors, SHOW TEAMS swaps
+   * + fades, bracket current-match highlight) and applies it below. The apply
+   * effect defers to BroadcastChannel on the operator's own machine.
+   */
+  const { data: overlayControlResp } = useQuery({
+    queryKey: ["overlay-control-state"],
+    queryFn: async () => {
+      const res = await fetch("/api/overlay-control", { cache: "no-store" });
+      if (!res.ok) throw new Error("overlay-control fetch failed");
+      return (await res.json()) as {
+        live: boolean;
+        scene: OverlayScene;
+        scoreboardMode: ScoreboardOverlayMode;
+        teamAId: string | null;
+        teamBId: string | null;
+        modeTournamentId: string | null;
+        highlight: { team: "A" | "B"; playerIndex: number } | null;
+        highlightTournamentId: string | null;
+        bracketMatchId: string | null;
+        bracketTournamentId: string | null;
+        rev: number;
+      };
+    },
+    enabled: !isPreview,
+    refetchInterval: isBracketSource ? BRACKET_SOURCE_POLL_MS : 400,
+    refetchIntervalInBackground: true,
+    refetchOnWindowFocus: true,
+  });
+
+  /**
    * Output window bootstraps tabs from localStorage async; use server list
    * for the canonical event name.
    *
@@ -372,7 +463,12 @@ export default function OverlayClient() {
     staleTime: 0,
     gcTime: 0,
     refetchInterval: (query) =>
-      boardRefetchIntervalMs(query.state.data as BoardPayload | undefined),
+      isBracketSource
+        ? BRACKET_SOURCE_POLL_MS
+        : boardRefetchIntervalMs(
+            query.state.data as BoardPayload | undefined,
+            SCOREBOARD_SOURCE_MAX_POLL_MS,
+          ),
     refetchOnMount: "always",
     refetchOnWindowFocus: true,
   });
@@ -417,12 +513,19 @@ export default function OverlayClient() {
    * monitors via this offscreen renderer.
    *
    *   isPreview      → no cues (dashboard preview iframe is visual only)
-   *   visible scoreboard window (no NDI, no preview)
+   *   visible scoreboard window (no NDI, no preview, no audio flag)
    *                  → no cues (dashboard already plays them audibly)
    *   offscreen NDI scoreboard renderer (`isNdi`)
    *                  → cues fire silently and stream PCM via NDI
+   *   remote Browser Source scoreboard (`audio=1`, not NDI/preview)
+   *                  → cues fire AUDIBLY through the local audio output so
+   *                    OBS/the broadcast PC can capture them
    *   bracket scenes → no cues (timer cues belong to scoreboard scene)
    */
+  const wantNdiScoreboardCues =
+    !isPreview && isNdi && lockedOutputScene === "scoreboard";
+  const wantAudibleBrowserCues =
+    !isPreview && !isNdi && audioEnabled && lockedOutputScene === "scoreboard";
   useTimerAlertSounds(
     board?.secondsRemaining,
     ndiTimerAudioResetKey,
@@ -432,11 +535,15 @@ export default function OverlayClient() {
     board?.timerRestMode,
     board?.sound10PlayNonce,
     board?.sound0PlayNonce,
-    !isPreview && isNdi && lockedOutputScene === "scoreboard",
+    wantNdiScoreboardCues || wantAudibleBrowserCues,
     board?.timerOtCountdownMode ?? false,
     board?.timerRunning,
     board?.timerEndsAt ?? null,
-    { tapPcmForNdi: true, ndiScene: "scoreboard" },
+    {
+      tapPcmForNdi: wantNdiScoreboardCues,
+      ndiScene: "scoreboard",
+      skipSinkRouting: wantAudibleBrowserCues,
+    },
   );
 
   const [stableBracketTitlesById, setStableBracketTitlesById] = useState<
@@ -481,7 +588,7 @@ export default function OverlayClient() {
     enabled: !!overlayTournamentId,
     staleTime: 0,
     gcTime: 0,
-    refetchInterval: 500,
+    refetchInterval: isBracketSource ? BRACKET_SOURCE_POLL_MS : 500,
     refetchOnMount: "always",
     refetchOnWindowFocus: true,
   });
@@ -497,7 +604,7 @@ export default function OverlayClient() {
     enabled: !!overlayTournamentId,
     staleTime: 0,
     gcTime: 0,
-    refetchInterval: 500,
+    refetchInterval: isBracketSource ? BRACKET_SOURCE_POLL_MS : 500,
     refetchOnMount: "always",
     refetchOnWindowFocus: true,
   });
@@ -539,6 +646,16 @@ export default function OverlayClient() {
     useState<ScoreboardOverlayMode>("scoreboard");
   const [teamListAId, setTeamListAId] = useState<string | null>(null);
   const [teamListBId, setTeamListBId] = useState<string | null>(null);
+  /**
+   * Wall-clock of the last control message received over BroadcastChannel.
+   * Used to detect a *remote* overlay (an OBS / browser source on another PC,
+   * which never gets BroadcastChannel): if no broadcast has arrived recently,
+   * the server-control poll below drives the show instead. Local in-app output
+   * windows keep getting broadcasts, so the (slower) poll defers to them and
+   * never fights the instant same-machine path.
+   */
+  const lastControlBroadcastAtRef = useRef(0);
+  const appliedControlRevRef = useRef(-1);
   /**
    * Sequential fade controller for the team-list layer. `teamListAId/BId` are
    * the *target* (from the latest `scoreboard-mode` broadcast); `teamRenderA/B`
@@ -883,6 +1000,7 @@ export default function OverlayClient() {
     channel.onmessage = (ev: MessageEvent) => {
       if (!isOverlayOutputBroadcast(ev.data)) return;
       const m = ev.data;
+      lastControlBroadcastAtRef.current = Date.now();
       if (m.kind === "live" || m.kind === "pong") {
         setOutputLive(m.live);
       } else if (m.kind === "scene") {
@@ -976,6 +1094,41 @@ export default function OverlayClient() {
   useEffect(() => {
     setTeamListHighlight(null);
   }, [teamListAId, teamListBId]);
+
+  /**
+   * Apply the server-mirrored control state on a *remote* overlay. Skipped on
+   * the operator's own machine (a BroadcastChannel control message arrived in
+   * the last ~3 s ⇒ the instant same-machine path owns the show and the slower
+   * poll must not fight it). Tournament-scoped fields are filtered to this
+   * overlay's event so a stale value can't drive the wrong tournament.
+   */
+  useEffect(() => {
+    if (isPreview || !overlayControlResp) return;
+    if (Date.now() - lastControlBroadcastAtRef.current < 3000) return;
+    if (appliedControlRevRef.current === overlayControlResp.rev) return;
+    appliedControlRevRef.current = overlayControlResp.rev;
+
+    const c = overlayControlResp;
+    setOutputLive(c.live);
+    if (!lockedOutputScene) setScene(c.scene);
+
+    if (c.modeTournamentId == null || c.modeTournamentId === overlayTournamentId) {
+      setScoreboardMode(c.scoreboardMode);
+      setTeamListAId(c.teamAId);
+      setTeamListBId(c.teamBId);
+    }
+    if (
+      c.highlightTournamentId == null ||
+      c.highlightTournamentId === overlayTournamentId
+    ) {
+      setTeamListHighlight(c.highlight);
+    }
+    if (c.bracketMatchId == null && c.bracketTournamentId == null) {
+      setBracketHighlightMatchId(null);
+    } else if (c.bracketTournamentId === overlayTournamentId) {
+      setBracketHighlightMatchId(c.bracketMatchId);
+    }
+  }, [isPreview, overlayControlResp, lockedOutputScene, overlayTournamentId]);
 
   /**
    * Drive the team-list fade controller off the target (mode + applied ids).
@@ -1138,6 +1291,26 @@ export default function OverlayClient() {
         ...(isPreview || isNdi ? {} : OVERLAY_OUTPUT_FRAME_STYLE),
       }}
     >
+      {showDiag ? (
+        <div
+          style={{
+            position: "fixed",
+            bottom: 6,
+            right: 10,
+            zIndex: 99999,
+            fontFamily: "monospace",
+            fontSize: 14,
+            lineHeight: 1.2,
+            color: "#22d3ee",
+            background: "rgba(0,0,0,0.6)",
+            padding: "2px 6px",
+            borderRadius: 4,
+            pointerEvents: "none",
+          }}
+        >
+          v{appVersion}
+        </div>
+      ) : null}
       <div
         style={{
           position: "relative",

@@ -1,3 +1,15 @@
+/**
+ * Headroom for the libuv worker pool. With NDI hardware clocking
+ * (`clockVideo: true`) each active feed's send loop parks one worker thread
+ * inside `NDIlib_send_send_video_v2` for the duration of a frame interval to
+ * pace output. Two feeds (scoreboard + bracket) + bursty audio sends + the
+ * usual fs/dns/crypto work would otherwise contend for the default pool of 4.
+ * Must be set before libuv first touches the pool.
+ */
+if (!process.env.UV_THREADPOOL_SIZE) {
+  process.env.UV_THREADPOOL_SIZE = "8";
+}
+
 const {
   app,
   BrowserWindow,
@@ -1116,6 +1128,104 @@ function getFreeIpv4Port() {
   });
 }
 
+/**
+ * Stable default port for the bundled dashboard/overlay server. Pinning the
+ * port (instead of an OS-assigned ephemeral one) keeps the OBS Browser Source
+ * URL constant across normal relaunches and crash-recoveries, so operators
+ * never have to rebuild the URL mid-event. Chosen in the IANA "user/registered"
+ * range and away from the dynamic/ephemeral range (49152-65535) to minimise
+ * the chance of colliding with another app's transient socket. A port is
+ * per-machine, so this never conflicts with the same port on other PCs.
+ * Override with the `MAT_BEAST_PORT` env var if 47800 is ever unsuitable.
+ */
+const PREFERRED_FIXED_PORT = 47800;
+
+/** Resolve true if `port` can be bound on `host` right now (then releases it). */
+function isPortBindable(port, host) {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    let settled = false;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      try {
+        srv.close(() => resolve(ok));
+      } catch {
+        resolve(ok);
+      }
+    };
+    srv.once("error", () => done(false));
+    try {
+      srv.listen(port, host, () => done(true));
+    } catch {
+      done(false);
+    }
+  });
+}
+
+/**
+ * Windows-only: if the preferred fixed port is held by an *orphaned* bundled
+ * server from a previously-crashed app instance (image `matbeast-node.exe`),
+ * terminate just that process so the new launch can reclaim the same port.
+ * Only kills a PID that (a) is listening on exactly this port and (b) is our
+ * own bundled-node image — never an unrelated process or another app's server.
+ */
+function reclaimFixedPortFromOrphan(port) {
+  if (process.platform !== "win32") return;
+  try {
+    const netstat = spawnSync("netstat", ["-ano", "-p", "tcp"], {
+      encoding: "utf8",
+      timeout: 6000,
+      windowsHide: true,
+    });
+    if (!netstat || typeof netstat.stdout !== "string") return;
+    const pids = new Set();
+    for (const line of netstat.stdout.split(/\r?\n/)) {
+      const m = line.match(/^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/i);
+      if (m && parseInt(m[1], 10) === port) pids.add(m[2]);
+    }
+    for (const pid of pids) {
+      if (!pid || pid === "0") continue;
+      const tl = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+        encoding: "utf8",
+        timeout: 6000,
+        windowsHide: true,
+      });
+      const isOurs = tl && typeof tl.stdout === "string" && /matbeast-node\.exe/i.test(tl.stdout);
+      if (!isOurs) continue;
+      spawnSync("taskkill", ["/F", "/PID", pid], { timeout: 6000, windowsHide: true });
+      appendBundledServerLog(
+        `${nowIso()}  Reclaimed fixed port ${port} from orphaned matbeast-node pid ${pid}\n`
+      );
+    }
+  } catch {
+    /* best-effort: if cleanup fails we fall back to an ephemeral port below */
+  }
+}
+
+/**
+ * Pick the server port: explicit `MAT_BEAST_PORT` override wins; otherwise
+ * try the stable {@link PREFERRED_FIXED_PORT} (reclaiming it from a crashed
+ * instance first), and only fall back to an OS-assigned ephemeral port if the
+ * fixed one truly cannot be bound (e.g. a foreign process owns it).
+ */
+async function resolveServerPort(bindHost) {
+  const override = String(process.env.MAT_BEAST_PORT ?? "").trim();
+  if (override && /^\d+$/.test(override)) {
+    return parseInt(override, 10);
+  }
+  reclaimFixedPortFromOrphan(PREFERRED_FIXED_PORT);
+  // Give the OS a moment to release the socket after killing an orphan.
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  if (await isPortBindable(PREFERRED_FIXED_PORT, bindHost)) {
+    return PREFERRED_FIXED_PORT;
+  }
+  appendBundledServerLog(
+    `${nowIso()}  Fixed port ${PREFERRED_FIXED_PORT} unavailable; falling back to an ephemeral port.\n`
+  );
+  return getFreeIpv4Port();
+}
+
 /** Hard cap so a single stuck error (e.g. Prisma P2022 spamming per poll)
  *  can't silently grow the log to hundreds of MB. When we cross the
  *  threshold the current log is rotated to `.old` (overwriting any
@@ -1788,10 +1898,7 @@ async function startBundledNextServer() {
   const bindHost = "0.0.0.0";
   const loopbackHost = "127.0.0.1";
   updateStartupStatus("Finding an available local server port.");
-  const port =
-    process.env.MAT_BEAST_PORT && /^\d+$/.test(String(process.env.MAT_BEAST_PORT).trim())
-      ? parseInt(String(process.env.MAT_BEAST_PORT).trim(), 10)
-      : await getFreeIpv4Port();
+  const port = await resolveServerPort(bindHost);
   appUrl = `http://${loopbackHost}:${port}`;
   updateStartupStatus(`Local dashboard URL reserved: ${appUrl}.`);
 
@@ -1909,6 +2016,21 @@ function attachMainWindowCloseConfirm(win) {
   win.on("close", async (e) => {
     if (win._matbeastQuitAllowClose || win.isDestroyed()) return;
     e.preventDefault();
+
+    // Local-file backup prompt (renderer-driven), run first. For each open
+    // event with edits since its last local save, the renderer asks whether
+    // to save to / back up to a `.matb` file. If the user cancels any prompt,
+    // keep the window open. Runs alongside the cloud-sync dialog below.
+    try {
+      const lb = await win.webContents.executeJavaScript(
+        "window.__MATBEAST_LOCAL_BACKUP_BEFORE_QUIT__ ? window.__MATBEAST_LOCAL_BACKUP_BEFORE_QUIT__() : Promise.resolve({ proceed: true })",
+        true,
+      );
+      if (lb && lb.proceed === false) return; // user cancelled — stay open
+    } catch {
+      /* renderer probe failed — fall through to the cloud-sync flow */
+    }
+    if (win.isDestroyed()) return;
 
     // Probe the renderer for unsynced state: either dirty open tabs
     // (edits not yet pushed) OR linked events still queued for the
@@ -2157,10 +2279,13 @@ function createMainWindow() {
   mainWindow = new BrowserWindow({
     title: titleWithVersion,
     icon: appIconPath,
+    // Restore (un-maximized) size; the window opens maximized below so it
+    // fills whatever monitor it lands on (incl. ultrawide like 3027×1440).
     width: 1500,
     height: 980,
     minWidth: 1200,
     minHeight: 760,
+    show: false,
     backgroundColor: "#111827",
     autoHideMenuBar: false,
     webPreferences: {
@@ -2169,6 +2294,22 @@ function createMainWindow() {
       nodeIntegration: false,
       backgroundThrottling: false,
     },
+  });
+
+  /**
+   * Open in borderless full screen (no title bar / taskbar). Deferring to
+   * `ready-to-show` (and keeping `show: false` above) avoids the brief
+   * 1500×980 flash before the window snaps full. We `maximize()` first so the
+   * pre-fullscreen state is "maximized" — that's what Escape / exit-fullscreen
+   * restores to (see the `app:set-main-fullscreen` IPC and the renderer Escape
+   * handler). Full screen fills the host display at any DPI, no per-resolution
+   * math needed.
+   */
+  mainWindow.once("ready-to-show", () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.maximize();
+    mainWindow.setFullScreen(true);
+    mainWindow.show();
   });
 
   /**
@@ -3339,6 +3480,20 @@ function buildMenuTemplate() {
           },
         },
         { type: "separator" },
+        {
+          /**
+           * Re-enter borderless full screen after Escape (or exit-fullscreen)
+           * dropped the dashboard to a maximized window. Ctrl+F is the
+           * shortcut; F11 still toggles via the platform role below.
+           */
+          label: "Full Screen",
+          accelerator: "CmdOrControl+F",
+          click: () => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.setFullScreen(true);
+            }
+          },
+        },
         { role: "minimize" },
         { role: "zoom" },
         { role: "togglefullscreen" },
@@ -4150,6 +4305,23 @@ if (!gotSingleInstanceLock) {
         mainWindow.focus();
         /** Deferred so we run after Windows foreground bookkeeping (see {@link scheduleMainWebContentsKeyboardFocus}). */
         scheduleMainWebContentsKeyboardFocus();
+      }
+    } catch {
+      /* ignore */
+    }
+    return { ok: true };
+  });
+
+  /**
+   * Renderer-driven full-screen control. The Escape key handler in the
+   * dashboard calls this with `enabled: false` to drop from borderless full
+   * screen back to a maximized window (the pre-fullscreen state). Entering
+   * full screen is normally done via the Window ▸ Full Screen menu (Ctrl+F).
+   */
+  ipcMain.handle("app:set-main-fullscreen", async (_event, payload) => {
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.setFullScreen(Boolean(payload && payload.enabled));
       }
     } catch {
       /* ignore */
