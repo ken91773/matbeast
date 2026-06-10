@@ -1,6 +1,14 @@
 # Progress Log
 
 ## Current Build Status
+- **v2.0.21 (2026-06-10)** — Fix: full screen triggered on a bare "F".
+  The Window ▸ Full Screen menu item registered a single-letter Electron
+  accelerator (`CmdOrControl+F`), which on Windows could fire on a plain "F"
+  (e.g. typed into a field). Now `registerAccelerator: false` (the menu still
+  shows "Ctrl+F" as a hint) and the real chord is handled in the renderer
+  (`AppChrome.tsx`) with an explicit modifier check: Ctrl/Cmd+F enters full
+  screen, Escape exits. (`electron/main.js`, `AppChrome.tsx`.)
+  Built + published.
 - **v2.0.20 (2026-06-10)** — Dashboard opens in borderless full screen; Escape ⇄ Ctrl+F.
   The dashboard window now launches in true full screen (no title bar / taskbar) instead of
   a maximized window. Pressing Escape drops it back to a maximized window (with borders), and

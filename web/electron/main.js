@@ -3485,9 +3485,16 @@ function buildMenuTemplate() {
            * Re-enter borderless full screen after Escape (or exit-fullscreen)
            * dropped the dashboard to a maximized window. Ctrl+F is the
            * shortcut; F11 still toggles via the platform role below.
+           *
+           * `registerAccelerator: false` — the real Ctrl+F is handled in the
+           * renderer (AppChrome) with an explicit modifier check. Letting
+           * Electron register this single-letter accelerator caused a bare
+           * "F" to trigger full screen on Windows; this keeps the menu hint
+           * ("Ctrl+F") without registering the global key.
            */
           label: "Full Screen",
           accelerator: "CmdOrControl+F",
+          registerAccelerator: false,
           click: () => {
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.setFullScreen(true);

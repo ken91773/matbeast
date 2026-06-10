@@ -115,13 +115,32 @@ export default function AppChrome() {
   >(null);
 
   /**
-   * Escape exits borderless full screen back to a maximized window. We skip
-   * it while typing in a field or when any modal/dialog is open so Escape
-   * keeps closing dialogs first; otherwise we ask the main process to drop
-   * full screen (a no-op when already windowed).
+   * Full-screen keyboard control, handled here (not via a registered Electron
+   * menu accelerator) so it fires ONLY on the real chord:
+   *   - Ctrl/Cmd + F  → enter borderless full screen.
+   *   - Escape        → exit back to a maximized window.
+   * The Window ▸ Full Screen menu item keeps `Ctrl+F` as a display hint but
+   * does NOT register the accelerator (a bare "F" was triggering it). Escape
+   * is skipped while typing in a field or when a modal/dialog is open so it
+   * keeps closing dialogs first.
    */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const desk =
+        typeof window !== "undefined" ? window.matBeastDesktop : undefined;
+
+      // Ctrl/Cmd + F → enter full screen. Requires the modifier so a plain
+      // "F" (e.g. typed into a field) never triggers it.
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        !e.altKey &&
+        (e.key === "f" || e.key === "F" || e.code === "KeyF")
+      ) {
+        e.preventDefault();
+        void desk?.setMainFullScreen?.(true);
+        return;
+      }
+
       if (e.key !== "Escape" && e.code !== "Escape") return;
       const t = e.target;
       if (t instanceof HTMLElement) {
@@ -140,8 +159,6 @@ export default function AppChrome() {
       if (document.querySelector('[role="dialog"], [aria-modal="true"]')) {
         return;
       }
-      const desk =
-        typeof window !== "undefined" ? window.matBeastDesktop : undefined;
       void desk?.setMainFullScreen?.(false);
     };
     window.addEventListener("keydown", onKey);
