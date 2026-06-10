@@ -50,6 +50,46 @@ const ndiSender = require("./ndi-sender.js");
 const NDI_FRAME_RATE_DEFAULT = 30;
 
 /**
+ * Per-scene NDI output tuning. Two independent rates:
+ *   - `frameRate`         — how often we BROADCAST to NDI. The feed always
+ *                           emits at this rate (a continuous stream) so the
+ *                           source is always displaying on every receiver.
+ *   - `captureIntervalMs` — how often we RE-CAPTURE the offscreen page to
+ *                           look for a new picture. `0` means "capture every
+ *                           broadcast frame" (tie capture to `frameRate`).
+ *
+ *   scoreboard — live match clock. Capture and broadcast both run at 15 fps,
+ *     so the seconds tick is perfectly smooth while costing half of 30 fps.
+ *
+ *   bracket — the graphic is essentially static (it only changes when the
+ *     operator advances the bracket). We keep broadcasting continuously at
+ *     `frameRate` so the bracket is ALWAYS displaying (never goes black on a
+ *     receiver), but only re-capture the page every `captureIntervalMs` (5 s)
+ *     to check for changes — capturing a 1080p page is the expensive part,
+ *     not re-sending the last frame. `continuousResend` re-broadcasts the
+ *     most recent captured frame on the broadcast clock between captures.
+ *
+ * A future NDI settings UI can override these per install; until then the
+ * scene defaults are the single source of truth.
+ *
+ * @type {Record<string, { frameRate: number, captureIntervalMs: number, continuousResend: boolean }>}
+ */
+const SCENE_FEED_DEFAULTS = {
+  scoreboard: { frameRate: 15, captureIntervalMs: 0, continuousResend: false },
+  bracket: { frameRate: 15, captureIntervalMs: 5000, continuousResend: true },
+};
+
+function getSceneFeedDefaults(scene) {
+  return (
+    SCENE_FEED_DEFAULTS[scene] || {
+      frameRate: NDI_FRAME_RATE_DEFAULT,
+      captureIntervalMs: 0,
+      continuousResend: false,
+    }
+  );
+}
+
+/**
  * NDI source names. Burned in for v0.9.29. v0.9.31 adds operator-editable
  * names persisted in `desktopPreferences.ndiSourceNames`.
  */
@@ -70,10 +110,17 @@ const activeFeeds = new Map();
  * @property {"scoreboard"|"bracket"} scene
  * @property {string}  sourceName
  * @property {number}  frameRate
+ * @property {boolean} continuousResend  Re-broadcast the latest captured frame
+ *                                       on the broadcast clock (decoupled from
+ *                                       the slower capture cadence).
+ * @property {number}  captureIntervalMs Page re-capture cadence (0 = per frame).
  * @property {object}  source     OffscreenSourceHandle from ndi-source
  * @property {object}  sender     grandiose Sender object
+ * @property {Electron.NativeImage|null} latestImage  Most recent capture (resend).
+ * @property {ReturnType<typeof setInterval>|null} sendTimer  Resend loop handle.
  * @property {number}  startedAt
  * @property {number}  framesSent
+ * @property {number}  capturesReceived  Frames pulled from the offscreen page.
  * @property {number}  sendFailures
  * @property {string|null} lastSendError
  */
@@ -88,6 +135,8 @@ const activeFeeds = new Map();
  *   preloadPath: string,
  *   userDataDir: string,
  *   frameRate?: number,
+ *   captureIntervalMs?: number,
+ *   continuousResend?: boolean,
  *   sourceName?: string,
  *   onLog?: (line: string) => void,
  * }} opts
@@ -118,14 +167,31 @@ async function startNdiFeed(opts) {
     };
   }
 
-  const frameRate = Math.max(1, Math.min(60, opts.frameRate || NDI_FRAME_RATE_DEFAULT));
+  const sceneDefaults = getSceneFeedDefaults(scene);
+  const frameRate = Math.max(
+    1,
+    Math.min(60, opts.frameRate || sceneDefaults.frameRate),
+  );
+  const continuousResend =
+    typeof opts.continuousResend === "boolean"
+      ? opts.continuousResend
+      : sceneDefaults.continuousResend;
+  const captureIntervalMs = Math.max(
+    0,
+    typeof opts.captureIntervalMs === "number"
+      ? opts.captureIntervalMs
+      : sceneDefaults.captureIntervalMs,
+  );
   const sourceName = opts.sourceName || getDefaultSourceName(scene);
   const frameRateN = frameRate * 1000;
   const frameRateD = 1000;
 
   log(
     `[ndi-feed/${scene}] starting "${sourceName}" @ ${frameRate}fps` +
-      ` (${frameRateN}/${frameRateD})`,
+      ` (${frameRateN}/${frameRateD})` +
+      (continuousResend
+        ? ` continuous-resend (re-capture every ${captureIntervalMs}ms)`
+        : ""),
   );
 
   let senderResult;
@@ -143,11 +209,16 @@ async function startNdiFeed(opts) {
     scene,
     sourceName,
     frameRate,
+    continuousResend,
+    captureIntervalMs,
     source: null,
     sender: senderResult.sender,
+    latestImage: null,
+    sendTimer: null,
     startedAt: Date.now(),
     framesSent: 0,
     framesSkipped: 0,
+    capturesReceived: 0,
     sendFailures: 0,
     lastSendError: null,
     /** v0.9.34: audio counters. Populated by `pushAudioForScene` as the
@@ -181,13 +252,16 @@ async function startNdiFeed(opts) {
    *      Better to skip a beat and start the receiver-visible stream
    *      with a fully-laid-out frame.
    *
-   * 30 frames at 30 fps = 1 s of warmup, matching the smoke test's
-   * `SMOKE_TEST_WARMUP_MS = 1500` ish (slightly tighter; we already
-   * delay the capture loop until `did-finish-load` so most of the
-   * smoke test's warmup work is done). We log the skip count once at
-   * the end of warmup so the operator can confirm it from `updater.log`.
+   * Sized to ~1 s of warmup for a per-frame capture (e.g. 15 frames at
+   * 15 fps), matching the smoke test's `SMOKE_TEST_WARMUP_MS = 1500` ish.
+   * Continuous-resend feeds (e.g. bracket) capture slowly — their first
+   * capture lands seconds after `did-finish-load`, by which point the page
+   * is fully laid out, so they need no warmup skip (otherwise warmup would
+   * span minutes at one capture per 5 s).
    */
-  const NDI_FEED_WARMUP_FRAMES = 30;
+  const NDI_FEED_WARMUP_FRAMES = continuousResend
+    ? 0
+    : Math.max(10, Math.round(frameRate));
 
   /**
    * Fire-and-forget per-frame send. We return the promise from
@@ -270,20 +344,13 @@ async function startNdiFeed(opts) {
     }
   };
 
-  let warmupAnnounced = false;
-  const onFrame = (image) => {
-    if (!record.sender) return;
-    if (record.framesSkipped < NDI_FEED_WARMUP_FRAMES) {
-      record.framesSkipped += 1;
-      if (!warmupAnnounced && record.framesSkipped === NDI_FEED_WARMUP_FRAMES) {
-        warmupAnnounced = true;
-        log(
-          `[ndi-feed/${scene}] warmup complete (skipped first ${NDI_FEED_WARMUP_FRAMES} frames);` +
-            ` now broadcasting to receivers.`,
-        );
-      }
-      return;
-    }
+  /**
+   * Hand one frame to NDI (fire-and-forget). Shared by the capture-driven
+   * path (scoreboard: send each capture) and the resend loop (bracket:
+   * re-broadcast the latest capture on the broadcast clock).
+   */
+  const sendFrame = (image) => {
+    if (!record.sender || !image) return;
     if (!firstFramePngWritten) {
       writeFirstFramePng(image);
     }
@@ -311,6 +378,32 @@ async function startNdiFeed(opts) {
     }
   };
 
+  let warmupAnnounced = false;
+  const onFrame = (image) => {
+    if (!record.sender) return;
+    if (record.framesSkipped < NDI_FEED_WARMUP_FRAMES) {
+      record.framesSkipped += 1;
+      if (!warmupAnnounced && record.framesSkipped === NDI_FEED_WARMUP_FRAMES) {
+        warmupAnnounced = true;
+        log(
+          `[ndi-feed/${scene}] warmup complete (skipped first ${NDI_FEED_WARMUP_FRAMES} frames);` +
+            ` now broadcasting to receivers.`,
+        );
+      }
+      return;
+    }
+    record.capturesReceived += 1;
+
+    if (record.continuousResend) {
+      // Stash the newest capture; the resend loop keeps broadcasting it at
+      // `frameRate` so the source is always displaying between captures.
+      record.latestImage = image;
+      return;
+    }
+
+    sendFrame(image);
+  };
+
   let source = null;
   try {
     source = await createOffscreenSource({
@@ -318,6 +411,7 @@ async function startNdiFeed(opts) {
       appUrl: opts.appUrl,
       preloadPath: opts.preloadPath,
       frameRate,
+      captureIntervalMs,
       onFrame,
       onError: (err) => {
         log(`[ndi-feed/${scene}] source error: ${String(err?.message || err)}`);
@@ -342,6 +436,18 @@ async function startNdiFeed(opts) {
   }
 
   record.source = source;
+
+  if (continuousResend) {
+    // Decoupled broadcast clock: re-send the most recent capture at
+    // `frameRate` so the source streams continuously (always displaying)
+    // even though the page is only re-captured every `captureIntervalMs`.
+    const sendIntervalMs = Math.max(1, Math.round(1000 / frameRate));
+    record.sendTimer = setInterval(() => {
+      if (!record.sender || !record.latestImage) return;
+      sendFrame(record.latestImage);
+    }, sendIntervalMs);
+  }
+
   activeFeeds.set(scene, record);
   log(`[ndi-feed/${scene}] running. Receivers should now see "${sourceName}".`);
   return { ok: true, status: getStatus(scene) };
@@ -355,6 +461,11 @@ function stopNdiFeed(scene, onLog) {
   const record = activeFeeds.get(scene);
   if (!record) return { ok: true, alreadyStopped: true };
   activeFeeds.delete(scene);
+  if (record.sendTimer) {
+    clearInterval(record.sendTimer);
+    record.sendTimer = null;
+  }
+  record.latestImage = null;
   try {
     record.source?.destroy?.();
   } catch (err) {
@@ -371,6 +482,7 @@ function stopNdiFeed(scene, onLog) {
     `[ndi-feed/${scene}] stopped.` +
       ` framesSent=${record.framesSent}` +
       ` framesSkipped=${record.framesSkipped || 0}` +
+      ` capturesReceived=${record.capturesReceived || 0}` +
       ` sendFailures=${record.sendFailures}`,
   );
   return { ok: true };
@@ -469,9 +581,12 @@ function getStatus(scene) {
     scene: record.scene,
     sourceName: record.sourceName,
     frameRate: record.frameRate,
+    continuousResend: record.continuousResend,
+    captureIntervalMs: record.captureIntervalMs,
     startedAt: record.startedAt,
     framesSent: record.framesSent,
     framesSkipped: record.framesSkipped,
+    capturesReceived: record.capturesReceived,
     sendFailures: record.sendFailures,
     lastSendError: record.lastSendError,
     sourceCounters: record.source?.counters || null,
@@ -499,5 +614,7 @@ module.exports = {
   getStatus,
   getAllStatuses,
   getDefaultSourceName,
+  getSceneFeedDefaults,
+  SCENE_FEED_DEFAULTS,
   NDI_FRAME_RATE_DEFAULT,
 };

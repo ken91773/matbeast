@@ -267,6 +267,13 @@ let bracketOverlayWindow = null;
  * the 16:9 aspect ratio. Toggled from the Window menu.
  */
 let scoreboardPreviewMonitorWindow = null;
+/**
+ * Operator-chosen display id for the Scoreboard Preview Monitor (picked from
+ * the dialog when the Window-menu item is selected). When set and the display
+ * is still attached, the monitor opens/snaps to it; otherwise the heuristic
+ * fallback in {@link pickScoreboardPreviewMonitorDisplay} is used.
+ */
+let selectedPreviewMonitorDisplayId = null;
 let overlayTournamentId = null;
 function closeOverlayWindows() {
   const wins = [
@@ -1394,6 +1401,11 @@ const ADDITIVE_COLUMN_PATCHES = [
     column: "otPlayDirection",
     ddl: "INTEGER NOT NULL DEFAULT 1",
   },
+  // Preserves the match-end clock + round when the operator starts the rest
+  // timer before saving the final (so the recorded values are not lost).
+  { table: "LiveScoreboardState", column: "recordedMatchClock", ddl: "TEXT" },
+  { table: "LiveScoreboardState", column: "recordedMatchRound", ddl: "TEXT" },
+  { table: "LiveScoreboardState", column: "otIntermediateLogJson", ddl: "TEXT" },
   // v0.7.0 cloud sync — link local master rows to their Mat Beast Masters
   // cloud counterparts. Both nullable so the ALTER is safe on existing DBs.
   { table: "MasterTeamName", column: "cloudId", ddl: "TEXT" },
@@ -2097,21 +2109,32 @@ let hardKeyboardRecoveryInFlight = false;
  */
 function hardRecoverMainWindowKeyboardFocus() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  if (process.platform !== "win32") {
-    // Only Windows exhibits the detached-keyboard-route bug; elsewhere a
-    // soft re-focus is sufficient and avoids needless z-order churn.
-    forceMainWebContentsKeyboardFocus();
-    return;
-  }
   if (hardKeyboardRecoveryInFlight) return;
   hardKeyboardRecoveryInFlight = true;
   try {
-    // Deactivate then reactivate the HWND so Windows + Chromium rebuild the
-    // keyboard route into the renderer (what Alt-Tab does for the user).
-    mainWindow.blur();
-    mainWindow.focus();
+    /**
+     * The soft path's failure mode is that Chromium's focus controller still
+     * believes the web view is focused, so `webContents.focus()` is a no-op
+     * while the OS keyboard route is detached. Explicitly blurring the web
+     * view first forces the subsequent `webContents.focus()` to perform a
+     * *real* focus transition, which rebinds the renderer's keyboard route —
+     * even when an HWND blur()/focus() does nothing on its own (e.g. there is
+     * no other window for Windows to actually deactivate us to, which is why
+     * `blur(); focus();` alone sometimes failed to fix the dead-keyboard bug).
+     */
+    mainWindow.blurWebView();
   } catch {
     /* ignore */
+  }
+  if (process.platform === "win32") {
+    try {
+      // Also cycle HWND activation (the Alt-Tab equivalent) for detaches that
+      // live at the OS level rather than only in Chromium's focus controller.
+      mainWindow.blur();
+      mainWindow.focus();
+    } catch {
+      /* ignore */
+    }
   }
   setImmediate(() => {
     try {
@@ -2479,24 +2502,92 @@ function createOverlayWindows() {
   }
 }
 
+/** ~1920×440 strip monitor (the intended preview hardware). */
+function isStripDisplay(d) {
+  return (
+    Math.abs(d.bounds.width - 1920) <= 8 && Math.abs(d.bounds.height - 440) <= 8
+  );
+}
+
 /**
- * Choose the display for the Scoreboard Preview Monitor. Prefer an attached
- * ~1920×440 strip monitor (the intended hardware); if none is found, fall
- * back to the first non-primary (external) display, then the primary.
+ * Choose the display for the Scoreboard Preview Monitor. Honors the
+ * operator's explicit choice ({@link selectedPreviewMonitorDisplayId}) when
+ * that display is still attached. Otherwise prefer an attached ~1920×440
+ * strip monitor, then the first non-primary (external) display, then primary.
  */
 function pickScoreboardPreviewMonitorDisplay() {
   try {
     const displays = screen.getAllDisplays();
     const primary = screen.getPrimaryDisplay();
-    const isStrip = (d) =>
-      Math.abs(d.bounds.width - 1920) <= 8 && Math.abs(d.bounds.height - 440) <= 8;
-    const strip = displays.find(isStrip);
+    if (selectedPreviewMonitorDisplayId != null) {
+      const chosen = displays.find(
+        (d) => d.id === selectedPreviewMonitorDisplayId,
+      );
+      if (chosen) return chosen;
+    }
+    const strip = displays.find(isStripDisplay);
     if (strip) return strip;
     const external = displays.find((d) => d.id !== primary.id);
     return external ?? primary;
   } catch {
     return screen.getPrimaryDisplay();
   }
+}
+
+/**
+ * Prompt the operator to pick which attached display the Scoreboard Preview
+ * Monitor should open on. Returns the chosen `Display`, or `null` if the
+ * operator cancels. With a single display attached, returns it without
+ * prompting.
+ */
+function chooseScoreboardPreviewMonitorDisplay() {
+  let displays = [];
+  let primaryId = null;
+  try {
+    displays = screen.getAllDisplays();
+    primaryId = screen.getPrimaryDisplay().id;
+  } catch {
+    return null;
+  }
+  if (!displays.length) return null;
+  if (displays.length === 1) return displays[0];
+
+  const labels = displays.map((d, i) => {
+    const tags = [];
+    if (d.id === primaryId) tags.push("Primary");
+    if (isStripDisplay(d)) tags.push("Strip 1920×440");
+    const tagStr = tags.length ? ` — ${tags.join(", ")}` : "";
+    return `Display ${i + 1}: ${d.bounds.width}×${d.bounds.height} @ (${d.bounds.x}, ${d.bounds.y})${tagStr}`;
+  });
+  const buttons = [...labels, "Cancel"];
+  const cancelId = buttons.length - 1;
+
+  let defaultId = displays.findIndex(isStripDisplay);
+  if (defaultId < 0) defaultId = displays.findIndex((d) => d.id !== primaryId);
+  if (defaultId < 0) defaultId = 0;
+
+  const parent =
+    mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+  let choice;
+  try {
+    choice = dialog.showMessageBoxSync(parent, {
+      type: "question",
+      title: "Scoreboard Preview Monitor",
+      message: "Select the display for the Scoreboard Preview Monitor",
+      detail:
+        "The preview opens full screen on the chosen display. Tip: the strip monitor is the intended target.",
+      buttons,
+      defaultId,
+      cancelId,
+      noLink: true,
+    });
+  } catch {
+    return null;
+  }
+  if (choice === cancelId || choice < 0 || choice >= displays.length) {
+    return null;
+  }
+  return displays[choice] ?? null;
 }
 
 function isScoreboardPreviewMonitorOpen() {
@@ -2611,9 +2702,17 @@ function closeScoreboardPreviewMonitor() {
 function toggleScoreboardPreviewMonitor() {
   if (isScoreboardPreviewMonitorOpen()) {
     closeScoreboardPreviewMonitor();
-  } else {
-    openScoreboardPreviewMonitor();
+    refreshApplicationMenu();
+    return;
   }
+  const display = chooseScoreboardPreviewMonitorDisplay();
+  if (!display) {
+    // Operator cancelled the picker — leave the monitor closed.
+    refreshApplicationMenu();
+    return;
+  }
+  selectedPreviewMonitorDisplayId = display.id;
+  openScoreboardPreviewMonitor();
   refreshApplicationMenu();
 }
 
@@ -3799,6 +3898,110 @@ if (!gotSingleInstanceLock) {
       return { ok: false, canceled: true };
     }
     return { ok: true, filePath: r.filePath };
+  });
+
+  /**
+   * Render arbitrary HTML to a PDF using Chromium's built-in `printToPDF`
+   * (no external PDF printer / Adobe required) and save it to a user-chosen
+   * file. Used by the Results "Export PDF" button so saving is completely free.
+   */
+  ipcMain.handle("app:export-pdf", async (_event, payload) => {
+    const html = payload?.html;
+    const rawName =
+      payload && typeof payload.defaultName === "string" && payload.defaultName.trim()
+        ? payload.defaultName.trim()
+        : "results.pdf";
+    if (typeof html !== "string" || !html) {
+      return { ok: false, error: "html required" };
+    }
+    const parent = BrowserWindow.getFocusedWindow() || mainWindow;
+    let renderWin = null;
+    try {
+      renderWin = new BrowserWindow({
+        show: false,
+        webPreferences: {
+          sandbox: true,
+          contextIsolation: true,
+          nodeIntegration: false,
+        },
+      });
+      await renderWin.loadURL(
+        "data:text/html;charset=UTF-8," + encodeURIComponent(html),
+      );
+      const pdf = await renderWin.webContents.printToPDF({
+        printBackground: true,
+        pageSize: "Letter",
+      });
+      const docs = app.getPath("documents");
+      const withExt = /\.pdf$/i.test(rawName) ? rawName : `${rawName}.pdf`;
+      const base =
+        path.basename(withExt).replace(/[^a-zA-Z0-9\-_ .]+/g, "_").trim() ||
+        "results.pdf";
+      const r = await dialog.showSaveDialog(parent, {
+        title: "Save results PDF",
+        defaultPath: path.join(docs, base),
+        filters: [{ name: "PDF", extensions: ["pdf"] }],
+      });
+      if (r.canceled || !r.filePath) {
+        return { ok: false, canceled: true };
+      }
+      await fs.promises.writeFile(r.filePath, pdf);
+      return { ok: true, filePath: r.filePath };
+    } catch (e) {
+      return { ok: false, error: String(e?.message || e) };
+    } finally {
+      try {
+        if (renderWin && !renderWin.isDestroyed()) renderWin.destroy();
+      } catch {
+        /* ignore */
+      }
+    }
+  });
+
+  /**
+   * Open the OS print dialog for arbitrary HTML via a hidden window. The
+   * dialog's destinations include the free "Microsoft Print to PDF" plus any
+   * physical printers, so printing never requires paid software.
+   */
+  ipcMain.handle("app:print-html", async (_event, payload) => {
+    const html = payload?.html;
+    if (typeof html !== "string" || !html) {
+      return { ok: false, error: "html required" };
+    }
+    let renderWin = null;
+    try {
+      renderWin = new BrowserWindow({
+        show: false,
+        webPreferences: {
+          sandbox: true,
+          contextIsolation: true,
+          nodeIntegration: false,
+        },
+      });
+      await renderWin.loadURL(
+        "data:text/html;charset=UTF-8," + encodeURIComponent(html),
+      );
+      const win = renderWin;
+      const printed = await new Promise((resolve) => {
+        try {
+          win.webContents.print(
+            { silent: false, printBackground: true },
+            (success) => resolve(Boolean(success)),
+          );
+        } catch {
+          resolve(false);
+        }
+      });
+      return { ok: true, printed };
+    } catch (e) {
+      return { ok: false, error: String(e?.message || e) };
+    } finally {
+      try {
+        if (renderWin && !renderWin.isDestroyed()) renderWin.destroy();
+      } catch {
+        /* ignore */
+      }
+    }
   });
 
   /**

@@ -19,12 +19,10 @@
  *
  * Frame batching:
  *   AudioWorklet processors are called in 128-sample blocks. NDI
- *   prefers ~1024-sample frames (≈ 21.3 ms at 48 kHz) — too small wastes
- *   IPC overhead, too large adds latency. We accumulate exactly
- *   `BUFFER_SIZE` samples per channel before posting, regardless of
- *   how many `process()` calls that takes. The accumulator handles
- *   blocks larger than the remaining capacity by splitting (rare in
- *   practice; only matters if Chromium ever changes the block size).
+ *   prefers moderately sized frames — we accumulate 256 samples per
+ *   channel (~5.3 ms at 48 kHz) before posting to balance IPC overhead
+ *   and latency. A `flush` message posts any partial tail when a cue
+ *   ends so short one-shots are not clipped.
  *
  * Memory ownership:
  *   Each post allocates a fresh planar `Float32Array` and transfers
@@ -42,7 +40,7 @@
  *   (Studio Monitor, OBS NDI, vMix) up-mix to stereo automatically.
  */
 
-const BUFFER_SIZE = 1024;
+const BUFFER_SIZE = 256;
 
 class MatBeastNdiPcmTap extends AudioWorkletProcessor {
   constructor() {
@@ -50,6 +48,31 @@ class MatBeastNdiPcmTap extends AudioWorkletProcessor {
     /** @type {Float32Array[] | null} channel-major accumulator */
     this.channelBuffers = null;
     this.numChannels = 0;
+    this.bufferOffset = 0;
+    this.port.onmessage = (event) => {
+      if (event.data?.type === "flush") {
+        this.flushPartial();
+      }
+    };
+  }
+
+  flushPartial() {
+    if (!this.channelBuffers || this.bufferOffset <= 0) return;
+    const numChannels = this.numChannels;
+    const n = this.bufferOffset;
+    const planar = new Float32Array(numChannels * n);
+    for (let ch = 0; ch < numChannels; ch++) {
+      planar.set(this.channelBuffers[ch].subarray(0, n), ch * n);
+    }
+    this.port.postMessage(
+      {
+        sampleRate,
+        numChannels,
+        numSamples: n,
+        planar: planar.buffer,
+      },
+      [planar.buffer],
+    );
     this.bufferOffset = 0;
   }
 

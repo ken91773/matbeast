@@ -12,6 +12,7 @@ import {
   foldOtRoundElapsedOrphanAnchorWhenPaused,
   isOtRoundLabelFromDropdown,
 } from "@/lib/ot-round-label";
+import { parseOtIntermediateLog } from "@/lib/ot-intermediate-log";
 import { prisma } from "./prisma";
 
 /**
@@ -112,6 +113,21 @@ async function ensureLiveScoreboardStateColumns() {
   if (!cols.has("soundWarningSeconds")) {
     await prisma.$executeRawUnsafe(
       `ALTER TABLE "LiveScoreboardState" ADD COLUMN "soundWarningSeconds" INTEGER NOT NULL DEFAULT 30`,
+    );
+  }
+  if (!cols.has("recordedMatchClock")) {
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE "LiveScoreboardState" ADD COLUMN "recordedMatchClock" TEXT`,
+    );
+  }
+  if (!cols.has("recordedMatchRound")) {
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE "LiveScoreboardState" ADD COLUMN "recordedMatchRound" TEXT`,
+    );
+  }
+  if (!cols.has("otIntermediateLogJson")) {
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE "LiveScoreboardState" ADD COLUMN "otIntermediateLogJson" TEXT`,
     );
   }
 }
@@ -318,6 +334,7 @@ export function toBoardPayload(
     })),
     secondsRemaining: effectiveSeconds(state),
     timerRunning: state.timerRunning,
+    timerEndsAt: state.timerEndsAt?.toISOString() ?? null,
     timerPhase: state.timerPhase,
     overtimeIndex: state.overtimeIndex,
     overtimeWinsLeft: state.overtimeWinsLeft,
@@ -341,6 +358,9 @@ export function toBoardPayload(
           timerRunning: state.timerRunning,
         })
       : 0,
+    otIntermediateLog: parseOtIntermediateLog(
+      (state as { otIntermediateLogJson?: string | null }).otIntermediateLogJson,
+    ),
     showFinalWinnerHighlight: state.showFinalWinnerHighlight,
     timerCuesResetNonce: state.timerCuesResetNonce,
     otRoundTransferConsumed: state.otRoundTransferConsumed,

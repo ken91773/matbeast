@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  OVERLAY_BARN_DOOR_MS,
   type OverlayOutputBroadcast,
   type OverlayScene,
   type ScoreboardOverlayMode,
@@ -20,14 +21,13 @@ import {
   setMatBeastTournamentId,
 } from "@/lib/matbeast-fetch";
 import type { BoardPayload } from "@/types/board";
-import {
-  SCOREBOARD_OT_MAIN_HEX,
-  SCOREBOARD_OT_SUBLINE_HEX,
-} from "@/lib/scoreboard-ot-colors";
+import { useLiveScoreboardTimerLine } from "@/hooks/useLiveScoreboardTimerLine";
+import { boardRefetchIntervalMs } from "@/lib/board-timer-poll";
+import { SCOREBOARD_OT_SUBLINE_HEX } from "@/lib/scoreboard-ot-colors";
 import {
   scoreboardOtRedTimerStyle,
   scoreboardSubclockRoundLabelFromBoard,
-  scoreboardTimerLineFromBoard,
+  scoreboardTimerColorHex,
 } from "@/lib/scoreboard-timer-display";
 import { otRoundLabelParts } from "@/lib/ot-round-label";
 import {
@@ -58,7 +58,7 @@ import { matbeastKeys } from "@/lib/matbeast-query-keys";
 import { matbeastJson } from "@/lib/matbeast-query";
 import { useQuery } from "@tanstack/react-query";
 import { createPortal } from "react-dom";
-import { type CSSProperties, useEffect, useMemo, useState } from "react";
+import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 
 const W = 1920;
 const H = 1080;
@@ -98,8 +98,7 @@ function pctRectFromCorners(corners: Array<[number, number]>) {
   };
 }
 
-/** Live ↔ stopped: left/right shutters meet at center when off-air, slide off when live. */
-const OVERLAY_BARN_DOOR_MS = 1000;
+/** Live ↔ stopped barn-door animation duration: see `OVERLAY_BARN_DOOR_MS` in overlay-output-broadcast. */
 
 /**
  * Maximum players rendered on the team-list overlay per team. Caps the
@@ -372,7 +371,8 @@ export default function OverlayClient() {
     enabled: !!overlayTournamentId,
     staleTime: 0,
     gcTime: 0,
-    refetchInterval: 1000,
+    refetchInterval: (query) =>
+      boardRefetchIntervalMs(query.state.data as BoardPayload | undefined),
     refetchOnMount: "always",
     refetchOnWindowFocus: true,
   });
@@ -434,6 +434,8 @@ export default function OverlayClient() {
     board?.sound0PlayNonce,
     !isPreview && isNdi && lockedOutputScene === "scoreboard",
     board?.timerOtCountdownMode ?? false,
+    board?.timerRunning,
+    board?.timerEndsAt ?? null,
     { tapPcmForNdi: true, ndiScene: "scoreboard" },
   );
 
@@ -538,6 +540,22 @@ export default function OverlayClient() {
   const [teamListAId, setTeamListAId] = useState<string | null>(null);
   const [teamListBId, setTeamListBId] = useState<string | null>(null);
   /**
+   * Sequential fade controller for the team-list layer. `teamListAId/BId` are
+   * the *target* (from the latest `scoreboard-mode` broadcast); `teamRenderA/B`
+   * are what's actually painted, and `teamLayerOpacity` drives a 1 s fade. On
+   * APPLY (or SHOW TEAMS / clear) the controller fades the current content out
+   * over 1 s, swaps the rendered ids, then fades the new content in over 1 s —
+   * so a matchup change reads as a clean out-then-in rather than a hard pop. A
+   * fade *into* an empty layer (nothing currently shown) skips the out phase.
+   */
+  const [teamRenderA, setTeamRenderA] = useState<string | null>(null);
+  const [teamRenderB, setTeamRenderB] = useState<string | null>(null);
+  const [teamLayerOpacity, setTeamLayerOpacity] = useState(0);
+  const teamRenderARef = useRef<string | null>(null);
+  const teamRenderBRef = useRef<string | null>(null);
+  const teamOpacityRef = useRef(0);
+  const teamFadeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
    * Currently-highlighted player in the team list (null = nothing selected).
    * Click-to-glow state synced across every overlay surface (preview iframe,
    * real output window, dashboard) via the `team-list-highlight`
@@ -569,7 +587,11 @@ export default function OverlayClient() {
       }>("/api/players", {
         headers: { [MATBEAST_TOURNAMENT_HEADER]: overlayTournamentId! },
       }),
-    enabled: !!overlayTournamentId && scoreboardMode === "teams",
+    enabled:
+      !!overlayTournamentId &&
+      (scoreboardMode === "teams" ||
+        teamRenderA !== null ||
+        teamRenderB !== null),
     staleTime: 0,
     gcTime: 0,
     refetchInterval: 1000,
@@ -585,15 +607,15 @@ export default function OverlayClient() {
    * players. Returns null if the team id is unset or no longer exists.
    */
   const teamListInputA = useMemo((): TeamListLayerInput | null => {
-    if (!teamListAId) return null;
+    if (!teamRenderA) return null;
     const teams = teamsPayload?.teams ?? [];
-    const team = teams.find((t) => t.id === teamListAId);
+    const team = teams.find((t) => t.id === teamRenderA);
     if (!team) return null;
     const teamName = (team.name ?? "").trim();
     if (!teamName || teamName.toUpperCase() === "TBD") return null;
     const players = playersPayload?.players ?? [];
     const rostered = players
-      .filter((p) => p.teamId === teamListAId)
+      .filter((p) => p.teamId === teamRenderA)
       .slice()
       .sort((a, b) => {
         const ao = a.lineupOrder == null ? Number.POSITIVE_INFINITY : a.lineupOrder;
@@ -604,18 +626,18 @@ export default function OverlayClient() {
       .filter((n) => n.length > 0)
       .slice(0, TEAM_LIST_STARTER_COUNT);
     return { teamName, players: rostered };
-  }, [teamListAId, teamsPayload?.teams, playersPayload?.players]);
+  }, [teamRenderA, teamsPayload?.teams, playersPayload?.players]);
 
   const teamListInputB = useMemo((): TeamListLayerInput | null => {
-    if (!teamListBId) return null;
+    if (!teamRenderB) return null;
     const teams = teamsPayload?.teams ?? [];
-    const team = teams.find((t) => t.id === teamListBId);
+    const team = teams.find((t) => t.id === teamRenderB);
     if (!team) return null;
     const teamName = (team.name ?? "").trim();
     if (!teamName || teamName.toUpperCase() === "TBD") return null;
     const players = playersPayload?.players ?? [];
     const rostered = players
-      .filter((p) => p.teamId === teamListBId)
+      .filter((p) => p.teamId === teamRenderB)
       .slice()
       .sort((a, b) => {
         const ao = a.lineupOrder == null ? Number.POSITIVE_INFINITY : a.lineupOrder;
@@ -626,7 +648,7 @@ export default function OverlayClient() {
       .filter((n) => n.length > 0)
       .slice(0, TEAM_LIST_STARTER_COUNT);
     return { teamName, players: rostered };
-  }, [teamListBId, teamsPayload?.teams, playersPayload?.players]);
+  }, [teamRenderB, teamsPayload?.teams, playersPayload?.players]);
 
   const previewRedDoorOpen = forcePreviewLive || outputLive;
   const previewSceneOverride = isPreview
@@ -955,6 +977,68 @@ export default function OverlayClient() {
     setTeamListHighlight(null);
   }, [teamListAId, teamListBId]);
 
+  /**
+   * Drive the team-list fade controller off the target (mode + applied ids).
+   * Refs hold the *current* rendered ids / opacity so this effect only depends
+   * on the target — setting the render state below never re-triggers it (no
+   * loop) and the in-flight timer survives the stable window between targets.
+   */
+  useEffect(() => {
+    const setRender = (a: string | null, b: string | null) => {
+      teamRenderARef.current = a;
+      teamRenderBRef.current = b;
+      setTeamRenderA(a);
+      setTeamRenderB(b);
+    };
+    const setOpacity = (o: number) => {
+      teamOpacityRef.current = o;
+      setTeamLayerOpacity(o);
+    };
+    if (teamFadeTimerRef.current) {
+      clearTimeout(teamFadeTimerRef.current);
+      teamFadeTimerRef.current = null;
+    }
+
+    const wantTeams = scoreboardMode === "teams";
+    const targetA = wantTeams ? teamListAId : null;
+    const targetB = wantTeams ? teamListBId : null;
+    const sameContent =
+      teamRenderARef.current === targetA && teamRenderBRef.current === targetB;
+
+    if (wantTeams) {
+      const showingSomething =
+        teamOpacityRef.current > 0 &&
+        (teamRenderARef.current !== null || teamRenderBRef.current !== null);
+      if (sameContent) {
+        setOpacity(1);
+      } else if (!showingSomething) {
+        // Nothing on screen → swap then fade straight in (no out phase).
+        setRender(targetA, targetB);
+        setOpacity(1);
+      } else {
+        // Different content on screen → fade out, swap, fade back in.
+        setOpacity(0);
+        teamFadeTimerRef.current = setTimeout(() => {
+          setRender(targetA, targetB);
+          setOpacity(1);
+        }, OVERLAY_BARN_DOOR_MS);
+      }
+    } else {
+      // Leaving teams (scoreboard / blank) → fade out, then drop the content.
+      setOpacity(0);
+      teamFadeTimerRef.current = setTimeout(() => {
+        setRender(null, null);
+      }, OVERLAY_BARN_DOOR_MS);
+    }
+
+    return () => {
+      if (teamFadeTimerRef.current) {
+        clearTimeout(teamFadeTimerRef.current);
+        teamFadeTimerRef.current = null;
+      }
+    };
+  }, [scoreboardMode, teamListAId, teamListBId]);
+
   useEffect(() => {
     if (!isPreview) return;
     const onMessage = (event: MessageEvent) => {
@@ -1017,7 +1101,7 @@ export default function OverlayClient() {
     };
   }, [isPreview, activeScene]);
 
-  const scoreboardTimerLine = scoreboardTimerLineFromBoard(board ?? undefined);
+  const scoreboardTimerLine = useLiveScoreboardTimerLine(board ?? undefined);
   const scoreboardRoundLine = scoreboardSubclockRoundLabelFromBoard(board ?? undefined);
   const scoreboardOtRoundParts = otRoundLabelParts(board?.roundLabel);
   /**
@@ -1238,22 +1322,12 @@ export default function OverlayClient() {
               }}
             >
               <span
-                className={`shrink-0 px-1 text-center font-black leading-none tabular-nums drop-shadow-[0_4px_12px_rgba(0,0,0,0.9)] ${
-                  board?.timerRestMode
-                    ? "text-amber-300"
-                    : scoreboardOtRedTimerStyle(board ?? undefined)
-                      ? "text-red-800"
-                      : ""
-                }`}
+                className="shrink-0 px-1 text-center font-black leading-none tabular-nums drop-shadow-[0_4px_12px_rgba(0,0,0,0.9)]"
                 style={{
                   /** Fixed px sizing on 1920 stage keeps preview/output identical. */
                   fontSize: "141px",
                   lineHeight: 1,
-                  color: board?.timerRestMode
-                    ? "#fcd34d"
-                    : scoreboardOtRedTimerStyle(board ?? undefined)
-                      ? SCOREBOARD_OT_MAIN_HEX
-                      : "#e5e7eb",
+                  color: scoreboardTimerColorHex(board ?? undefined),
                 }}
               >
                 {scoreboardTimerLine}
@@ -1458,9 +1532,10 @@ export default function OverlayClient() {
           </div>
           {/**
            * Team-list sibling layer. Shares the same barn-door wrapper so
-           * OVERLAY LIVE / STOPPED transitions apply identically; opacity
-           * crossfades against the scoreboard graphic over 1 s whenever the
-           * dashboard broadcasts a `scoreboard-mode` change.
+           * OVERLAY LIVE / STOPPED transitions apply identically. Opacity is
+           * driven by the fade controller above (`teamLayerOpacity`): a 1 s
+           * fade-out then 1 s fade-in on every APPLY / SHOW TEAMS / clear, so
+           * matchup swaps read as out-then-in rather than a hard cut.
            *
            * `pointerEvents` toggles with visibility so clicks only hit the
            * team list when it's actually on screen — while the team list is
@@ -1475,10 +1550,10 @@ export default function OverlayClient() {
               inset: 0,
               width: "100%",
               height: "100%",
-              opacity: scoreboardMode === "teams" ? 1 : 0,
-              transition: "opacity 1000ms ease-in-out",
+              opacity: teamLayerOpacity,
+              transition: `opacity ${OVERLAY_BARN_DOOR_MS}ms ease-in-out`,
               willChange: "opacity",
-              pointerEvents: scoreboardMode === "teams" ? "auto" : "none",
+              pointerEvents: teamLayerOpacity > 0 ? "auto" : "none",
             }}
           >
             <OverlayTeamListLayer

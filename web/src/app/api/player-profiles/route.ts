@@ -10,7 +10,6 @@ import {
 import { queueProfileUpsertForCloud } from "@/lib/master-profile-outbox";
 import { jsonProfilePayload } from "@/lib/player-profile-master-response";
 import { syncProfiles } from "@/lib/cloud-sync";
-import { syncTournamentRosterPlayersToMasterProfiles } from "@/lib/sync-roster-player-master-profile";
 
 const BELTS: readonly BeltRank[] = [
   "WHITE",
@@ -50,14 +49,14 @@ export async function GET(req: Request) {
       tournamentId: tournamentIdHint,
       ...(useTrainingHint !== undefined ? { useTrainingMasters: useTrainingHint } : {}),
     });
+    // NOTE: listing the master profiles is intentionally read-only. We do NOT
+    // backfill roster players into the master table here, because that would
+    // resurrect a profile the operator just deleted (delete → list refresh →
+    // roster player re-creates the same name). Roster players are mirrored into
+    // masters at write time (`/api/players`) and on explicit roster import
+    // (`import-roster-server`), so the master list stays in sync without this
+    // GET re-adding removed entries.
     if (training) {
-      if (tournamentIdHint?.trim()) {
-        await syncTournamentRosterPlayersToMasterProfiles(tournamentIdHint, true).catch(
-          () => {
-            /* roster backfill is best-effort; list existing profiles either way */
-          },
-        );
-      }
       const profiles = await prisma.trainingMasterPlayerProfile.findMany({
         orderBy: [{ lastName: "asc" }, { firstName: "asc" }],
       });
@@ -68,13 +67,6 @@ export async function GET(req: Request) {
     await syncProfiles().catch(() => {
       /* offline / cloud error - fall back to local cache */
     });
-    if (tournamentIdHint?.trim()) {
-      await syncTournamentRosterPlayersToMasterProfiles(tournamentIdHint, false).catch(
-        () => {
-          /* roster backfill is best-effort; list existing profiles either way */
-        },
-      );
-    }
     const profiles = await prisma.masterPlayerProfile.findMany({
       orderBy: [{ lastName: "asc" }, { firstName: "asc" }],
     });

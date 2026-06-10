@@ -1,9 +1,6 @@
 "use client";
 
-import {
-  SCOREBOARD_OT_MAIN_HEX,
-  SCOREBOARD_OT_SUBLINE_HEX,
-} from "@/lib/scoreboard-ot-colors";
+import { SCOREBOARD_OT_SUBLINE_HEX } from "@/lib/scoreboard-ot-colors";
 import {
   CENTER_OT_STRIP,
   CENTER_TIMER,
@@ -19,6 +16,7 @@ import type { BoardPayload } from "@/types/board";
 import {
   scoreboardOtRedTimerStyle,
   scoreboardSubclockRoundLabelFromBoard,
+  scoreboardTimerColorHex,
   scoreboardTimerLineFromBoard,
 } from "@/lib/scoreboard-timer-display";
 import { otRoundLabelParts } from "@/lib/ot-round-label";
@@ -211,7 +209,7 @@ export function OverlayCanvasTextLayer({
         const timerR = vbToPx(CENTER_TIMER);
         const rest = Boolean(board?.timerRestMode);
         const otRed = scoreboardOtRedTimerStyle(board ?? undefined);
-        const timerColor = rest ? "#fcd34d" : otRed ? SCOREBOARD_OT_MAIN_HEX : "#e5e7eb";
+        const timerColor = scoreboardTimerColorHex(board ?? undefined);
         const roundColor = rest ? "#fcd34d" : otRed ? SCOREBOARD_OT_SUBLINE_HEX : "#d9d9d9";
         const line =
           timerLine.trim().length > 0

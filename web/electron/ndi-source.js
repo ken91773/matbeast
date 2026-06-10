@@ -41,7 +41,10 @@ const KNOWN_SCENES = new Set(["scoreboard", "bracket"]);
  * @property {string}   appUrl      Bundled Next server origin (e.g. "http://localhost:31415").
  * @property {string}   preloadPath Absolute path to electron/preload.js.
  * @property {"scoreboard"|"bracket"} scene  Which overlay scene to lock the renderer to.
- * @property {number}   [frameRate=30]  Capture cadence; also the announced NDI frame rate.
+ * @property {number}   [frameRate=30]  Announced NDI frame rate; also the default capture cadence.
+ * @property {number}   [captureIntervalMs]  Override the capture cadence in ms.
+ *   When >0 this decouples how often the page is re-captured from `frameRate`
+ *   (e.g. a static bracket re-captured every 5 s while still broadcast at 15 fps).
  * @property {(image: Electron.NativeImage, dim: {width: number, height: number}) => void} onFrame
  * @property {(error: Error) => void} [onError]
  * @property {(line: string) => void} [onLog]
@@ -61,7 +64,10 @@ async function createOffscreenSource(opts) {
   const log = typeof opts.onLog === "function" ? opts.onLog : () => {};
   const onError = typeof opts.onError === "function" ? opts.onError : () => {};
   const frameRate = Math.max(1, Math.min(60, opts.frameRate || 30));
-  const captureIntervalMs = Math.round(1000 / frameRate);
+  const captureIntervalMs =
+    typeof opts.captureIntervalMs === "number" && opts.captureIntervalMs > 0
+      ? Math.round(opts.captureIntervalMs)
+      : Math.round(1000 / frameRate);
 
   const win = new BrowserWindow({
     show: false,

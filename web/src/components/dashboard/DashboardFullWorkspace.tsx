@@ -21,7 +21,7 @@ import { matbeastJson } from "@/lib/matbeast-query";
 import { postScoreboardMode } from "@/lib/overlay-output-broadcast";
 import type { BoardPayload } from "@/types/board";
 import type { BracketMusicState } from "@/lib/bracket-music-state";
-import { ResultsLogPanel } from "@/components/ResultsLogPanel";
+import { ResultsLogPanel, ResultsExportButton } from "@/components/ResultsLogPanel";
 import { useQuery } from "@tanstack/react-query";
 
 /** Fills parent panel; scroll inside */
@@ -240,7 +240,11 @@ function DashboardResizablePanels({
             minSize="12%"
             className="min-h-0 min-w-0"
           >
-            <SectionShell id="results" title="Results">
+            <SectionShell
+              id="results"
+              title="Results"
+              headerActions={tournamentId ? <ResultsExportButton /> : undefined}
+            >
               {tournamentId ? <ResultsBody /> : <NeedEventPlaceholder />}
             </SectionShell>
           </Panel>
@@ -313,7 +317,12 @@ type OverlayTeamRow = {
   seedOrder: number;
 };
 
-const OVERLAY_APPLY_ERROR_MS = 2000;
+/** Order-sensitive equality for the bracket current-match team-id tuples. */
+function sameStringArray(a: string[] | null, b: string[] | null): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  return a.every((v, i) => v === b[i]);
+}
 
 /**
  * Small-font team picker used in the Overlay card header. Renders a native
@@ -531,7 +540,54 @@ function OverlayStrip() {
   const [teamBId, setTeamBId] = useState<string>("");
   const [appliedTeamAId, setAppliedTeamAId] = useState<string>("");
   const [appliedTeamBId, setAppliedTeamBId] = useState<string>("");
-  const [applyError, setApplyError] = useState(false);
+
+  /**
+   * CURRENT button: the two team ids of the match the operator highlighted in
+   * gold in the Brackets panel, ordered [first/home, second/away]. Mirrored
+   * from BracketPanel's `matbeast-bracket-selection` window event (same window,
+   * sibling component). `null` = no match highlighted. The tap counter cycles
+   * the dropdown population: 1 → TEAM A only, 2 → TEAM B only, 3 → both, 4 →
+   * cleared, then repeats. Reset to 0 whenever the highlighted match changes or
+   * the operator edits a dropdown by hand so CURRENT always starts a fresh cycle.
+   */
+  const [currentMatchTeamIds, setCurrentMatchTeamIds] = useState<string[] | null>(
+    null,
+  );
+  const currentMatchTeamIdsRef = useRef<string[] | null>(null);
+  const [currentTapCount, setCurrentTapCount] = useState(0);
+
+  useEffect(() => {
+    const onBracketSelection = (e: Event) => {
+      const detail = (
+        e as CustomEvent<{
+          tournamentId?: string | null;
+          teamIds?: string[] | null;
+        }>
+      ).detail;
+      if (!detail?.tournamentId || detail.tournamentId !== tournamentId) return;
+      const ids = Array.isArray(detail.teamIds)
+        ? detail.teamIds.filter(
+            (id): id is string => typeof id === "string" && id.length > 0,
+          )
+        : [];
+      const nextIds = ids.length > 0 ? ids : null;
+      // Only restart the cycle when the *teams* actually change — BracketPanel
+      // re-dispatches the same selection on every bracket data refetch, which
+      // must not stomp a tap cycle the operator is in the middle of.
+      if (!sameStringArray(currentMatchTeamIdsRef.current, nextIds)) {
+        setCurrentTapCount(0);
+      }
+      currentMatchTeamIdsRef.current = nextIds;
+      setCurrentMatchTeamIds(nextIds);
+    };
+    window.addEventListener("matbeast-bracket-selection", onBracketSelection);
+    return () => {
+      window.removeEventListener(
+        "matbeast-bracket-selection",
+        onBracketSelection,
+      );
+    };
+  }, [tournamentId]);
 
   /**
    * Any time the user opens a different event (tournament id changes) the
@@ -544,7 +600,9 @@ function OverlayStrip() {
     setTeamBId("");
     setAppliedTeamAId("");
     setAppliedTeamBId("");
-    setApplyError(false);
+    setCurrentMatchTeamIds(null);
+    currentMatchTeamIdsRef.current = null;
+    setCurrentTapCount(0);
     postScoreboardMode(tournamentId ?? null, "scoreboard", null, null);
   }, [tournamentId]);
 
@@ -585,20 +643,6 @@ function OverlayStrip() {
     (teamAId !== appliedTeamAId || teamBId !== appliedTeamBId) &&
     (teamAId !== "" || teamBId !== "");
 
-  /**
-   * Auto-dismiss the "No team selected" discrete error after 2 s per spec.
-   * This is a one-shot timer used only for the error toast, not for any
-   * ongoing background behavior (no autosave / poll / interval touched).
-   */
-  useEffect(() => {
-    if (!applyError) return;
-    const id = window.setTimeout(
-      () => setApplyError(false),
-      OVERLAY_APPLY_ERROR_MS,
-    );
-    return () => window.clearTimeout(id);
-  }, [applyError]);
-
   const handleShowTeamsToggle = () => {
     if (overlayMode === "scoreboard") {
       /** Entering teams mode: reveal the dropdowns (pre-populated with any
@@ -609,7 +653,6 @@ function OverlayStrip() {
        *  scoreboard to the same team list that was on-air before; with no
        *  previously-applied state, the output stays on scoreboard until APPLY. */
       setOverlayMode("teams");
-      setApplyError(false);
       if (appliedTeamAId !== "" || appliedTeamBId !== "") {
         postScoreboardMode(
           tournamentId ?? null,
@@ -617,6 +660,11 @@ function OverlayStrip() {
           appliedTeamAId || null,
           appliedTeamBId || null,
         );
+      } else {
+        /** No matchup applied yet: fade the scoreboard out to nothing now
+         *  (blank) rather than leaving it on-air until APPLY. The overlay
+         *  shows nothing until teams are picked and APPLY'd. */
+        postScoreboardMode(tournamentId ?? null, "blank", null, null);
       }
       return;
     }
@@ -627,16 +675,71 @@ function OverlayStrip() {
      *  team-list graphic. Only the cross-event reset in the `tournamentId`
      *  effect above clears this state. */
     setOverlayMode("scoreboard");
-    setApplyError(false);
     postScoreboardMode(tournamentId ?? null, "scoreboard", null, null);
+  };
+
+  /**
+   * Manual dropdown edits restart the CURRENT cycle so the next CURRENT tap
+   * always begins at "TEAM A only" rather than resuming a stale phase.
+   */
+  const handleTeamAChange = (id: string) => {
+    setTeamAId(id);
+    setCurrentTapCount(0);
+  };
+  const handleTeamBChange = (id: string) => {
+    setTeamBId(id);
+    setCurrentTapCount(0);
+  };
+
+  /**
+   * CURRENT: populate the dropdowns from the gold-highlighted bracket match,
+   * cycling through TEAM A only → TEAM B only → both → cleared on successive
+   * taps. With no highlighted match (or its slots aren't named teams), clear
+   * both dropdowns and reset to the pre-selected (empty) state. CURRENT only
+   * stages the dropdown selection; APPLY still commits it to the output.
+   */
+  const handleCurrent = () => {
+    const ids = currentMatchTeamIds ?? [];
+    const resolve = (id: string | undefined) =>
+      id && namedTeams.some((t) => t.id === id) ? id : "";
+    const firstId = resolve(ids[0]);
+    const secondId = resolve(ids[1]);
+    if (firstId === "" && secondId === "") {
+      setTeamAId("");
+      setTeamBId("");
+      setCurrentTapCount(0);
+      return;
+    }
+    const next = currentTapCount + 1;
+    setCurrentTapCount(next);
+    const phase = ((next - 1) % 4) + 1;
+    if (phase === 1) {
+      setTeamAId(firstId);
+      setTeamBId("");
+    } else if (phase === 2) {
+      setTeamAId("");
+      setTeamBId(secondId);
+    } else if (phase === 3) {
+      setTeamAId(firstId);
+      setTeamBId(secondId);
+    } else {
+      setTeamAId("");
+      setTeamBId("");
+    }
   };
 
   const handleApply = () => {
     if (teamAId === "" && teamBId === "") {
-      setApplyError(true);
+      // APPLY with both dropdowns empty fades the team-list overlay out to
+      // nothing (transparent) — NOT back to the scoreboard graphic. The overlay
+      // stays live (barn doors open) but shows no content. The dropdowns stay
+      // open (overlayMode remains "teams") so the operator can pick a new matchup.
+      setAppliedTeamAId("");
+      setAppliedTeamBId("");
+      setCurrentTapCount(0);
+      postScoreboardMode(tournamentId ?? null, "blank", null, null);
       return;
     }
-    setApplyError(false);
     setAppliedTeamAId(teamAId);
     setAppliedTeamBId(teamBId);
     postScoreboardMode(
@@ -772,17 +875,25 @@ function OverlayStrip() {
                 <OverlayTeamPicker
                   label="TEAM A"
                   value={teamAId}
-                  onChange={setTeamAId}
+                  onChange={handleTeamAChange}
                   teams={namedTeams}
                   excludeId={teamBId}
                 />
                 <OverlayTeamPicker
                   label="TEAM B"
                   value={teamBId}
-                  onChange={setTeamBId}
+                  onChange={handleTeamBChange}
                   teams={namedTeams}
                   excludeId={teamAId}
                 />
+                <button
+                  type="button"
+                  onClick={handleCurrent}
+                  className="rounded border border-amber-600/60 bg-amber-950/30 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-300 hover:bg-amber-900/40"
+                  title="Fill the dropdowns from the match highlighted gold in Brackets. Tap to cycle: TEAM A → TEAM B → both → clear. APPLY to commit."
+                >
+                  CURRENT
+                </button>
                 <button
                   type="button"
                   onClick={handleApply}
@@ -799,11 +910,6 @@ function OverlayStrip() {
                 >
                   APPLY
                 </button>
-                {applyError ? (
-                  <span className="text-[10px] italic text-red-400">
-                    No team selected
-                  </span>
-                ) : null}
                 {/* Hint that the rendered team-list preview below is
                     interactive — clicking a player's name lights it up
                     with the breathing glow. Shown only while team-list

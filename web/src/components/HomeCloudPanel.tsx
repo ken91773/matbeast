@@ -123,7 +123,16 @@ export default function HomeCloudPanel() {
       }
       const evRes = await fetch("/api/cloud/events", { cache: "no-store" });
       if (!evRes.ok) {
-        setError(`Cloud list HTTP ${evRes.status}`);
+        // Surface the real underlying reason (DNS/TLS/timeout/upstream
+        // status) the route puts in `{ error }`, not just a bare 502.
+        let detail = "";
+        try {
+          const body = (await evRes.json()) as { error?: unknown };
+          if (typeof body?.error === "string") detail = body.error;
+        } catch {
+          /* non-JSON body — fall back to status line */
+        }
+        setError(detail || `Cloud list HTTP ${evRes.status}`);
         return;
       }
       const data = (await evRes.json()) as { events: CloudEventMeta[] };

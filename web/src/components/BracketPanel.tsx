@@ -56,6 +56,34 @@ function bracketDropdownRows(teamOptions: TeamRef[]): BracketOptionRow[] {
   return rows;
 }
 
+/**
+ * Next logical team match to run: the first undecided, fully-seeded, real match
+ * in canonical order (quarter-finals by index → semi-finals by index → grand
+ * final). Placeholder slots, decided matches (a winner already set), and matches
+ * with a still-TBD side are skipped. Returns the match id, or null if none
+ * remain (tournament complete or downstream not yet seeded).
+ */
+function pickNextLogicalMatchId(proj: {
+  quarterSlots: BracketMatchJson[];
+  semiSlots: BracketMatchJson[];
+  grandFinalSlot: BracketMatchJson | null;
+}): string | null {
+  const byIndex = (a: BracketMatchJson, b: BracketMatchJson) =>
+    a.bracketIndex - b.bracketIndex;
+  const ordered: BracketMatchJson[] = [
+    ...proj.quarterSlots.slice().sort(byIndex),
+    ...proj.semiSlots.slice().sort(byIndex),
+    ...(proj.grandFinalSlot ? [proj.grandFinalSlot] : []),
+  ];
+  for (const m of ordered) {
+    if (m.id.includes("placeholder")) continue;
+    if (m.winnerTeamId) continue;
+    if (isTbdTeamRef(m.homeTeam) || isTbdTeamRef(m.awayTeam)) continue;
+    return m.id;
+  }
+  return null;
+}
+
 function roundLabelForBracketMatchRound(round: string | null | undefined): string | null {
   const normalized = (round ?? "").trim().toUpperCase();
   if (normalized === "QUARTER_FINAL") return "Quarter Finals";
@@ -812,6 +840,41 @@ export default function BracketPanel({ embed = false }: { embed?: boolean }) {
       );
     };
   }, [selectedMatch, tournamentId]);
+
+  /**
+   * Auto-advance the current-match highlight after a team match is decided.
+   * The control card dispatches `matbeast-bracket-advance-current` once the
+   * winner is recorded; we refetch the bracket (the server set the winner +
+   * downstream seeding) and move the highlight to the next logical match.
+   */
+  useEffect(() => {
+    const onAdvance = async (e: Event) => {
+      const detail = (e as CustomEvent<{ tournamentId?: string | null }>).detail;
+      if (!detail?.tournamentId || detail.tournamentId !== tournamentId) return;
+      try {
+        await queryClient.refetchQueries({
+          queryKey: matbeastKeys.bracket(tournamentId),
+        });
+      } catch {
+        /* fall through to whatever is cached */
+      }
+      const payload =
+        queryClient.getQueryData<BracketPayload>(
+          matbeastKeys.bracket(tournamentId),
+        ) ?? null;
+      const teamsCache = queryClient.getQueryData<{ teams: TeamRefWithOverlay[] }>(
+        matbeastKeys.teams(tournamentId),
+      );
+      const opts = (teamsCache?.teams ?? teamOptions)
+        .slice()
+        .sort((a, b) => a.seedOrder - b.seedOrder);
+      const proj = buildBracketProjection(payload, opts);
+      setSelectedMatchId(pickNextLogicalMatchId(proj));
+    };
+    window.addEventListener("matbeast-bracket-advance-current", onAdvance);
+    return () =>
+      window.removeEventListener("matbeast-bracket-advance-current", onAdvance);
+  }, [tournamentId, queryClient, teamOptions]);
 
   const toggleTvGroup = useCallback((key: string) => {
     setTvGroupKey((prev) => (prev === key ? null : key));

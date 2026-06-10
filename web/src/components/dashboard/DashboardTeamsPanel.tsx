@@ -102,6 +102,41 @@ const OVERLAY_SWATCHES = RAW_OVERLAY_SWATCHES.filter((c) =>
   hasReadableTextContrast(c),
 );
 
+/** Maximum re-roll iterations before the 6th tap restores the original colors. */
+const AUTO_COLOR_RANDOM_ITERATIONS = 5;
+const AUTO_COLOR_CYCLE_LENGTH = AUTO_COLOR_RANDOM_ITERATIONS + 1;
+
+function shuffleArray<T>(input: readonly T[]): T[] {
+  const a = input.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+/**
+ * Pick `count` distinct overlay swatches at random, preferring colors not
+ * already locked onto manually-colored teams so the auto-assigned names stay
+ * visually distinct. Falls back to repeats only if the palette runs out.
+ */
+function pickAutoColors(count: number, exclude: Iterable<string>): string[] {
+  if (count <= 0) return [];
+  const excludeSet = new Set(
+    Array.from(exclude, (c) => c.toLowerCase()),
+  );
+  const result = shuffleArray(
+    OVERLAY_SWATCHES.filter((c) => !excludeSet.has(c.toLowerCase())),
+  ).slice(0, count);
+  if (result.length < count) {
+    for (const c of shuffleArray(OVERLAY_SWATCHES)) {
+      if (result.length >= count) break;
+      result.push(c);
+    }
+  }
+  return result;
+}
+
 function TeamOverlayColorDialog({
   open,
   initial,
@@ -215,6 +250,14 @@ function UnlockIcon({ className }: { className?: string }) {
   );
 }
 
+function AutoColorIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+      <path d="M12 3a9 9 0 1 0 0 18c.83 0 1.5-.67 1.5-1.5 0-.39-.15-.74-.39-1.01a1.49 1.49 0 0 1-.36-.99c0-.83.67-1.5 1.5-1.5H16a5 5 0 0 0 5-5c0-4.42-4.04-8-9-8Zm-5.5 9a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm3-4a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm3.5 4a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Z" />
+    </svg>
+  );
+}
+
 export function DashboardTeamsPanel() {
   const { tournamentId, ready, tournamentTrainingMode } = useEventWorkspace();
   const queryClient = useQueryClient();
@@ -228,6 +271,18 @@ export function DashboardTeamsPanel() {
   const toastTimeoutRef = useRef<number | null>(null);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [dragLocked, setDragLocked] = useState(false);
+  /**
+   * Auto-color cycle: each tap re-rolls random colors for the teams that had
+   * no color when the cycle began (taps 1–5); the 6th tap restores those teams
+   * to their original (uncolored) state. The snapshot captures the eligible
+   * team ids + their pre-cycle colors so manually-colored teams are never
+   * touched. Reset whenever the team set / named-state changes.
+   */
+  const [autoColorTapCount, setAutoColorTapCount] = useState(0);
+  const [autoColorSnapshot, setAutoColorSnapshot] = useState<{
+    targetIds: string[];
+    originalById: Record<string, string | null>;
+  } | null>(null);
   const [overlayColorTeamId, setOverlayColorTeamId] = useState<string | null>(null);
   const [editingTeamId, setEditingTeamId] = useState<string | null>(null);
   const [editingTeamNameDraft, setEditingTeamNameDraft] = useState("");
@@ -423,10 +478,124 @@ export function DashboardTeamsPanel() {
     onSuccess: () => invalidateTeams(),
   });
 
+  const autoColor = useMutation({
+    mutationFn: async (changes: { id: string; overlayColor: string | null }[]) => {
+      await Promise.all(
+        changes.map(async (c) => {
+          const res = await matbeastFetch(`/api/teams/${c.id}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              overlayColor: c.overlayColor,
+              tournamentId: tournamentId ?? undefined,
+              useTrainingMasters: tournamentTrainingMode,
+            }),
+          });
+          if (!res.ok) {
+            const j = (await res.json().catch(() => ({}))) as { error?: string };
+            throw new Error(j.error ?? "Auto color failed");
+          }
+        }),
+      );
+    },
+    // Optimistic: recolor every affected team in one cache write so the list
+    // (and overlay) update instantly without per-team flicker.
+    onMutate: async (changes) => {
+      const key = matbeastKeys.teams(tournamentId);
+      await queryClient.cancelQueries({ queryKey: key });
+      const previous = queryClient.getQueryData<TeamsPayload>(key);
+      if (previous) {
+        const byId = new Map(changes.map((c) => [c.id, c.overlayColor]));
+        queryClient.setQueryData<TeamsPayload>(key, {
+          teams: previous.teams.map((t) =>
+            byId.has(t.id) ? { ...t, overlayColor: byId.get(t.id) ?? null } : t,
+          ),
+        });
+      }
+      return { previous };
+    },
+    onError: (_e, _v, ctx) => {
+      const prev = (ctx as { previous?: TeamsPayload } | undefined)?.previous;
+      if (prev) queryClient.setQueryData(matbeastKeys.teams(tournamentId), prev);
+    },
+    onSuccess: () => invalidateTeams(),
+  });
+
   const namedCount = useMemo(
     () => teamsSorted.filter((t) => !isSlotEmpty(t.name)).length,
     [teamsSorted],
   );
+
+  /**
+   * Stable key over team membership + named-state (order-independent, color-
+   * independent). Changing the team set restarts the auto-color cycle; merely
+   * reordering or recoloring (including our own auto-color writes) does not.
+   */
+  const teamSetKey = useMemo(
+    () =>
+      teamsSorted
+        .map((t) => `${t.id}:${isSlotEmpty(t.name) ? 0 : 1}`)
+        .sort()
+        .join("|"),
+    [teamsSorted],
+  );
+  useEffect(() => {
+    setAutoColorTapCount(0);
+    setAutoColorSnapshot(null);
+  }, [teamSetKey]);
+
+  const handleAutoColor = useCallback(() => {
+    const named = teamsSorted.filter((t) => !isSlotEmpty(t.name));
+    if (named.length === 0) return;
+    const nextTap = autoColorTapCount + 1;
+    const phase = ((nextTap - 1) % AUTO_COLOR_CYCLE_LENGTH) + 1; // 1..6
+
+    let snap = autoColorSnapshot;
+    if (phase === 1) {
+      // Start of a cycle: capture the eligible (uncolored) named teams and the
+      // pre-cycle color of every named team so the 6th tap can restore them.
+      const originalById: Record<string, string | null> = {};
+      for (const t of named) originalById[t.id] = t.overlayColor ?? null;
+      snap = {
+        targetIds: named.filter((t) => !t.overlayColor).map((t) => t.id),
+        originalById,
+      };
+      setAutoColorSnapshot(snap);
+    }
+    if (!snap) return;
+    const snapshot = snap;
+
+    const existingIds = new Set(teamsSorted.map((t) => t.id));
+    const liveTargetIds = snapshot.targetIds.filter((id) => existingIds.has(id));
+    if (liveTargetIds.length === 0) {
+      // Every named team already had a color when the cycle began — nothing to
+      // auto-assign. Still advance so the tap rhythm stays consistent.
+      setAutoColorTapCount(nextTap);
+      return;
+    }
+
+    let changes: { id: string; overlayColor: string | null }[];
+    if (phase === AUTO_COLOR_CYCLE_LENGTH) {
+      // 6th tap: restore the targeted teams to their original (uncolored) state.
+      changes = liveTargetIds.map((id) => ({
+        id,
+        overlayColor: snapshot.originalById[id] ?? null,
+      }));
+    } else {
+      // Re-roll: distinct random colors, avoiding colors already locked onto
+      // the manually-colored teams that we never touch.
+      const lockedColors = teamsSorted
+        .filter((t) => !snapshot.targetIds.includes(t.id) && t.overlayColor)
+        .map((t) => t.overlayColor as string);
+      const colors = pickAutoColors(liveTargetIds.length, lockedColors);
+      changes = liveTargetIds.map((id, i) => ({ id, overlayColor: colors[i] }));
+    }
+    setAutoColorTapCount(nextTap);
+    autoColor.mutate(changes, {
+      onError: (e) =>
+        window.alert(e instanceof Error ? e.message : "Auto color failed"),
+    });
+  }, [autoColor, autoColorSnapshot, autoColorTapCount, teamsSorted]);
 
   const onAddTeam = useCallback(() => {
     if (selectedMasterTeam === TEAM_ADD_NOT_LISTED) {
@@ -816,6 +985,16 @@ export function DashboardTeamsPanel() {
             ) : (
               <UnlockIcon className="h-3.5 w-3.5" />
             )}
+          </button>
+          <span className="text-[10px] text-zinc-500">Auto color</span>
+          <button
+            type="button"
+            title="Auto-assign random colors to teams that have no color. Tap again to re-roll (up to 5 times); a 6th tap restores the original colors. Teams you've colored manually are never changed."
+            disabled={autoColor.isPending || isLoading}
+            onClick={handleAutoColor}
+            className="inline-flex items-center justify-center rounded border border-zinc-700 p-0.5 text-zinc-400 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <AutoColorIcon className="h-3.5 w-3.5" />
           </button>
         </div>
 

@@ -1,5 +1,9 @@
 /** Shared API shape for GET/PATCH /api/board (safe for client import) */
 
+import type { OtIntermediateEntry } from "@/lib/ot-intermediate-log";
+
+export type { OtIntermediateEntry };
+
 export type BoardPlayerPayload = {
   displayName: string;
   teamName: string;
@@ -55,6 +59,8 @@ export type BoardPayload = {
   resultsLog: ResultLogEntry[];
   secondsRemaining: number;
   timerRunning: boolean;
+  /** ISO timestamp when the running timer hits 0; null when paused/stopped. */
+  timerEndsAt: string | null;
   timerPhase: "REGULATION" | "OVERTIME";
   overtimeIndex: number;
   overtimeWinsLeft: number;
@@ -78,6 +84,8 @@ export type BoardPayload = {
   timerOtRoundMode: boolean;
   /** Elapsed seconds for OT round secondary timer (control card only). */
   otRoundElapsedSeconds: number;
+  /** OT intermediate (advancing) results recorded on the control card this OT period. */
+  otIntermediateLog: OtIntermediateEntry[];
   /** Green winner highlight on overlays; cleared by Reset 1:00 after an OT-round final. */
   showFinalWinnerHighlight: boolean;
   /** Increments when the control clock is jumped by preset buttons so timer sounds do not false-trigger. */

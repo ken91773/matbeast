@@ -278,6 +278,24 @@ function hardRecoverKeyboardRouting(
   }
   lastHardRecoverAt = now;
   const el = target ?? lastClickedEditable?.deref() ?? null;
+  // Capture the caret/selection up front: the recovery blurs the web view and
+  // cycles window activation, both of which fire a DOM blur on the focused
+  // field. Restoring the exact selection afterward means an escalation is
+  // invisible even when the field was never actually stuck.
+  let savedSelection:
+    | { start: number | null; end: number | null; dir: "forward" | "backward" | "none" }
+    | null = null;
+  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+    try {
+      savedSelection = {
+        start: el.selectionStart,
+        end: el.selectionEnd,
+        dir: el.selectionDirection ?? "none",
+      };
+    } catch {
+      savedSelection = null;
+    }
+  }
   matbeastFocusLog("hard-recover → hardRestoreWebKeyboardFocus()", {
     source,
     activeElement: activeElementHint(),
@@ -289,6 +307,21 @@ function hardRecoverKeyboardRouting(
       if (el && el.isConnected) {
         try {
           el.focus({ preventScroll: true });
+          if (
+            savedSelection &&
+            (el instanceof HTMLInputElement ||
+              el instanceof HTMLTextAreaElement)
+          ) {
+            try {
+              el.setSelectionRange(
+                savedSelection.start ?? el.value.length,
+                savedSelection.end ?? el.value.length,
+                savedSelection.dir,
+              );
+            } catch {
+              /* number/email inputs disallow setSelectionRange */
+            }
+          }
         } catch {
           /* ignore */
         }
@@ -338,8 +371,13 @@ function noteEditableEngagement(target: EventTarget | null): void {
   const sameEl = prevEl === editable;
   const gap = now - lastEditableEngageAt;
   const typedSincePrev = lastTypingActivityAt >= lastEditableEngageAt;
+  // `gap > 250` skips the fast second click of a double-click (word select);
+  // anything slower that lands on the same field with no typing in between is
+  // the operator deliberately re-clicking because their keystrokes went
+  // nowhere. The window is wide (up to 4 s) so a frustrated "click… nothing…
+  // click again" still counts.
   const deliberateReengage =
-    sameEl && gap > 350 && gap < 2500 && !typedSincePrev;
+    sameEl && gap > 250 && gap < 4000 && !typedSincePrev;
   if (deliberateReengage) {
     deadReengageStreak += 1;
   } else {
@@ -347,7 +385,12 @@ function noteEditableEngagement(target: EventTarget | null): void {
   }
   lastEditableEngageAt = now;
   lastEngagedEditable = new WeakRef(editable);
-  if (deadReengageStreak >= 2) {
+  // Escalate on the FIRST deliberate re-click of the same field (i.e. the 2nd
+  // click overall) instead of waiting for a third. Operators alt-tab to fix
+  // the dead-keyboard bug long before three clicks, so the old `>= 2` rarely
+  // fired in practice. The hard recovery preserves the caret, so escalating a
+  // click early is invisible if the field was actually fine.
+  if (deadReengageStreak >= 1) {
     deadReengageStreak = 0;
     matbeastFocusLog("dead-input streak → hard recover", {
       element: `${editable.tagName}${editable.id ? `#${editable.id}` : ""}`,

@@ -129,6 +129,10 @@ if (!contextBridge || !ipcRenderer) {
   /** Escalation for the Windows dead-keyboard bug: blur+focus the window (Alt-Tab equivalent) when the soft nudge fails. */
   hardRestoreWebKeyboardFocus: () =>
     ipcRenderer.invoke("app:hard-restore-web-keyboard-focus"),
+  /** Render HTML → PDF via Chromium's printToPDF and save to a chosen file (free, no Adobe). */
+  exportPdf: (payload) => ipcRenderer.invoke("app:export-pdf", payload),
+  /** Open the OS print dialog for HTML via a hidden window (Microsoft Print to PDF / printers). */
+  printHtml: (payload) => ipcRenderer.invoke("app:print-html", payload),
   checkForUpdates: () => ipcRenderer.invoke("app:check-for-updates"),
   checkForUpdatesWithDebug: () => ipcRenderer.invoke("app:check-for-updates-debug"),
   getRuntimeInfo: () => ipcRenderer.invoke("app:get-runtime-info"),

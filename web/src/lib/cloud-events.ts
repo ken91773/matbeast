@@ -88,17 +88,91 @@ async function withTimeout<T>(
  * Cloud-side CRUD helpers (metadata)
  * ========================================================================== */
 
+/**
+ * Turn a `fetch` failure (or an upstream non-2xx) into an operator-readable
+ * sentence that names the actual cause. Node's `fetch` throws a generic
+ * `TypeError: fetch failed` and tucks the real error (DNS, TLS, refused,
+ * timeout) into `.cause`, so we dig that out and map common codes to a hint.
+ * Used so the homepage "Could not reach the cloud" panel says *why* instead
+ * of a bare HTTP 502.
+ */
+export function describeCloudFetchFailure(
+  e: unknown,
+  target: string,
+  timeoutMs: number,
+): string {
+  if (e instanceof Error && e.name === "AbortError") {
+    return `Timed out after ${Math.round(
+      timeoutMs / 1000,
+    )}s reaching ${target}. The cloud host may be blocked or unreachable on this network (firewall, proxy, or DNS filtering).`;
+  }
+  const cause = (e as { cause?: unknown })?.cause;
+  const code =
+    (cause as { code?: string } | undefined)?.code ??
+    (e as { code?: string } | undefined)?.code ??
+    "";
+  const causeMsg =
+    cause instanceof Error
+      ? cause.message
+      : typeof cause === "string"
+        ? cause
+        : "";
+  const base = e instanceof Error ? e.message : String(e);
+  let hint: string;
+  switch (code) {
+    case "ENOTFOUND":
+    case "EAI_AGAIN":
+      hint =
+        "DNS lookup failed — the cloud host name could not be resolved. This is usually DNS filtering/content blocking, a VPN, or no internet on this machine.";
+      break;
+    case "ECONNREFUSED":
+      hint = "The connection was refused by the host or a local proxy.";
+      break;
+    case "ETIMEDOUT":
+    case "UND_ERR_CONNECT_TIMEOUT":
+      hint =
+        "The connection timed out — likely a firewall, proxy, or network block on this machine/network.";
+      break;
+    case "CERT_HAS_EXPIRED":
+    case "UNABLE_TO_VERIFY_LEAF_SIGNATURE":
+    case "SELF_SIGNED_CERT_IN_CHAIN":
+    case "ERR_TLS_CERT_ALTNAME_INVALID":
+    case "DEPTH_ZERO_SELF_SIGNED_CERT":
+      hint =
+        "TLS certificate validation failed — check this computer's date/time (a wrong clock breaks HTTPS), or antivirus HTTPS/SSL scanning may be intercepting the connection.";
+      break;
+    default:
+      hint =
+        "Could not establish a connection — check internet access, firewall/antivirus HTTPS scanning, VPN/proxy, or DNS filtering for this host.";
+  }
+  const codeStr = code ? ` [${code}]` : "";
+  return `Network error reaching ${target}${codeStr}: ${
+    causeMsg || base
+  }. ${hint}`;
+}
+
 export async function listCloudEvents(): Promise<CloudEventMeta[]> {
   const cfg = await getCloudConfig();
   if (!isCloudConfigured(cfg)) return [];
+  const target = cloudUrl(cfg, "/api/events");
   return withTimeout(REQUEST_TIMEOUT_MS, async (signal) => {
-    const r = await fetch(cloudUrl(cfg, "/api/events"), {
-      headers: authHeaders(cfg),
-      cache: "no-store",
-      signal,
-    });
+    let r: Response;
+    try {
+      r = await fetch(target, {
+        headers: authHeaders(cfg),
+        cache: "no-store",
+        signal,
+      });
+    } catch (e) {
+      throw new Error(describeCloudFetchFailure(e, target, REQUEST_TIMEOUT_MS));
+    }
     if (!r.ok) {
-      throw new Error(`listCloudEvents: HTTP ${r.status}`);
+      const body = await r.text().catch(() => "");
+      throw new Error(
+        `Cloud server returned HTTP ${r.status} for ${target}${
+          body ? ` — ${body.slice(0, 160)}` : ""
+        }`,
+      );
     }
     const data = (await r.json()) as { events: CloudEventMeta[] };
     return data.events;

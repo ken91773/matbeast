@@ -13,15 +13,29 @@ import {
   useTimerAlertSounds,
 } from "@/hooks/useTimerAlertSounds";
 import {
+  OVERLAY_APPLY_PROPAGATION_MS,
+  OVERLAY_BARN_DOOR_MS,
+  isOverlayOutputBroadcast,
+  openOverlayOutputChannel,
+} from "@/lib/overlay-output-broadcast";
+import {
   getAudioVolumePercent,
   setAudioVolumePercent,
 } from "@/lib/audio-output";
 import type { BoardPayload } from "@/types/board";
-import { OT_ROUND_DROPDOWN_LABELS } from "@/lib/ot-round-label";
+import { useLiveScoreboardTimerLine } from "@/hooks/useLiveScoreboardTimerLine";
+import { boardRefetchIntervalMs } from "@/lib/board-timer-poll";
+import { OT_ROUND_DROPDOWN_LABELS, otRoundLabelParts } from "@/lib/ot-round-label";
+import {
+  formatOtElapsedColonSeconds,
+  formatOtElapsedMmss,
+  formatOtIntermediateLine,
+  parseOtElapsedMmss,
+  totalEscapeSecondsForSide,
+} from "@/lib/ot-intermediate-log";
 import {
   formatWallMss,
   scoreboardOtRedTimerStyle,
-  scoreboardTimerLineFromBoard,
 } from "@/lib/scoreboard-timer-display";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
@@ -106,6 +120,109 @@ const ROUND_PRESETS = [
 const CUSTOM_PRESET = "CUSTOM";
 const CUSTOM_FIGHTER = "__CUSTOM__";
 
+/** Winning corner for a final result, or null for DRAW / NO_CONTEST. */
+function winnerSideFromResultType(rt: string): "left" | "right" | null {
+  switch (rt) {
+    case "LEFT":
+    case "SUBMISSION_LEFT":
+    case "ESCAPE_LEFT":
+    case "DQ_RIGHT":
+      return "left";
+    case "RIGHT":
+    case "SUBMISSION_RIGHT":
+    case "ESCAPE_RIGHT":
+    case "DQ_LEFT":
+      return "right";
+    default:
+      return null;
+  }
+}
+
+/** OT-round result buttons. Plain SUB/ESC/DRAW advance; OT_* end the match. */
+type OtResultKind = "SUB" | "ESC" | "DRAW" | "OT_SUB" | "OT_ESC" | "OT_WINDQ";
+
+/** Current (unsaved) OT intermediate pick on the control card. */
+type OtSelection =
+  | { side: "left" | "right"; kind: "SUB" | "ESC" }
+  | "DRAW"
+  | null;
+
+/** Next label in the OT ROUND1 ↑ → … → OT ROUND 3 ↓ sequence, or null at the end. */
+function nextOtRoundLabel(label: string): string | null {
+  const trimmed = label.trim();
+  const direct = OT_ROUND_DROPDOWN_LABELS.findIndex((l) => l === trimmed);
+  const seqIdx =
+    direct >= 0
+      ? direct
+      : (() => {
+          const parts = otRoundLabelParts(label);
+          if (!parts || !parts.half) return -1;
+          return (parts.index - 1) * 2 + (parts.half === "top" ? 0 : 1);
+        })();
+  if (seqIdx < 0 || seqIdx >= OT_ROUND_DROPDOWN_LABELS.length - 1) return null;
+  return OT_ROUND_DROPDOWN_LABELS[seqIdx + 1];
+}
+
+/** Map an OT result kind + winning corner to a stored FinalResultType. */
+function otResultTypeFor(
+  kind: OtResultKind,
+  corner: "LEFT" | "RIGHT" | null,
+): string | null {
+  switch (kind) {
+    case "DRAW":
+      return "DRAW";
+    case "SUB":
+    case "OT_SUB":
+      return corner === "LEFT"
+        ? "SUBMISSION_LEFT"
+        : corner === "RIGHT"
+          ? "SUBMISSION_RIGHT"
+          : null;
+    case "ESC":
+    case "OT_ESC":
+      return corner === "LEFT"
+        ? "ESCAPE_LEFT"
+        : corner === "RIGHT"
+          ? "ESCAPE_RIGHT"
+          : null;
+    case "OT_WINDQ":
+      /** Winner corner → the OTHER corner is the disqualified (losing) side. */
+      return corner === "LEFT" ? "DQ_RIGHT" : corner === "RIGHT" ? "DQ_LEFT" : null;
+    default:
+      return null;
+  }
+}
+
+/** Whether the chosen result is "expected" in the given OT half/context. */
+function otResultIsExpected(
+  kind: OtResultKind,
+  half: "top" | "bottom",
+  index: 1 | 2 | 3,
+  afterTopSub: boolean,
+): boolean {
+  if (half === "top") {
+    return kind === "SUB" || kind === "ESC" || kind === "DRAW" || kind === "OT_WINDQ";
+  }
+  if (index === 3) {
+    /**
+     * OT ROUND 3 ↓ (final tie-break). Enders: OT-SUB / OT-ESC / OT-WinByDQ.
+     * Intermediate ESC is ALSO expected here (no warning): the operator needs
+     * to record the escape's elapsed time so each fighter's total escape time
+     * can be summed and compared to decide the lowest-time winner.
+     */
+    return (
+      kind === "OT_SUB" ||
+      kind === "OT_ESC" ||
+      kind === "OT_WINDQ" ||
+      kind === "ESC"
+    );
+  }
+  if (afterTopSub) {
+    return kind === "OT_SUB" || kind === "OT_WINDQ";
+  }
+  return kind === "OT_SUB" || kind === "OT_WINDQ" || kind === "ESC" || kind === "DRAW";
+}
+
 export default function ControlPanel({
   standalone = false,
 }: {
@@ -114,6 +231,41 @@ export default function ControlPanel({
   const { tournamentId, ready } = useEventWorkspace();
   const queryClient = useQueryClient();
   const [err, setErr] = useState<string | null>(null);
+  /**
+   * Read-only follower of the overlay LIVE / barn-door state plus a setter, so
+   * APPLY can orchestrate close → change → open. ControlPanel mirrors the live
+   * state via `live` / `pong` broadcasts and can drive it via `live`, but it
+   * deliberately does NOT answer `ping` — the dashboard / output window owns the
+   * authoritative state; answering could broadcast a stale value.
+   */
+  const [overlayOutputLive, setOverlayOutputLive] = useState(false);
+  const overlayLiveChannelRef = useRef<BroadcastChannel | null>(null);
+  useEffect(() => {
+    let ch: BroadcastChannel;
+    try {
+      ch = openOverlayOutputChannel();
+    } catch {
+      return;
+    }
+    overlayLiveChannelRef.current = ch;
+    ch.onmessage = (ev: MessageEvent) => {
+      if (!isOverlayOutputBroadcast(ev.data)) return;
+      const m = ev.data;
+      if (m.kind === "live" || m.kind === "pong") {
+        setOverlayOutputLive(m.live);
+      }
+    };
+    /** Learn the current live state from whoever owns it. */
+    ch.postMessage({ kind: "ping" });
+    return () => {
+      overlayLiveChannelRef.current = null;
+      ch.close();
+    };
+  }, []);
+  const setOverlayLiveBroadcast = (next: boolean) => {
+    setOverlayOutputLive(next);
+    overlayLiveChannelRef.current?.postMessage({ kind: "live", live: next });
+  };
   const [leftId, setLeftId] = useState<string>("");
   const [rightId, setRightId] = useState<string>("");
   const [leftCustomName, setLeftCustomName] = useState("");
@@ -124,6 +276,9 @@ export default function ControlPanel({
   const [roundDirty, setRoundDirty] = useState(false);
   const [showFinalPanel, setShowFinalPanel] = useState(false);
   const [finalCorner, setFinalCorner] = useState<"LEFT" | "RIGHT" | null>(null);
+  const [otSelection, setOtSelection] = useState<OtSelection>(null);
+  const [otLeftElapsed, setOtLeftElapsed] = useState("");
+  const [otRightElapsed, setOtRightElapsed] = useState("");
   const [warningSelectOverride, setWarningSelectOverride] = useState<
     "30" | "CUS" | null
   >(null);
@@ -140,10 +295,22 @@ export default function ControlPanel({
   );
   const firstBoardLoad = useRef(true);
   const prevTimerOtRoundModeRef = useRef(false);
+  /**
+   * Tracks whether the upcoming OT bottom half follows a TOP submission
+   * ("beat-the-time"). Used only to decide whether to warn on an unexpected
+   * result — the actual clock/label mutation is server-driven, so a stale
+   * value (e.g. after a reload) at worst shows/skips a confirmation prompt.
+   */
+  const otBottomAfterSubRef = useRef(false);
   const selectedBracketMatchIdRef = useRef<string | null>(null);
+  /** Latest highlighted bracket round label (e.g. "Semi Finals"); ref so the
+   *  full-match-reset handler (subscribed once) reads the current value. */
+  const selectedBracketRoundLabelRef = useRef<string | null>(null);
   const patchRef = useRef<
     (body: Record<string, unknown>) => Promise<BoardPayload | null>
   >(async () => null);
+  const timerRunningRef = useRef(false);
+  const boardReadyRef = useRef(false);
 
   useEffect(() => {
     firstBoardLoad.current = true;
@@ -158,7 +325,19 @@ export default function ControlPanel({
       ) {
         return;
       }
-      void patchRef.current({ command: { type: "reset_match" } });
+      /**
+       * Carry the highlighted bracket round into the reset so the round label
+       * lands on the current match's round (e.g. "Semi Finals") instead of
+       * snapping back to the default "Quarter Finals". `reset_match` itself
+       * leaves the round label alone, so we set it via the direct `roundLabel`
+       * field (applied before the command).
+       */
+      const body: Record<string, unknown> = { command: { type: "reset_match" } };
+      const highlightedRound = selectedBracketRoundLabelRef.current?.trim();
+      if (highlightedRound) {
+        body.roundLabel = highlightedRound;
+      }
+      void patchRef.current(body);
     };
     window.addEventListener("matbeast-control-full-match-reset", onFullMatchReset);
     return () => {
@@ -174,6 +353,7 @@ export default function ControlPanel({
     setSelectedBracketMatchId(null);
     setSelectedBracketRoundLabel(null);
     selectedBracketMatchIdRef.current = null;
+    selectedBracketRoundLabelRef.current = null;
   }, [tournamentId]);
 
   useEffect(() => {
@@ -202,8 +382,14 @@ export default function ControlPanel({
       return (await bRes.json()) as BoardPayload;
     },
     enabled: ready && !!tournamentId,
-    refetchInterval: 1000,
+    refetchInterval: (query) =>
+      boardRefetchIntervalMs(query.state.data as BoardPayload | undefined),
   });
+
+  timerRunningRef.current = board?.timerRunning ?? false;
+  boardReadyRef.current = !!(ready && tournamentId && board);
+
+  const scoreboardTimerLine = useLiveScoreboardTimerLine(board);
 
   const { data: playersData } = useQuery({
     queryKey: matbeastKeys.players(tournamentId),
@@ -245,8 +431,9 @@ export default function ControlPanel({
         typeof detail.roundLabel === "string" && detail.roundLabel.trim()
           ? detail.roundLabel.trim()
           : null;
-      setSelectedBracketMatchId(matchId);
-      setSelectedBracketRoundLabel(bracketRoundLabel);
+    setSelectedBracketMatchId(matchId);
+    setSelectedBracketRoundLabel(bracketRoundLabel);
+    selectedBracketRoundLabelRef.current = bracketRoundLabel;
       if (matchId && matchId !== selectedBracketMatchIdRef.current && bracketRoundLabel) {
         setRoundLabel(bracketRoundLabel);
         setRoundDirty(true);
@@ -332,6 +519,18 @@ export default function ControlPanel({
   }, [board, warningSeconds, warningSelectOverride]);
 
   /**
+   * Keep the "beat-the-time" flag honest: a TOP half (or any non-OT label) is
+   * never "after a top submission". Bottom halves keep whatever our own advance
+   * recorded so the unexpected-result warning stays accurate.
+   */
+  useEffect(() => {
+    const parts = otRoundLabelParts(board?.roundLabel);
+    if (!parts || parts.half === "top") {
+      otBottomAfterSubRef.current = false;
+    }
+  }, [board?.roundLabel]);
+
+  /**
    * Do not include `board.updatedAt` here: it changes on every board PATCH, which
    * resets `prevSecondsRef` in `useTimerAlertSounds` and **swallows boundary cues**.
    *
@@ -355,6 +554,8 @@ export default function ControlPanel({
     board?.sound0PlayNonce,
     true,
     board?.timerOtCountdownMode ?? false,
+    board?.timerRunning,
+    board?.timerEndsAt ?? null,
   );
 
   const pOpts = useMemo(() => {
@@ -471,6 +672,35 @@ export default function ControlPanel({
   }
   patchRef.current = patch;
 
+  useEffect(() => {
+    const isEditableTarget = (t: EventTarget | null) => {
+      if (!(t instanceof HTMLElement)) return false;
+      if (t.closest("[data-matbeast-rename-dialog]")) return true;
+      const tag = t.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+      return t.isContentEditable;
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== " " && e.code !== "Space") return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.repeat) return;
+      // While editing an input/textarea/select, Space must type a space.
+      if (isEditableTarget(e.target)) return;
+      // Otherwise Space is reserved exclusively for the match timer. Always
+      // preventDefault so it never activates whatever button/link happens to
+      // have focus (the prior behavior let Space "click" the focused control).
+      e.preventDefault();
+      if (!boardReadyRef.current) return;
+      void patchRef.current({
+        command: {
+          type: timerRunningRef.current ? "timer_pause" : "timer_start",
+        },
+      });
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   function fighterPayload(): Record<string, unknown> {
     return {
       leftPlayerId: leftId && leftId !== CUSTOM_FIGHTER ? leftId : null,
@@ -499,6 +729,10 @@ export default function ControlPanel({
     confirmMessage: string,
   ): Promise<void> {
     if (!window.confirm(confirmMessage)) return;
+    /** OT state BEFORE the save: a regulation 4-4 draw can transition INTO OT
+     *  (server-side), so `saved.timerOtRoundMode` may flip true even though this
+     *  was a regulation result — base the dropdown keep/clear on the prior state. */
+    const wasOt = board?.timerOtRoundMode ?? false;
     const saved = await patch({
       ...fighterPayload(),
       roundLabel,
@@ -509,8 +743,260 @@ export default function ControlPanel({
       },
     });
     if (saved) {
+      /**
+       * Clear the control's fighter dropdowns based on the outcome (the
+       * scoreboard overlay keeps showing the names until the next APPLY):
+       *   • DRAW / NO_CONTEST — both fighters are replaced, so clear both.
+       *   • Win — the winner stays selected to face the next challenger; the
+       *     loser's dropdown clears so the operator picks the next fighter.
+       *   • Sweep — once a team reaches 5 eliminations the team match is over,
+       *     so clear both in preparation for a new team match.
+       *
+       * Exception: in an OVERTIME round (OT ROUND label) the same two fighters
+       * keep going regardless of result, so leave both dropdowns untouched.
+       */
+      const winnerSide = winnerSideFromResultType(resultType);
+      const matchOver =
+        (saved.leftEliminatedCount ?? 0) >= 5 ||
+        (saved.rightEliminatedCount ?? 0) >= 5;
+      const clearLeftDropdown = () => {
+        setLeftId("");
+        setLeftCustomName("");
+        setLeftCustomTeamName("");
+      };
+      const clearRightDropdown = () => {
+        setRightId("");
+        setRightCustomName("");
+        setRightCustomTeamName("");
+      };
+      if (wasOt) {
+        // OT ROUND intermediate-style final: keep both fighters selected.
+      } else if (matchOver || winnerSide === null) {
+        clearLeftDropdown();
+        clearRightDropdown();
+      } else if (winnerSide === "left") {
+        clearRightDropdown();
+      } else {
+        clearLeftDropdown();
+      }
       setShowFinalPanel(false);
       setFinalCorner(null);
+
+      /**
+       * Team match decided by a regulation sweep (exactly one side reached 5 —
+       * a dual 4-4 draw instead goes to OT, see server). Advance the bracket:
+       * the winner was set server-side; here we move the current-match highlight
+       * to the next logical team match.
+       */
+      const leftOut = (saved.leftEliminatedCount ?? 0) >= 5;
+      const rightOut = (saved.rightEliminatedCount ?? 0) >= 5;
+      const teamDecidedBySweep = !wasOt && (leftOut !== rightOut);
+      if (teamDecidedBySweep && selectedBracketMatchId) {
+        void advanceBracketToNextMatch();
+      }
+    }
+  }
+
+  /**
+   * After a team match is decided (regulation sweep or OT ender), refresh the
+   * bracket (the winner + downstream seeding were set server-side) and tell the
+   * Bracket card to move its "current match" highlight to the next logical team
+   * match. That selection re-emits the bracket-selection event, which updates
+   * the round label, the overlay highlight, and the next match's team ids.
+   */
+  async function advanceBracketToNextMatch(): Promise<void> {
+    if (!tournamentId) return;
+    try {
+      await queryClient.invalidateQueries({
+        queryKey: matbeastKeys.bracket(tournamentId),
+      });
+    } catch {
+      /* ignore — BracketPanel refetches on the advance event below */
+    }
+    window.dispatchEvent(
+      new CustomEvent("matbeast-bracket-advance-current", {
+        detail: { tournamentId },
+      }),
+    );
+  }
+
+  /** Toggle an OT intermediate pick on the card; auto-fills the elapsed box. */
+  function handleOtSelect(next: OtSelection): void {
+    setOtSelection((prev) => {
+      const same =
+        prev === next ||
+        (prev &&
+          next &&
+          prev !== "DRAW" &&
+          next !== "DRAW" &&
+          prev.side === next.side &&
+          prev.kind === next.kind);
+      if (same) {
+        if (prev && prev !== "DRAW") {
+          if (prev.side === "left") setOtLeftElapsed("");
+          else setOtRightElapsed("");
+        }
+        return null;
+      }
+      if (next && next !== "DRAW") {
+        const snap = formatOtElapsedColonSeconds(board?.otRoundElapsedSeconds ?? 0);
+        if (next.side === "left") setOtLeftElapsed(snap);
+        else setOtRightElapsed(snap);
+      }
+      return next;
+    });
+  }
+
+  /**
+   * Commit the selected OT intermediate result (SUB / ESC / DRAW). Appends to
+   * the in-card OT log and advances the round per the OT rules; on OT ROUND 3 ↓
+   * an (unexpected) result is recorded without advancing. Players stay the same.
+   */
+  async function commitOtIntermediate(): Promise<void> {
+    if (!board) return;
+    const parts = otRoundLabelParts(board.roundLabel);
+    if (!parts || !parts.half) return;
+    const { half, index } = parts;
+    const sel = otSelection;
+    if (!sel) {
+      window.alert("Select a result first (SUB / ESC / DRAW).");
+      return;
+    }
+
+    let kind: "SUB" | "ESC" | "DRAW";
+    let side: "left" | "right" | null;
+    let elapsedSeconds: number | null;
+    if (sel === "DRAW") {
+      kind = "DRAW";
+      side = null;
+      elapsedSeconds = null;
+    } else {
+      kind = sel.kind;
+      side = sel.side;
+      const box = side === "left" ? otLeftElapsed : otRightElapsed;
+      elapsedSeconds = parseOtElapsedMmss(box);
+      if (elapsedSeconds == null) {
+        window.alert("Enter the elapsed time as m:ss (e.g. 0:26).");
+        return;
+      }
+    }
+
+    const expected = otResultIsExpected(
+      kind,
+      half,
+      index,
+      otBottomAfterSubRef.current,
+    );
+    if (!expected && !window.confirm("Unexpected Result-Sure?")) return;
+
+    const isFinalRound3Bottom = half === "bottom" && index === 3;
+    const mode: "advance" | "record_only" = isFinalRound3Bottom
+      ? "record_only"
+      : "advance";
+    let clock: "transfer" | "oneMinute" | "none" = "none";
+    let nextLabel: string | null = null;
+    if (mode === "advance") {
+      clock = half === "top" && kind === "SUB" ? "transfer" : "oneMinute";
+      nextLabel = nextOtRoundLabel(board.roundLabel);
+    }
+
+    const saved = await patch({
+      command: {
+        type: "ot_intermediate_result",
+        outcome: kind,
+        side,
+        elapsedSeconds,
+        mode,
+        clock,
+        nextRoundLabel: nextLabel,
+      },
+    });
+    if (!saved) return;
+
+    if (mode === "advance") {
+      otBottomAfterSubRef.current = half === "top" ? kind === "SUB" : false;
+    }
+    setOtSelection(null);
+    setOtLeftElapsed("");
+    setOtRightElapsed("");
+  }
+
+  /** Undo the last in-card OT half: pop the entry and restore the pre-save clock/label. */
+  async function commitOtUnsave(): Promise<void> {
+    if (!board) return;
+    if ((board.otIntermediateLog ?? []).length === 0) return;
+    const saved = await patch({ command: { type: "ot_intermediate_unsave" } });
+    if (!saved) return;
+    /** Re-derive the beat-the-time flag from the restored log/label. */
+    const parts = otRoundLabelParts(saved.roundLabel);
+    if (!parts || parts.half !== "bottom") {
+      otBottomAfterSubRef.current = false;
+    } else {
+      const log = saved.otIntermediateLog ?? [];
+      const top = log[log.length - 1];
+      otBottomAfterSubRef.current = Boolean(
+        top && top.kind === "SUB" && top.roundLabel.trim().endsWith("↑"),
+      );
+    }
+    setOtSelection(null);
+    setOtLeftElapsed("");
+    setOtRightElapsed("");
+  }
+
+  /**
+   * OT-ender (final winner). Always finalizes: records the winner to the Results
+   * log and flushes the in-card OT log (server side). Warns first on an
+   * unexpected result, but on "I'm Sure" still records the final (a gap in the
+   * intermediate record is acceptable). Never advances the OT round label, but
+   * it DOES decide the team match: both fighter dropdowns clear and the bracket
+   * highlight advances to the next logical match.
+   */
+  async function submitOtResult(kind: OtResultKind): Promise<void> {
+    if (!board) return;
+    const parts = otRoundLabelParts(board.roundLabel);
+    if (!parts || !parts.half) return;
+    const { half, index } = parts;
+
+    if (!finalCorner) {
+      window.alert("Tap the winning fighter (left or right) first.");
+      return;
+    }
+    const rt = otResultTypeFor(kind, finalCorner);
+    if (!rt) {
+      window.alert("Tap the winning fighter (left or right) first.");
+      return;
+    }
+
+    const expected = otResultIsExpected(
+      kind,
+      half,
+      index,
+      otBottomAfterSubRef.current,
+    );
+    if (!expected && !window.confirm("Unexpected Result-Sure?")) return;
+
+    const saved = await patch({
+      command: { type: "final_save", resultType: rt, selectedBracketMatchId },
+    });
+    if (!saved) return;
+
+    setShowFinalPanel(false);
+    setFinalCorner(null);
+
+    /**
+     * An OT ender finishes the whole team match: clear both fighter dropdowns
+     * (a new team match is next) and advance the bracket — the winner was set
+     * server-side from the winning corner; here we move the current-match
+     * highlight to the next logical team match.
+     */
+    setLeftId("");
+    setLeftCustomName("");
+    setLeftCustomTeamName("");
+    setRightId("");
+    setRightCustomName("");
+    setRightCustomTeamName("");
+    if (selectedBracketMatchId) {
+      void advanceBracketToNextMatch();
     }
   }
 
@@ -543,7 +1029,44 @@ export default function ControlPanel({
     ) {
       body.roundLabel = roundLabel;
     }
-    await patch(body);
+    /**
+     * Committing a matchup clears any prior final result so both fighter
+     * names reset to white (the previous winner is no longer highlighted
+     * green once the operator applies a new pairing).
+     */
+    body.clearFinalResult = true;
+    /**
+     * APPLY also resets the regulation clock to 4:00 (paused). Finalizing a
+     * result no longer resets the timer; the operator gets the fresh clock here
+     * instead. The server ignores this for OT rounds (they keep their own clock).
+     */
+    body.resetTimerForApply = true;
+
+    /**
+     * Barn-door orchestration around the change:
+     *  - If the overlay is LIVE, first close the barn doors, commit the change
+     *    while it's hidden, then reopen the doors on the fresh content.
+     *  - If it's NOT live, commit the change behind the (already closed) doors,
+     *    then open with the barn-door effect.
+     * Either way the overlay ends LIVE. We pause after the commit so the
+     * overlay window's board poll has time to pick up the new fighters/round
+     * before the doors open. (`postScoreboardMode` is untouched — this only
+     * drives the live/barn-door state.)
+     */
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const wasLive = overlayOutputLive;
+    if (wasLive) {
+      setOverlayLiveBroadcast(false);
+      await sleep(OVERLAY_BARN_DOOR_MS);
+    }
+    const saved = await patch(body);
+    if (!saved) {
+      // Restore the prior live state on failure so we don't strand the doors.
+      if (wasLive) setOverlayLiveBroadcast(true);
+      return;
+    }
+    await sleep(OVERLAY_APPLY_PROPAGATION_MS);
+    setOverlayLiveBroadcast(true);
   }
 
   if (!board) {
@@ -917,10 +1440,13 @@ export default function ControlPanel({
           </div>
           {showFinalPanel && (
             <div className="absolute inset-0 z-30 flex flex-col overflow-auto rounded-md border border-teal-800/60 bg-zinc-950/95 p-3 shadow-2xl backdrop-blur-sm">
-              <p className="text-sm font-medium text-zinc-300">Final result</p>
+              <p className="text-sm font-medium text-zinc-300">
+                {board.timerOtRoundMode ? "Final result — OVERTIME" : "Final result"}
+              </p>
               <p className="mt-1 text-xs text-zinc-500">
-                Tap a fighter for submission, escape, or DQ. Draw / no contest need
-                no selection.
+                {board.timerOtRoundMode
+                  ? "Tap the winner, then OT-SUB / OT-ESC / OT-WinByDQ to end overtime (green winner) and save the intermediate log to Results. Record each half on the timer card."
+                  : "Tap a fighter for submission, escape, or DQ. Draw / no contest need no selection."}
               </p>
               <div className="mt-2 grid gap-2 sm:grid-cols-2">
                 <button
@@ -964,95 +1490,136 @@ export default function ControlPanel({
                   </p>
                 </button>
               </div>
-              <div className="mt-3 flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  className="rounded bg-emerald-800 px-2 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700"
-                  onClick={() => {
-                    if (!finalCorner) {
-                      window.alert("Tap left or right fighter first.");
-                      return;
+              {board.timerOtRoundMode ? (
+                <>
+                  <p className="mt-3 text-[10px] font-semibold uppercase tracking-wide text-emerald-500/80">
+                    End overtime — winner
+                  </p>
+                  <div className="mt-1 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      className="rounded bg-emerald-700 px-2 py-1.5 text-xs font-semibold text-white hover:bg-emerald-600"
+                      onClick={() => void submitOtResult("OT_SUB")}
+                    >
+                      OT-SUB
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded bg-emerald-700 px-2 py-1.5 text-xs font-semibold text-white hover:bg-emerald-600"
+                      onClick={() => void submitOtResult("OT_ESC")}
+                    >
+                      OT-ESC
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded bg-emerald-700 px-2 py-1.5 text-xs font-semibold text-white hover:bg-emerald-600"
+                      onClick={() => void submitOtResult("OT_WINDQ")}
+                    >
+                      OT-WinByDQ
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded border border-zinc-600 px-2 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800"
+                      onClick={() => {
+                        setShowFinalPanel(false);
+                        setFinalCorner(null);
+                      }}
+                    >
+                      CANCEL
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    className="rounded bg-emerald-800 px-2 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700"
+                    onClick={() => {
+                      if (!finalCorner) {
+                        window.alert("Tap left or right fighter first.");
+                        return;
+                      }
+                      const rt =
+                        finalCorner === "LEFT"
+                          ? "SUBMISSION_LEFT"
+                          : "SUBMISSION_RIGHT";
+                      void submitFinalResult(
+                        rt,
+                        `Record SUBMISSION?\n\nWinner: ${cornerWinnerSummary(board, finalCorner)}`,
+                      );
+                    }}
+                  >
+                    SUBMISSION
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded bg-sky-900 px-2 py-1.5 text-xs font-semibold text-white hover:bg-sky-800"
+                    onClick={() => {
+                      if (!finalCorner) {
+                        window.alert("Tap left or right fighter first.");
+                        return;
+                      }
+                      const rt =
+                        finalCorner === "LEFT" ? "ESCAPE_LEFT" : "ESCAPE_RIGHT";
+                      void submitFinalResult(
+                        rt,
+                        `Record ESCAPE?\n\nWinner: ${cornerWinnerSummary(board, finalCorner)}`,
+                      );
+                    }}
+                  >
+                    ESCAPE
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded bg-orange-900 px-2 py-1.5 text-xs font-semibold text-white hover:bg-orange-800"
+                    onClick={() => {
+                      if (!finalCorner) {
+                        window.alert("Tap the disqualified fighter first.");
+                        return;
+                      }
+                      const rt = finalCorner === "LEFT" ? "DQ_LEFT" : "DQ_RIGHT";
+                      const other = finalCorner === "LEFT" ? "RIGHT" : "LEFT";
+                      void submitFinalResult(
+                        rt,
+                        `Disqualify ${finalCorner} corner?\n\nWinner: ${cornerWinnerSummary(board, other)}`,
+                      );
+                    }}
+                  >
+                    WIN BY DQ
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded bg-zinc-700 px-2 py-1.5 text-xs font-semibold text-white hover:bg-zinc-600"
+                    onClick={() =>
+                      void submitFinalResult(
+                        "NO_CONTEST",
+                        "Record NO CONTEST for this bout?",
+                      )
                     }
-                    const rt =
-                      finalCorner === "LEFT"
-                        ? "SUBMISSION_LEFT"
-                        : "SUBMISSION_RIGHT";
-                    void submitFinalResult(
-                      rt,
-                      `Record SUBMISSION?\n\nWinner: ${cornerWinnerSummary(board, finalCorner)}`,
-                    );
-                  }}
-                >
-                  SUBMISSION
-                </button>
-                <button
-                  type="button"
-                  className="rounded bg-sky-900 px-2 py-1.5 text-xs font-semibold text-white hover:bg-sky-800"
-                  onClick={() => {
-                    if (!finalCorner) {
-                      window.alert("Tap left or right fighter first.");
-                      return;
+                  >
+                    NO CONTEST
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded bg-zinc-700 px-2 py-1.5 text-xs font-semibold text-white hover:bg-zinc-600"
+                    onClick={() =>
+                      void submitFinalResult("DRAW", "Record DRAW for this bout?")
                     }
-                    const rt =
-                      finalCorner === "LEFT" ? "ESCAPE_LEFT" : "ESCAPE_RIGHT";
-                    void submitFinalResult(
-                      rt,
-                      `Record ESCAPE?\n\nWinner: ${cornerWinnerSummary(board, finalCorner)}`,
-                    );
-                  }}
-                >
-                  ESCAPE
-                </button>
-                <button
-                  type="button"
-                  className="rounded bg-orange-900 px-2 py-1.5 text-xs font-semibold text-white hover:bg-orange-800"
-                  onClick={() => {
-                    if (!finalCorner) {
-                      window.alert("Tap the disqualified fighter first.");
-                      return;
-                    }
-                    const rt = finalCorner === "LEFT" ? "DQ_LEFT" : "DQ_RIGHT";
-                    const other = finalCorner === "LEFT" ? "RIGHT" : "LEFT";
-                    void submitFinalResult(
-                      rt,
-                      `Disqualify ${finalCorner} corner?\n\nWinner: ${cornerWinnerSummary(board, other)}`,
-                    );
-                  }}
-                >
-                  WIN BY DQ
-                </button>
-                <button
-                  type="button"
-                  className="rounded bg-zinc-700 px-2 py-1.5 text-xs font-semibold text-white hover:bg-zinc-600"
-                  onClick={() =>
-                    void submitFinalResult(
-                      "NO_CONTEST",
-                      "Record NO CONTEST for this bout?",
-                    )
-                  }
-                >
-                  NO CONTEST
-                </button>
-                <button
-                  type="button"
-                  className="rounded bg-zinc-700 px-2 py-1.5 text-xs font-semibold text-white hover:bg-zinc-600"
-                  onClick={() =>
-                    void submitFinalResult("DRAW", "Record DRAW for this bout?")
-                  }
-                >
-                  DRAW
-                </button>
-                <button
-                  type="button"
-                  className="rounded border border-zinc-600 px-2 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800"
-                  onClick={() => {
-                    setShowFinalPanel(false);
-                    setFinalCorner(null);
-                  }}
-                >
-                  CANCEL
-                </button>
-              </div>
+                  >
+                    DRAW
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded border border-zinc-600 px-2 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800"
+                    onClick={() => {
+                      setShowFinalPanel(false);
+                      setFinalCorner(null);
+                    }}
+                  >
+                    CANCEL
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </section>
@@ -1071,10 +1638,12 @@ export default function ControlPanel({
                   ? "text-amber-300"
                   : scoreboardOtRedTimerStyle(board)
                     ? "text-red-800"
-                    : "text-white"
+                    : board.timerRunning
+                      ? "text-white"
+                      : "text-red-500"
               }`}
             >
-              {scoreboardTimerLineFromBoard(board)}
+              {scoreboardTimerLine}
             </p>
             {board.timerOtRoundMode ? (
               <>
@@ -1116,17 +1685,99 @@ export default function ControlPanel({
                     {formatWallMss(board.otRoundElapsedSeconds)}
                   </p>
                 </div>
+                <div className="ml-auto flex flex-wrap items-center gap-1 self-center">
+                  <button
+                    type="button"
+                    title={board.timerRunning ? "Pause (Space)" : "Start (Space)"}
+                    aria-label={
+                      board.timerRunning ? "Pause timer (Space)" : "Start timer (Space)"
+                    }
+                    className={
+                      "inline-flex h-8 w-8 items-center justify-center rounded text-white " +
+                      (board.timerRunning
+                        ? "bg-red-800 hover:bg-red-700"
+                        : "bg-green-800 hover:bg-green-700")
+                    }
+                    onClick={() =>
+                      patch({
+                        command: {
+                          type: board.timerRunning ? "timer_pause" : "timer_start",
+                        },
+                      })
+                    }
+                  >
+                    {board.timerRunning ? (
+                      <PauseIcon className="h-4 w-4" />
+                    ) : (
+                      <PlayIcon className="h-4 w-4 pl-0.5" />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded bg-zinc-700 px-2 py-1 text-xs hover:bg-zinc-600"
+                    onClick={() => patch({ command: { type: "reset_timer_overtime" } })}
+                  >
+                    1:00
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded bg-indigo-900 px-2 py-1 text-xs hover:bg-indigo-800"
+                    onClick={() =>
+                      patch({
+                        command: { type: "adjust_timer_seconds", deltaSeconds: 10 },
+                      })
+                    }
+                  >
+                    +0:10
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded bg-indigo-900 px-2 py-1 text-xs hover:bg-indigo-800"
+                    onClick={() =>
+                      patch({
+                        command: { type: "adjust_timer_seconds", deltaSeconds: -10 },
+                      })
+                    }
+                  >
+                    -0:10
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded bg-violet-900 px-2 py-1 text-xs hover:bg-violet-800"
+                    onClick={() =>
+                      patch({
+                        command: { type: "adjust_timer_seconds", deltaSeconds: 1 },
+                      })
+                    }
+                  >
+                    +0:01
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded bg-violet-900 px-2 py-1 text-xs hover:bg-violet-800"
+                    onClick={() =>
+                      patch({
+                        command: { type: "adjust_timer_seconds", deltaSeconds: -1 },
+                      })
+                    }
+                  >
+                    -0:01
+                  </button>
+                </div>
               </>
             ) : null}
           </div>
           <p className="mt-1 text-xs font-medium uppercase tracking-wide text-zinc-400">
             {board.roundLabel}
           </p>
+          {!board.timerOtRoundMode && (
           <div className="mt-4 flex flex-wrap gap-2">
             <button
               type="button"
-              title={board.timerRunning ? "Pause" : "Start"}
-              aria-label={board.timerRunning ? "Pause timer" : "Start timer"}
+              title={board.timerRunning ? "Pause (Space)" : "Start (Space)"}
+              aria-label={
+                board.timerRunning ? "Pause timer (Space)" : "Start timer (Space)"
+              }
               className={
                 "inline-flex h-10 w-10 items-center justify-center rounded text-white " +
                 (board.timerRunning
@@ -1147,28 +1798,19 @@ export default function ControlPanel({
                 <PlayIcon className="h-5 w-5 pl-0.5" />
               )}
             </button>
-            <button
-              type="button"
-              className="rounded bg-zinc-700 px-3 py-2 text-sm hover:bg-zinc-600"
-              onClick={() =>
-                patch({
-                  command: { type: "set_timer_seconds", seconds: 300 },
-                })
-              }
-            >
-              5:00
-            </button>
-            <button
-              type="button"
-              className="rounded bg-zinc-700 px-3 py-2 text-sm hover:bg-zinc-600"
-              onClick={() =>
-                patch({
-                  command: { type: "reset_timer_regulation" },
-                })
-              }
-            >
-              4:00
-            </button>
+            {!board.timerOtRoundMode && (
+              <button
+                type="button"
+                className="rounded bg-zinc-700 px-3 py-2 text-sm hover:bg-zinc-600"
+                onClick={() =>
+                  patch({
+                    command: { type: "reset_timer_regulation" },
+                  })
+                }
+              >
+                4:00
+              </button>
+            )}
             <button
               type="button"
               className="rounded bg-zinc-700 px-3 py-2 text-sm hover:bg-zinc-600"
@@ -1176,35 +1818,45 @@ export default function ControlPanel({
             >
               1:00
             </button>
-            <button
-              type="button"
-              className="rounded bg-amber-500 px-3 py-2 text-sm font-semibold text-black hover:bg-amber-400"
-              onClick={() => patch({ command: { type: "set_timer_rest_period" } })}
-            >
-              Rest
-            </button>
+            {!board.timerOtRoundMode && (
+              <button
+                type="button"
+                className="rounded bg-amber-500 px-3 py-2 text-sm font-semibold text-black hover:bg-amber-400"
+                onClick={() => patch({ command: { type: "set_timer_rest_period" } })}
+              >
+                Rest
+              </button>
+            )}
           </div>
+          )}
+          {!board.timerOtRoundMode && (
           <div className="mt-2 flex flex-wrap gap-2">
-            <button
-              type="button"
-              className="rounded bg-sky-900 px-3 py-2 text-sm hover:bg-sky-800"
-              onClick={() =>
-                patch({ command: { type: "adjust_timer_seconds", deltaSeconds: 60 } })
-              }
-            >
-              +1:00
-            </button>
-            <button
-              type="button"
-              className="rounded bg-sky-900 px-3 py-2 text-sm hover:bg-sky-800"
-              onClick={() =>
-                patch({
-                  command: { type: "adjust_timer_seconds", deltaSeconds: -60 },
-                })
-              }
-            >
-              -1:00
-            </button>
+            {!board.timerOtRoundMode && (
+              <button
+                type="button"
+                className="rounded bg-sky-900 px-3 py-2 text-sm hover:bg-sky-800"
+                onClick={() =>
+                  patch({
+                    command: { type: "adjust_timer_seconds", deltaSeconds: 60 },
+                  })
+                }
+              >
+                +1:00
+              </button>
+            )}
+            {!board.timerOtRoundMode && (
+              <button
+                type="button"
+                className="rounded bg-sky-900 px-3 py-2 text-sm hover:bg-sky-800"
+                onClick={() =>
+                  patch({
+                    command: { type: "adjust_timer_seconds", deltaSeconds: -60 },
+                  })
+                }
+              >
+                -1:00
+              </button>
+            )}
             <button
               type="button"
               className="rounded bg-indigo-900 px-3 py-2 text-sm hover:bg-indigo-800"
@@ -1244,6 +1896,20 @@ export default function ControlPanel({
               -0:01
             </button>
           </div>
+          )}
+          {board.timerOtRoundMode && (
+            <OtResultCard
+              board={board}
+              selection={otSelection}
+              leftElapsed={otLeftElapsed}
+              rightElapsed={otRightElapsed}
+              onSelect={handleOtSelect}
+              onLeftElapsedChange={setOtLeftElapsed}
+              onRightElapsedChange={setOtRightElapsed}
+              onSave={() => void commitOtIntermediate()}
+              onUnsave={() => void commitOtUnsave()}
+            />
+          )}
           <div className="mt-2 flex flex-wrap gap-2">
             <div className="inline-flex items-center gap-1">
               <span className="text-[10px] font-semibold tracking-wide text-zinc-300">
@@ -1420,6 +2086,167 @@ export default function ControlPanel({
           </div>
         </section>
       </div>
+    </div>
+  );
+}
+
+/**
+ * OT-round intermediate result card (control timer card, OT mode only). Each
+ * fighter gets SUB / ESC (toggle) plus an editable elapsed box, a shared DRAW
+ * toggle and a save action. Saving appends to the in-card OT log and advances
+ * the round. `TOT ESC:` tallies each fighter's escape time across the period.
+ */
+function OtResultCard({
+  board,
+  selection,
+  leftElapsed,
+  rightElapsed,
+  onSelect,
+  onLeftElapsedChange,
+  onRightElapsedChange,
+  onSave,
+  onUnsave,
+}: {
+  board: BoardPayload;
+  selection: OtSelection;
+  leftElapsed: string;
+  rightElapsed: string;
+  onSelect: (sel: OtSelection) => void;
+  onLeftElapsedChange: (v: string) => void;
+  onRightElapsedChange: (v: string) => void;
+  onSave: () => void;
+  onUnsave: () => void;
+}) {
+  const log = board.otIntermediateLog ?? [];
+  const isPicked = (side: "left" | "right", kind: "SUB" | "ESC") =>
+    selection !== null &&
+    selection !== "DRAW" &&
+    selection.side === side &&
+    selection.kind === kind;
+
+  const renderRow = (
+    side: "left" | "right",
+    name: string,
+    teamName: string,
+    elapsed: string,
+    onElapsed: (v: string) => void,
+  ) => {
+    const totEsc = totalEscapeSecondsForSide(log, side);
+    return (
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="min-w-[5rem] flex-1 truncate text-[11px] font-semibold text-zinc-100">
+          {name || (side === "left" ? "Left fighter" : "Right fighter")}
+          {teamName.trim() ? (
+            <span className="ml-1 font-normal text-zinc-400">
+              · {teamName.trim()}
+            </span>
+          ) : null}
+        </span>
+        <button
+          type="button"
+          onClick={() => onSelect({ side, kind: "SUB" })}
+          className={[
+            "rounded px-1.5 py-0.5 text-[11px] font-semibold transition",
+            isPicked(side, "SUB")
+              ? "bg-emerald-600 text-white ring-1 ring-emerald-300"
+              : "bg-zinc-700 text-zinc-100 hover:bg-zinc-600",
+          ].join(" ")}
+        >
+          SUB
+        </button>
+        <button
+          type="button"
+          onClick={() => onSelect({ side, kind: "ESC" })}
+          className={[
+            "rounded px-1.5 py-0.5 text-[11px] font-semibold transition",
+            isPicked(side, "ESC")
+              ? "bg-sky-600 text-white ring-1 ring-sky-300"
+              : "bg-zinc-700 text-zinc-100 hover:bg-zinc-600",
+          ].join(" ")}
+        >
+          ESC
+        </button>
+        <input
+          type="text"
+          inputMode="numeric"
+          placeholder=":ss"
+          aria-label={`${side} elapsed time`}
+          value={elapsed}
+          onChange={(e) => onElapsed(e.target.value)}
+          className="h-6 w-9 rounded border border-zinc-600 bg-zinc-900 px-1 text-center font-mono text-[11px] text-zinc-100"
+        />
+        <span className="text-[11px] uppercase tracking-wide text-zinc-400">
+          TOT ESC:{" "}
+          <span className="font-bold text-white">{formatOtElapsedMmss(totEsc)}</span>
+        </span>
+      </div>
+    );
+  };
+
+  return (
+    <div className="mt-3 rounded-md border border-teal-800/50 bg-zinc-900/40 p-2">
+      <div className="flex flex-col gap-1.5">
+        {renderRow(
+          "left",
+          board.left?.displayName ?? "",
+          board.left?.teamName ?? "",
+          leftElapsed,
+          onLeftElapsedChange,
+        )}
+        {renderRow(
+          "right",
+          board.right?.displayName ?? "",
+          board.right?.teamName ?? "",
+          rightElapsed,
+          onRightElapsedChange,
+        )}
+      </div>
+      <div className="mt-2 flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={() => onSelect("DRAW")}
+          className={[
+            "rounded px-2 py-0.5 text-[11px] font-semibold transition",
+            selection === "DRAW"
+              ? "bg-amber-500 text-black ring-1 ring-amber-300"
+              : "bg-zinc-700 text-zinc-100 hover:bg-zinc-600",
+          ].join(" ")}
+        >
+          DRAW
+        </button>
+        <button
+          type="button"
+          title="Save this half and advance"
+          aria-label="Save OT half"
+          onClick={onSave}
+          className="inline-flex h-6 w-6 items-center justify-center rounded bg-teal-700 text-white hover:bg-teal-600"
+        >
+          <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+            <path d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm-5 16a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm3-10H5V5h10v4z" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          title="Undo the last saved half"
+          aria-label="Undo last OT half"
+          onClick={onUnsave}
+          disabled={log.length === 0}
+          className="inline-flex h-6 w-6 items-center justify-center rounded bg-zinc-700 text-zinc-100 hover:bg-zinc-600 disabled:cursor-not-allowed disabled:opacity-35"
+        >
+          <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+            <path d="M12.5 8c-2.65 0-5.05 1-6.9 2.6L2 7v9h9l-3.62-3.62A7.97 7.97 0 0 1 12.5 11c2.86 0 5.29 1.87 6.16 4.45l2.36-.78C19.84 10.98 16.5 8 12.5 8z" />
+          </svg>
+        </button>
+      </div>
+      {log.length > 0 && (
+        <div className="mt-2 max-h-32 overflow-auto rounded border border-zinc-800 bg-zinc-950/60 p-2">
+          <ul className="space-y-0.5 font-mono text-[11px] leading-snug text-zinc-300">
+            {log.map((entry, i) => (
+              <li key={`${entry.createdAt}-${i}`}>{formatOtIntermediateLine(entry)}</li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   );
 }

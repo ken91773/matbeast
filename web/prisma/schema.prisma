@@ -378,6 +378,23 @@ model LiveScoreboardState {
   /// OT round: total elapsed seconds moved to main (restored to secondary base on undo).
   otRoundTransferUndoElapsedTotal Int?
 
+  /// Match clock/elapsed captured the instant the operator started the rest
+  /// timer, so the *match-end* time is preserved for the next FINAL save
+  /// instead of being overwritten by the running 0:30 rest clock. Formatted
+  /// like the summary clock (e.g. "2:34", "OT 0:45"). Consumed/cleared on
+  /// final_save, reset, and when a fresh clock is set.
+  recordedMatchClock String?
+  /// Result-log round label captured alongside `recordedMatchClock`. Starting
+  /// the rest timer sets overtimeIndex to -1, which would otherwise stamp the
+  /// final as "REST PERIOD". Preserves the real round (e.g. "Quarter Finals",
+  /// "OT PERIOD"). Consumed/cleared together with `recordedMatchClock`.
+  recordedMatchRound String?
+  /// OT intermediate (advancing) results log: JSON array of per-half results
+  /// recorded on the control card during overtime. Held here until an OT-ender
+  /// flushes them into the Results log, then cleared. Each entry:
+  /// { roundLabel, side, playerName, kind, elapsedSeconds, createdAt }.
+  otIntermediateLogJson String?
+
   updatedAt DateTime @updatedAt
 }
 

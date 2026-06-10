@@ -100,6 +100,15 @@ interface MatBeastDesktopApi {
    * nudges fail. Used only when the renderer detects it is still stuck.
    */
   hardRestoreWebKeyboardFocus?: () => Promise<{ ok: boolean }>;
+  /** Render HTML to a PDF (Chromium printToPDF) and save it to a user-chosen file — free, no Adobe. */
+  exportPdf?: (payload: {
+    html: string;
+    defaultName?: string;
+  }) => Promise<{ ok: boolean; filePath?: string; canceled?: boolean; error?: string }>;
+  /** Open the OS print dialog for HTML via a hidden window (Microsoft Print to PDF / printers). */
+  printHtml?: (payload: {
+    html: string;
+  }) => Promise<{ ok: boolean; printed?: boolean; error?: string }>;
   /**
    * v1.2.9: First-launch password gate persistence under
    * `userData/first-launch-password.json`. Origin-stable so the

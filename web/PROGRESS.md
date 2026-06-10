@@ -1,6 +1,348 @@
 # Progress Log
 
 ## Current Build Status
+- **v2.0.0 (2026-06-09)** — Overlay APPLY behavior, regulation/OT timer + bracket automation (released).
+  - Full-match reset now keeps the highlighted bracket round (e.g. "Semi
+    Finals") instead of snapping the round label back to "Quarter Finals":
+    the reset PATCH carries the highlighted round as a direct `roundLabel`
+    field (applied before `reset_match`, which leaves the label alone). A
+    `selectedBracketRoundLabelRef` lets the once-subscribed reset handler read
+    the current highlight. (`ControlPanel.tsx`.)
+  - Version bumped `1.2.34` → `2.0.0`; the items below shipped in this release.
+  - **Empty teams APPLY fades to nothing (not the scoreboard).** In SHOW TEAMS,
+    tapping `Apply` with both dropdowns empty now fades the team-list overlay out
+    to fully transparent while the overlay stays live (barn doors open), instead
+    of reverting to the scoreboard graphic. New `"blank"` `ScoreboardOverlayMode`
+    variant; both scoreboard + team-list layers already crossfade to opacity 0 for
+    any non-`scoreboard`/`teams` mode, so no overlay render change was needed. The
+    dropdowns stay open so the operator can pick a new matchup.
+    (`overlay-output-broadcast.ts`, `DashboardFullWorkspace.tsx`.)
+  - **Control-card APPLY orchestrates the barn doors.** `applyFighters` now sequences
+    the live/barn-door state around the board change: if the overlay is LIVE it
+    closes the doors → waits `OVERLAY_BARN_DOOR_MS` → commits the change (hidden) →
+    waits `OVERLAY_APPLY_PROPAGATION_MS` for the overlay's board poll to catch up →
+    reopens. If it's NOT live it commits behind the closed doors → waits → opens with
+    the barn-door effect. Either path ends LIVE; a failed PATCH restores the prior
+    live state so the doors aren't stranded. `ControlPanel` follows the live state via
+    the overlay broadcast channel (mirrors `live`/`pong`, emits `live`) but never
+    answers `ping` so it doesn't become a competing authority. Barn-door duration
+    moved to the shared lib (`OVERLAY_BARN_DOOR_MS`); new `OVERLAY_APPLY_PROPAGATION_MS`.
+    (`ControlPanel.tsx`, `overlay-output-broadcast.ts`, `overlay-client.tsx`.)
+  - **Teams overlay fade in/out on APPLY.** The team-list layer now runs a
+    sequential fade controller: the broadcast ids are the *target*, while
+    `teamRenderA/B` + `teamLayerOpacity` drive what's painted. Changing the
+    matchup fades the current list **out** (1 s), swaps the content while
+    hidden, then fades the new list **in** (1 s); a first show (nothing on
+    screen) skips the out-phase and just fades in. The players query is kept
+    enabled through the fade-out (its `gcTime: 0` would otherwise hard-cut the
+    roster mid-fade). (`overlay-client.tsx`.)
+  - **SHOW TEAMS fades the scoreboard out to nothing.** Clicking SHOW TEAMS
+    with no matchup applied now broadcasts `"blank"` (scoreboard fades out, the
+    overlay shows nothing) instead of leaving the scoreboard on-air until APPLY;
+    picking teams + APPLY then fades the list in. A previously-applied matchup
+    still restores on SHOW TEAMS. (`DashboardFullWorkspace.tsx`.)
+  - **Team-final detection drives bracket advancement + OT.** When a regulation
+    sweep decides a team match (one side reaches 5 eliminations), the winner is
+    already written to the bracket; now the Bracket card's "current match"
+    highlight also auto-advances to the next logical match (first undecided,
+    fully-seeded match in QF→SF→GF order), which re-emits the selection (round
+    label, overlay highlight, next team ids). A regulation DRAW that takes BOTH
+    teams to 5 (4-4 → 5-5) no longer dead-ends: it advances the round label to
+    `OT ROUND1 ↑`, resets into a fresh OT period (1:00 paused, ELAPSED 0, OT log
+    cleared), and the control card clears both fighter dropdowns. An OT ender
+    (OT-SUB / OT-ESC / OT-WinByDQ) now decides the team match by winning corner:
+    it sets the bracket winner, advances the highlight, and clears both
+    dropdowns. New `winnerSideForResult` + `matbeast-bracket-advance-current`
+    event + `pickNextLogicalMatchId`. (`api/board/route.ts`, `ControlPanel.tsx`,
+    `BracketPanel.tsx`.)
+  - **Regulation 4:00 reset moved from finalize → APPLY.** Finalizing a result
+    no longer resets the live clock (the match-end time stays on screen). The
+    4:00 (paused) regulation reset now happens when the operator taps the
+    control-card APPLY instead (new `resetTimerForApply` PATCH flag; server
+    ignores it for OT rounds, which keep their own clock). (`api/board/route.ts`,
+    `ControlPanel.tsx`.)
+  - Kept `web/package.json` at `1.2.34`. Built locally (not published).
+- **v1.2.33 (2026-06-07)** — OT round control redesign (per-fighter intermediate results + in-card log).
+  - **Timer card transforms in OT round mode.** Hides the `5:00`, `4:00`,
+    `+1:00`, `-1:00`, and `Rest` presets and shows a per-fighter result card:
+    each fighter gets `SUB` / `ESC` toggles, an editable elapsed box (auto-filled
+    from the current ELAPSED, mm:ss), and a running `TOT ESC:` (sum of that
+    fighter's escape elapsed across the whole OT period). A shared `DRAW` toggle +
+    save icon sit below. (`ControlPanel.tsx`, new `OtResultCard`.)
+  - **Intermediate results go to an in-card OT log, not the Results card.** Saving
+    a half appends a line (`OT ROUND1 ↑: NAME by SUB elapsed time: 0:26` / `…: Draw`)
+    to a card-local log (newest at bottom, persists across OT round selections) and
+    advances per the existing OT rules (top SUB transfers the edited elapsed to the
+    next clock; ESC/DRAW → 1:00; label steps to the next half, paused; players
+    unchanged). Unexpected results warn "Unexpected Result-Sure?"; on OT ROUND 3 ↓ a
+    result is logged with no advance/reset. New `ot_intermediate_result` command.
+  - **OT enders finalize + flush.** The Final-result panel in OT mode shows only
+    `OT-SUB` / `OT-ESC` / `OT-WinByDQ` (with the LEFT/RIGHT corner pick). These
+    record the green winner to the Results log **and** flush the in-card OT log into
+    the Results log most-recent-first (each line keeps its original record time),
+    then clear the in-card log. Unexpected enders warn but still finalize on
+    "I'm Sure" (a gap in the record is acceptable); never advance.
+  - New nullable `LiveScoreboardState.otIntermediateLogJson` column (schema +
+    `ALTER TABLE` self-heal in `board.ts` + `electron/main.js` additive list),
+    exposed parsed as `board.otIntermediateLog`. New `lib/ot-intermediate-log.ts`
+    (entry type, line formatter, mm:ss parse, TOT-ESC sum). Log clears on new-OT
+    entry / `reset_match` / `clear_fields`. (`api/board/route.ts`, `lib/board.ts`,
+    `types/board.ts`, `prisma/schema.prisma`, `electron/main.js`.)
+  - **Compact OT card + unsave + reset-on-entry (follow-up).** The OT timer card
+    is now tighter: the timer control buttons (`Play/Pause`, `1:00`, `±0:10`,
+    `±0:01`) sit inline on the same row as the clock/ELAPSED; the `Record half —
+    Round x` caption is gone; fighter names + `SUB`/`ESC`/`DRAW` use `text-[11px]`
+    (Teams-list size); the editable elapsed box shows `:ss` (e.g. `:26`) and parses
+    `:ss`/`m:ss`/bare seconds; `TOT ESC:` time renders bold bright white; `DRAW`,
+    save, and the new `Unsave` button are smaller. Selecting an OT round for the
+    first time (non-OT → OT) now resets the clock to `1:00` and ELAPSED to `0`.
+    The `Unsave` button (enabled only after a save) pops the last in-card OT log
+    entry and restores the pre-save clock / ELAPSED / round label via a per-entry
+    `restore` snapshot. New `ot_intermediate_unsave` command + `formatOtElapsedColonSeconds`
+    helper. (`ControlPanel.tsx`, `api/board/route.ts`, `lib/ot-intermediate-log.ts`.)
+  - **Elapsed `:ss` everywhere + team names on the OT card.** The in-card OT log
+    line (and the Results-log flush) now render elapsed as `:26` instead of `0:26`
+    (an OT half is always < 1 min); `TOT ESC:` stays `m:ss` since it can exceed a
+    minute. The editable elapsed box shrank to fit, and each fighter row now shows
+    `Name · Team`. (`lib/ot-intermediate-log.ts`, `ControlPanel.tsx`.)
+  - **Bug fix: false warning cue on OT save/unsave.** Saving a SUB (or unsaving)
+    that set the clock below the warning threshold played the 10s warning.
+    `useLiveEffectiveTimerSeconds` returned a one-render-lagged internal state, so
+    a paused clock jump landed in a *different* render than its `resetKey` bump and
+    the edge detector saw `prev>warn → curr<=warn`. It now returns the prop
+    directly when the timer is not counting down, keeping the value and reset key
+    in lockstep. (`useLiveEffectiveTimerSeconds.ts`.)
+  - **Bug fix: OT-ender unsave now fully reverts.** Unsaving an OT-ending final
+    result left the flushed intermediate lines on the Results log and did not
+    restore the in-card OT log. `final_save` now records the flushed Results-log
+    row ids and the pre-flush log JSON in the pre-final snapshot; `final_unsave`
+    deletes those rows and restores `otIntermediateLogJson` (the OT card returns
+    since OT mode is derived from the restored round label). (`api/board/route.ts`.)
+  - **Bug fix: false cues on big clock jumps / app open.** Defense-in-depth for
+    both the 10s warning and the 0 air horn: the edge detector now ignores any
+    instantaneous drop greater than 3s (reset / clock edit / OT transfer /
+    sleep-or-throttle catch-up / stale→fresh board swap on launch) and resyncs
+    silently instead of firing. Fixes sounds blasting rapidly on app open.
+    (`useTimerAlertSounds.ts`.)
+  - **OT ROUND 3 ↓ allows an intermediate ESC without the warning.** The final
+    tie-break half now treats a per-fighter `ESC` as an expected intermediate
+    result (recorded, no advance/reset) so the operator can capture each
+    escape's elapsed time and compare total escape times. (`ControlPanel.tsx`.)
+  - **Regulation final resets the clock to 4:00.** Finalizing a non-OT result
+    now resets the live timer to 4:00 (paused, cue-nonce bumped) so the operator
+    is ready for the next match; OT-round finals keep their own clock.
+    (`api/board/route.ts`.) The `5:00` preset was removed from the timer control
+    card. (`ControlPanel.tsx`.)
+  - Bumped `web/package.json` to `1.2.33`. Built locally (not published).
+
+- **v1.2.32 (2026-06-07)** — Results timestamps, match-clock preservation, post-final fighter dropdowns.
+  - **Every results-log entry now shows a timestamp.** Decisive finals already
+    embedded the saved-at time; draws, no-contests and manual rows did not.
+    `resultLogDisplayLine` now prepends the recorded time when the base line
+    lacks one — `createdAt` for draws/no-contests, the operator-entered
+    `manualDate`/`manualTime` (tolerant parse, falls back to `createdAt`) for
+    manual rows. Flows through to the PDF/Print export. (`ResultsLogPanel.tsx`.)
+  - **Match clock/round preserved across the rest timer.** Operators start the
+    0:30 rest clock to sync with the live event *before* saving the final, which
+    used to overwrite the recorded match clock with the rest countdown (and wipe
+    OT-round elapsed). `set_timer_rest_period` now snapshots the match
+    clock/elapsed *and* the real round label the instant rest begins; `final_save`
+    reuses them (so a final saved during rest is no longer stamped "REST PERIOD")
+    and clears the snapshot. The snapshot is also cleared on any fresh-clock / new
+    match action. New nullable `LiveScoreboardState.recordedMatchClock` +
+    `recordedMatchRound` columns (schema + `ALTER TABLE` self-heal in `board.ts`
+    and the `electron/main.js` additive-column list). (`api/board/route.ts`,
+    `lib/board.ts`, `prisma/schema.prisma`, `electron/main.js`.)
+  - **Control fighter dropdowns clear by outcome after a final.** The scoreboard
+    overlay keeps the names until the next APPLY; only the control's selection
+    changes: DRAW / NO_CONTEST clear both; a win keeps the winner selected and
+    clears the loser; a 5th elimination (team swept) clears both for a new team
+    match. **Exception:** in an OVERTIME round (OT ROUND label) both fighters stay
+    selected regardless of result. (`ControlPanel.tsx`.)
+  - Carries forward v1.2.31's free PDF export (Chromium `printToPDF` + native
+    Save dialog; Print via OS dialog) — no Adobe required.
+  - Bumped `web/package.json` to `1.2.32`. Built locally (not yet published).
+
+- **v1.2.31 (2026-06-07)** — Results export to PDF (free, no Adobe).
+  - **Export PDF + Print buttons on the Results card title bar.** Builds a
+    print-styled document of the results log in chronological order (oldest →
+    newest by `createdAt`), titled with the event name and a date (or date
+    range) deduced from the log's timestamps. Result lines reuse the on-screen
+    formatting (shared `resultLogDisplayLine`). Buttons disabled with no event /
+    empty log.
+  - **Free PDF, no Adobe.** Export PDF renders the document with Chromium's
+    built-in `webContents.printToPDF` in the main process and saves it via a
+    native Save dialog — no PDF printer / Adobe Acrobat required (the renderer
+    print dialog had been defaulting to paid "Adobe PDF"). Print opens the OS
+    print dialog (free Microsoft Print to PDF or any printer). New IPC
+    `app:export-pdf` / `app:print-html` (+ preload `exportPdf`/`printHtml`),
+    each rendering the HTML in a hidden window. Browser/dev fallback uses an
+    iframe + system print dialog. (`ResultsLogPanel.tsx`,
+    `DashboardFullWorkspace.tsx`, `electron/main.js`, `electron/preload.js`.)
+  - Bumped `web/package.json` to `1.2.31`. Built locally (not yet published).
+
+- **v1.2.30 (2026-06-07)** — empty-APPLY clears overlay + Teams Auto color.
+  - **APPLY with no teams now clears the overlay.** In SHOW TEAMS, tapping APPLY
+    with both dropdowns empty reverts the output (and preview) to the scoreboard
+    graphic, removing any team names/players that were on-air, instead of the old
+    "No team selected" error that left stale content up. Dropdowns stay open for
+    re-selection. Removed the now-dead error toast + its state/effect.
+  - **Auto color button in the Teams card.** New "Auto color" label + palette
+    icon after the seed-order lock. Tapping randomly assigns distinct colors to
+    named teams that have *no* color (manually-colored teams are never changed,
+    and their colors are avoided). Taps 1–5 re-roll a fresh set; the 6th tap
+    restores the targeted teams to their original (uncolored) state; a 7th starts
+    a new cycle. Cycle resets on team add/remove/rename but not on reorder or
+    color changes. Writes are optimistic and persisted via `/api/teams/:id`.
+  - Bumped `web/package.json` to `1.2.30`. Built and published to GitHub
+    (release `v1.2.30`, no source commit).
+
+- **v1.2.29 (2026-06-07)** — dead-keyboard recovery hardening + CURRENT team-fill button.
+  - **Keyboard-routing recovery actually rebinds now.** The Windows "input is
+    focused but keystrokes go nowhere until Alt+Tab" bug occasionally survived
+    the hard recovery because `mainWindow.blur(); focus();` can be a no-op when
+    there's no other window to deactivate to, and `webContents.focus()` is a
+    no-op when Chromium already believes the web view is focused.
+    `hardRecoverMainWindowKeyboardFocus` now calls `blurWebView()` first so the
+    follow-up focus performs a *real* Chromium focus transition that rebuilds
+    the renderer keyboard route (HWND blur/focus still runs on Windows as a
+    secondary OS-level measure).
+  - **Stuck input detected sooner.** The same-field re-click detector now
+    escalates on the first deliberate re-click (2 clicks) instead of the third,
+    with a wider 250 ms–4 s window. The hard recovery captures and restores the
+    caret/selection, so an early escalation is invisible if the field was fine.
+  - **CURRENT button in SHOW TEAMS.** New amber button between TEAM B and APPLY
+    fills the team dropdowns from the gold-highlighted bracket match, cycling on
+    successive taps: TEAM A only → TEAM B only → both → cleared. No highlighted
+    match (or TBD slots) → clears both and resets. Reads BracketPanel's
+    `matbeast-bracket-selection` event; stages the selection only (APPLY still
+    commits). Cycle resets on match change or manual dropdown edit.
+  - Bumped `web/package.json` to `1.2.29`. Built and published to GitHub
+    (release `v1.2.29`, no source commit).
+
+- **v1.2.28 (2026-06-07)** — bracket NDI always-displaying, capture decoupled.
+  - **Bracket NDI now broadcasts continuously (always displaying)** at 15 fps
+    instead of emitting only on change. The previous v1.2.27 send-on-change +
+    5 s heartbeat made the static bracket source emit a frame only every 5 s
+    on receivers. Capture rate and broadcast rate are now **decoupled**: the
+    offscreen page is re-captured (checked for changes) every 5 s while a
+    resend loop re-broadcasts the latest captured frame at 15 fps, so the
+    bracket is always live on every receiver and a change appears within ~5 s.
+  - Scoreboard unchanged: continuous 15 fps (captures and broadcasts every
+    frame).
+  - `electron/ndi-feed.js` `SCENE_FEED_DEFAULTS` now keyed by
+    `{frameRate, captureIntervalMs, continuousResend}`; `ndi-source.js` accepts
+    a `captureIntervalMs` override (defaults to `1000/frameRate`); diagnostics
+    expose `continuousResend`, `captureIntervalMs`, `capturesReceived`.
+  - Bumped `web/package.json` to `1.2.28`. Built and published to GitHub
+    (release `v1.2.28`, no source commit).
+
+- **v1.2.27 (2026-06-07)** — NDI per-scene tuning + roster/timer fixes.
+  - **Scoreboard NDI now 15 fps** (was 30). Per-second clock stays smooth
+    while halving capture/encode/network cost. Capture pump, announced NDI
+    rate, and `setFrameRate` all follow the same value.
+  - **Bracket NDI send-on-change.** The bracket feed only hands a frame to
+    NDI when the captured pixels differ from the last sent frame; a 5 s
+    heartbeat re-sends the current frame while idle so late-joining
+    receivers still latch onto the live image. New per-scene
+    `SCENE_FEED_DEFAULTS` in `electron/ndi-feed.js`
+    (`{frameRate, sendOnChangeOnly, heartbeatMs}`); diagnostics expose
+    `framesDeduped`. Warmup now scales to ~1 s at any frame rate.
+  - **Master profile delete sticks.** `GET /api/player-profiles` is now
+    read-only — removed the roster→master backfill that resurrected a
+    just-deleted profile on the list refresh. Masters still stay in sync
+    via the per-player write path (`/api/players`) and explicit roster
+    import.
+  - **Space bar exclusively controls the timer.** It now always
+    `preventDefault`s (unless editing an input) so it no longer activates
+    whatever button/link happens to have focus; it only starts/pauses the
+    match timer.
+  - **Match clock turns red when not counting down.** White only while
+    actively counting down; red when paused/stopped (REST keeps amber, OT
+    keeps its red). Shared `scoreboardTimerColorHex` applied to overlay,
+    NDI canvas layer, and control panel.
+  - Bumped `web/package.json` to `1.2.27`. Built and published to GitHub
+    (release `v1.2.27`, no source commit).
+
+- **v1.2.26 (2026-06-07)** — wall-clock scoreboard timer display (overlay + NDI).
+  - **Match clock on screen now uses `timerEndsAt`.** The overlay
+    scoreboard and control-panel timer tick every second from the same
+    100 ms wall-clock hook as WARN/HORN cues (`useLiveEffectiveTimerSeconds`
+    → `useLiveScoreboardTimerLine`), instead of updating only when the
+    board poll returned new `secondsRemaining`. Fixes skipped seconds
+    (e.g. 30→29→27) and uneven pauses on NDI/OBS receivers.
+  - **Shared hook extracted** from `useTimerAlertSounds` so display and
+    audio share one clock. New files: `src/hooks/useLiveEffectiveTimerSeconds.ts`,
+    `src/hooks/useLiveScoreboardTimerLine.ts`; `scoreboardTimerLineFromRemaining`
+    in `scoreboard-timer-display.ts`.
+  - Bumped `web/package.json` to `1.2.26`. Built and published to GitHub
+    (release `v1.2.26`, no source commit).
+
+- **v1.2.25 (2026-06-06)** — tighter timer cue audio (wall clock + NDI).
+  - **Wall-clock cue detection.** Timer WARN/HORN cues now follow
+    `timerEndsAt` on a 100 ms tick instead of waiting for the 1 s board
+    poll, so NDI/OBS paths hear cues aligned with the overlay clock.
+  - **Faster board polling near boundaries** (100–250 ms within a few
+    seconds of WARN/0) as a fallback for other board consumers.
+  - **NDI audio:** smaller PCM frames (256 vs 1024 samples) and flush
+    of partial tail when a cue ends so short warnings are not clipped.
+  - **Space bar** toggles timer start/pause on the control panel (when
+    not typing in an input and focus is not on another button).
+  - Board API now exposes `timerEndsAt` to the client.
+  - Bumped `web/package.json` to `1.2.25`. Published to GitHub (no commit).
+
+## NDI / OBS latency notes (2026-06-07 session)
+Operator setup: Mat Beast → NDI → (same Gigabit switch) → OBS PC + other
+receivers; arena audio via OBS → USB-C → DLZ mixer. Unicast to multiple
+receivers (no multicast).
+
+**Measured (direct Ethernet cable Mat Beast ↔ OBS PC):**
+- Scoreboard PC local speakers: instant (dashboard audible path, not NDI).
+- NDI Studio Monitor on OBS PC: ~**½ s** behind operator desk.
+- OBS NDI source: ~**1 s** behind operator desk (≈½ s NDI + ≈½ s OBS).
+- Timeout on NDI source does **not** affect live delay (only on signal loss).
+
+**Root causes identified:**
+- Display timer (pre-1.2.26) updated on board poll (~1 s) while audio used
+  wall clock → janky/skipped seconds on NDI video; fixed in v1.2.26.
+- Overall NDI/OBS buffer delay is expected; cannot match operator local audio
+  without delaying local or accepting arena path latency.
+
+**OBS recommendations (arena feed):**
+- Bandwidth: Highest; Audio/Video Sync: **Network**; Framesync: **off**;
+  Timeout: 3 s; Keepalive: on.
+- Tune horn vs on-screen timer with **Edit → Advanced Audio Properties →
+  Sync Offset** on the NDI source (100 ms steps), judged on OBS preview only.
+- Do not use operator PC speakers to judge arena timing.
+
+**Mat Beast NDI config today:** Options ▸ NDI ▸ Network adapter only.
+Private `ndi-config.v1.json` under `%APPDATA%\Mat Beast Scoreboard\ndi-config\`
+supports `adapters.allowed`; multicast/transport not exposed in UI yet.
+
+**Possible future work:**
+- NDI settings UI (multicast toggle, 15 fps scoreboard mode, dual-NIC).
+- Unified NDI video+audio timecodes for better OBS Source Timing.
+- Mute local cue sounds on operator PC when NDI is active.
+- NDI HX requires Advanced SDK + H.264 encoder (not in current grandiose path).
+
+- **v1.2.24 (2026-06-04)** — clearer cloud connection errors on homepage.
+  - **Diagnostic cloud errors.** When the homepage cannot load the cloud
+    event list, the error panel now shows the real underlying reason
+    (DNS failure, TLS/certificate, timeout, connection refused, or the
+    cloud server's actual HTTP status) instead of a generic "Cloud list
+    HTTP 502".
+  - Bumped `web/package.json` to `1.2.24`.
+
+- **v1.2.23 (2026-06-02)** — Scoreboard Preview Monitor display picker.
+  - **Choose the output display.** Selecting Window → Scoreboard Preview
+    Monitor now opens a dialog listing every attached display (with
+    resolution, position, and Primary/Strip tags) so the operator picks
+    which monitor the preview opens on, instead of auto-guessing. The
+    chosen display is honored when opening, snapping, and repositioning on
+    display changes; it falls back to the strip/external/primary heuristic
+    if that display is unplugged. Cancel leaves the monitor closed.
+  - Bumped `web/package.json` to `1.2.23`.
+
 - **v1.2.22 (2026-06-02)** — Scoreboard Preview Monitor zoom-to-fill.
   - **Fill-width preview.** The Scoreboard Preview Monitor now zooms the
     16:9 overlay to fill the monitor width and crops the empty top/bottom

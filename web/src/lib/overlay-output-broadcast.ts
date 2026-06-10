@@ -6,10 +6,23 @@ export type OverlayScene = "scoreboard" | "bracket";
 /**
  * Scoreboard-window content mode. `teams` swaps the scoreboard graphic for a
  * two-team list overlay while keeping the barn-door / OVERLAY LIVE behavior
- * unchanged. Fully ephemeral — never persisted to DB or event file; cold app
- * start, tab switch, or file open resets to `scoreboard`.
+ * unchanged. `blank` fades both the scoreboard graphic and the team list out to
+ * nothing (transparent) while the overlay stays live — used when APPLY is
+ * tapped in teams mode with no teams selected. Fully ephemeral — never
+ * persisted to DB or event file; cold app start, tab switch, or file open
+ * resets to `scoreboard`.
  */
-export type ScoreboardOverlayMode = "scoreboard" | "teams";
+export type ScoreboardOverlayMode = "scoreboard" | "teams" | "blank";
+
+/** Barn-door open/close animation duration (ms). Shared by the overlay render and APPLY orchestration. */
+export const OVERLAY_BARN_DOOR_MS = 1000;
+
+/**
+ * After a control-card APPLY commits a board change, wait this long before
+ * reopening the barn doors so the overlay's board poll (≤1s when idle) has
+ * picked up the new fighters/round and the doors open on fresh content.
+ */
+export const OVERLAY_APPLY_PROPAGATION_MS = 1100;
 
 /**
  * Player highlight in the team-list overlay. `team` selects which of the two

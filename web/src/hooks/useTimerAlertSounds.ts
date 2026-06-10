@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { useLiveEffectiveTimerSeconds } from "@/hooks/useLiveEffectiveTimerSeconds";
 import {
   applySelectedAudioOutput,
   applySelectedAudioOutputToContext,
@@ -297,6 +298,15 @@ function renderAirHornishBuffer(ctx: AudioContext): AudioBuffer {
   return buf;
 }
 
+function flushNdiTapPartial(kit: AudioKit): void {
+  if (!kit.tapNode) return;
+  try {
+    kit.tapNode.port.postMessage({ type: "flush" });
+  } catch {
+    /* ignore */
+  }
+}
+
 /**
  * Must await `AudioContext.resume()` before `start()` when the context is suspended;
  * otherwise the first samples are scheduled before output runs and sound is clipped.
@@ -316,7 +326,11 @@ function playBuffer(kit: AudioKit | null, buffer: AudioBuffer | null): void {
        * exact same node that volume / silencing rules expect.
        */
       source.connect(kit.input);
-      source.start(kit.ctx.currentTime);
+      source.onended = () => {
+        flushNdiTapPartial(kit);
+      };
+      /** Lookahead so resume + NDI batching do not clip the attack. */
+      source.start(kit.ctx.currentTime + 0.01);
     } catch {
       /* ignore */
     }
@@ -466,6 +480,9 @@ export function useTimerAlertSounds(
   enabled: boolean = true,
   /** OT count-down minute: no automatic 10s warning. */
   suppressTenSecondWarning: boolean = false,
+  /** When running, wall-clock cue detection uses `timerEndsAt` (100 ms tick). */
+  timerRunning: boolean | undefined = undefined,
+  timerEndsAt: string | null | undefined = undefined,
   options?: {
     /** Pipe each cue's audio over NDI for the offscreen scoreboard renderer (silences local). */
     tapPcmForNdi?: boolean;
@@ -483,6 +500,12 @@ export function useTimerAlertSounds(
   const audio0BufferRef = useRef<AudioBuffer | null>(null);
   const lastPlay10NowNonceRef = useRef<number | null>(null);
   const lastPlay0NowNonceRef = useRef<number | null>(null);
+
+  const liveSecondsRemaining = useLiveEffectiveTimerSeconds(
+    secondsRemaining,
+    timerRunning,
+    timerEndsAt,
+  );
 
   useEffect(() => {
     if (!enabled) return;
@@ -566,8 +589,8 @@ export function useTimerAlertSounds(
 
   useEffect(() => {
     if (!enabled) return;
-    if (secondsRemaining === undefined) return;
-    const curr = secondsRemaining;
+    if (liveSecondsRemaining === undefined) return;
+    const curr = liveSecondsRemaining;
     const prev = prevSecondsRef.current;
     const warnAt =
       typeof warningSeconds === "number" && Number.isFinite(warningSeconds)
@@ -575,6 +598,20 @@ export function useTimerAlertSounds(
         : 30;
 
     if (prev !== null) {
+      /**
+       * A genuine countdown decreases by ~1s per observation (≤1s with the
+       * 100ms wall-clock tick). A large instantaneous DROP is not a real
+       * crossing — it's a reset / clock edit / OT transfer / sleep- or
+       * throttle-induced catch-up / a stale→fresh board swap on app open.
+       * Resync silently so we never blast a late 10s warning or air horn.
+       * (Genuine resets bump `timerCuesResetNonce`, which already nulls
+       * `prev` above, so this guard only ever trips on un-nonced jumps.)
+       */
+      const MAX_NATURAL_DROP_SECONDS = 3;
+      if (prev - curr > MAX_NATURAL_DROP_SECONDS) {
+        prevSecondsRef.current = curr;
+        return;
+      }
       if (
         !(isRestMode ?? false) &&
         !suppressTenSecondWarning &&
@@ -616,7 +653,7 @@ export function useTimerAlertSounds(
 
     prevSecondsRef.current = curr;
   }, [
-    secondsRemaining,
+    liveSecondsRemaining,
     is10SecondEnabled,
     warningSeconds,
     isZeroEnabled,
